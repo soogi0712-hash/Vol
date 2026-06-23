@@ -3,6 +3,7 @@ import { cors } from 'hono/cors'
 import { logger } from 'hono/logger'
 import watchlistRoute from './routes/watchlist'
 import tradingRoute from './routes/trading'
+import testRoute from './routes/api-test'
 import { runTradeScan } from './lib/trade-engine'
 
 type Bindings = {
@@ -22,6 +23,7 @@ app.use('/api/*', cors())
 // API 라우트
 app.route('/api/watchlist', watchlistRoute)
 app.route('/api/trading', tradingRoute)
+app.route('/api/test', testRoute)
 
 // 시스템 설정 조회
 app.get('/api/config', async (c) => {

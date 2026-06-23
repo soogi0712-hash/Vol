@@ -1,0 +1,751 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>KIS API 연결 테스트 | 볼린저밴드 자동매매</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.4.0/css/all.min.css" rel="stylesheet" />
+  <script src="https://cdn.jsdelivr.net/npm/axios@1.6.0/dist/axios.min.js"></script>
+  <style>
+    body { font-family: 'Malgun Gothic', 'Apple SD Gothic Neo', sans-serif; background: #f0f4f8; }
+
+    /* 카드 */
+    .card { background: #fff; border-radius: 14px; box-shadow: 0 2px 8px rgba(0,0,0,0.07); }
+
+    /* 상태 배지 */
+    .badge-ok   { background:#dcfce7; color:#166534; border:1px solid #86efac; }
+    .badge-fail { background:#fee2e2; color:#991b1b; border:1px solid #fca5a5; }
+    .badge-warn { background:#fef9c3; color:#854d0e; border:1px solid #fde047; }
+    .badge-idle { background:#f1f5f9; color:#64748b; border:1px solid #cbd5e1; }
+
+    /* 섹션 헤더 */
+    .section-title { font-size:15px; font-weight:700; color:#1e293b; }
+
+    /* 결과 패널 */
+    .result-panel {
+      border-radius:10px; padding:16px; font-size:13px; line-height:1.7;
+      border-left:4px solid transparent; transition:all .3s;
+    }
+    .result-ok   { background:#f0fdf4; border-color:#22c55e; }
+    .result-fail { background:#fff1f2; border-color:#f43f5e; }
+    .result-idle { background:#f8fafc; border-color:#e2e8f0; color:#94a3b8; }
+
+    /* 버튼 */
+    .btn-test {
+      display:inline-flex; align-items:center; gap:8px;
+      padding:10px 20px; border-radius:10px; font-weight:600; font-size:14px;
+      cursor:pointer; transition:all .15s; border:none; outline:none;
+    }
+    .btn-blue  { background:#3b82f6; color:#fff; }
+    .btn-blue:hover  { background:#2563eb; }
+    .btn-blue:disabled { background:#93c5fd; cursor:not-allowed; }
+    .btn-green { background:#22c55e; color:#fff; }
+    .btn-green:hover { background:#16a34a; }
+    .btn-green:disabled { background:#86efac; cursor:not-allowed; }
+    .btn-indigo { background:#6366f1; color:#fff; }
+    .btn-indigo:hover { background:#4f46e5; }
+    .btn-indigo:disabled { background:#a5b4fc; cursor:not-allowed; }
+    .btn-amber { background:#f59e0b; color:#fff; }
+    .btn-amber:hover { background:#d97706; }
+    .btn-amber:disabled { background:#fcd34d; cursor:not-allowed; }
+    .btn-rose  { background:#f43f5e; color:#fff; }
+    .btn-rose:hover  { background:#e11d48; }
+    .btn-rose:disabled { background:#fda4af; cursor:not-allowed; }
+
+    /* 스피너 */
+    .spin { animation: spin .8s linear infinite; display:inline-block; }
+    @keyframes spin { to { transform:rotate(360deg); } }
+
+    /* 테이블 */
+    .data-table { width:100%; border-collapse:collapse; font-size:13px; }
+    .data-table th { background:#f8fafc; padding:8px 12px; text-align:left; font-weight:600; color:#475569; border-bottom:2px solid #e2e8f0; }
+    .data-table td { padding:8px 12px; border-bottom:1px solid #f1f5f9; color:#334155; }
+    .data-table tr:last-child td { border-bottom:none; }
+    .data-table tr:hover td { background:#f8fafc; }
+
+    /* 수익/손실 색상 */
+    .pos { color:#dc2626; font-weight:600; }
+    .neg { color:#2563eb; font-weight:600; }
+    .zero { color:#64748b; }
+
+    /* 환경변수 행 */
+    .env-row { display:flex; align-items:center; padding:10px 0; border-bottom:1px solid #f1f5f9; gap:12px; }
+    .env-row:last-child { border-bottom:none; }
+    .env-key { width:170px; font-weight:600; font-size:13px; color:#374151; flex-shrink:0; font-family:monospace; }
+    .env-val { font-family:monospace; font-size:13px; color:#6b7280; }
+
+    /* JSON 뷰어 */
+    pre.json-view { background:#0f172a; color:#e2e8f0; padding:14px; border-radius:10px; font-size:12px; overflow-x:auto; max-height:320px; overflow-y:auto; }
+    pre.json-view .k { color:#7dd3fc; }
+    pre.json-view .s { color:#86efac; }
+    pre.json-view .n { color:#fbbf24; }
+    pre.json-view .b { color:#f9a8d4; }
+
+    /* 엘라이드드 타임 */
+    .elapsed { font-size:11px; color:#94a3b8; margin-left:8px; }
+
+    /* All-in-one 진행 스텝 */
+    .step { display:flex; align-items:center; gap:10px; padding:10px 14px; border-radius:10px; margin-bottom:8px; }
+    .step-pending  { background:#f8fafc; }
+    .step-running  { background:#eff6ff; border:1px solid #bfdbfe; }
+    .step-ok       { background:#f0fdf4; border:1px solid #bbf7d0; }
+    .step-fail     { background:#fff1f2; border:1px solid #fecdd3; }
+    .step-icon { width:28px; height:28px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:13px; flex-shrink:0; }
+    .step-icon-pending { background:#e2e8f0; color:#94a3b8; }
+    .step-icon-running { background:#dbeafe; color:#3b82f6; }
+    .step-icon-ok      { background:#dcfce7; color:#16a34a; }
+    .step-icon-fail    { background:#fee2e2; color:#dc2626; }
+  </style>
+</head>
+<body class="min-h-screen py-8 px-4">
+
+  <!-- 헤더 -->
+  <div class="max-w-4xl mx-auto mb-8">
+    <div class="flex items-center justify-between">
+      <div class="flex items-center gap-4">
+        <a href="/" class="w-10 h-10 bg-blue-600 rounded-xl flex items-center justify-center shadow text-white hover:bg-blue-700 transition" title="대시보드로">
+          <i class="fas fa-arrow-left text-sm"></i>
+        </a>
+        <div>
+          <h1 class="text-2xl font-bold text-gray-900 flex items-center gap-2">
+            <i class="fas fa-plug text-blue-500"></i>
+            KIS API 연결 테스트
+          </h1>
+          <p class="text-sm text-gray-500 mt-0.5">한국투자증권 Open API 환경변수 확인 및 실시간 조회 테스트</p>
+        </div>
+      </div>
+      <button onclick="runAllTests()" id="btn-all" class="btn-test btn-rose">
+        <i class="fas fa-bolt"></i>
+        전체 테스트 실행
+      </button>
+    </div>
+  </div>
+
+  <div class="max-w-4xl mx-auto space-y-6">
+
+    <!-- ── 1. 환경변수 확인 ─────────────────────────────── -->
+    <div class="card p-6">
+      <div class="flex items-center justify-between mb-5">
+        <div class="flex items-center gap-3">
+          <div class="w-9 h-9 bg-slate-100 rounded-lg flex items-center justify-center">
+            <i class="fas fa-key text-slate-500"></i>
+          </div>
+          <div>
+            <p class="section-title">1. 환경변수 확인</p>
+            <p class="text-xs text-gray-400">.dev.vars / Cloudflare Secrets 인식 여부</p>
+          </div>
+        </div>
+        <div class="flex items-center gap-3">
+          <span id="env-badge" class="badge-idle px-3 py-1 rounded-full text-xs font-semibold">대기</span>
+          <button onclick="checkEnv()" id="btn-env" class="btn-test btn-blue">
+            <i class="fas fa-search"></i> 확인
+          </button>
+        </div>
+      </div>
+
+      <!-- 환경변수 목록 -->
+      <div id="env-rows" class="hidden">
+        <div class="env-row">
+          <span class="env-key">KIS_APP_KEY</span>
+          <span id="env-appkey-status" class="px-2 py-0.5 rounded-full text-xs font-semibold badge-idle">-</span>
+          <span id="env-appkey-val" class="env-val"></span>
+          <span id="env-appkey-note" class="text-xs text-gray-400"></span>
+        </div>
+        <div class="env-row">
+          <span class="env-key">KIS_APP_SECRET</span>
+          <span id="env-appsecret-status" class="px-2 py-0.5 rounded-full text-xs font-semibold badge-idle">-</span>
+          <span id="env-appsecret-val" class="env-val"></span>
+          <span id="env-appsecret-note" class="text-xs text-gray-400"></span>
+        </div>
+        <div class="env-row">
+          <span class="env-key">KIS_ACCOUNT_NO</span>
+          <span id="env-accountno-status" class="px-2 py-0.5 rounded-full text-xs font-semibold badge-idle">-</span>
+          <span id="env-accountno-val" class="env-val"></span>
+        </div>
+        <div class="env-row">
+          <span class="env-key">KIS_ACCOUNT_SUFFIX</span>
+          <span id="env-suffix-status" class="px-2 py-0.5 rounded-full text-xs font-semibold badge-idle">-</span>
+          <span id="env-suffix-val" class="env-val"></span>
+        </div>
+      </div>
+      <div id="env-result" class="result-panel result-idle mt-3">환경변수 확인 버튼을 눌러주세요.</div>
+    </div>
+
+    <!-- ── 2. 액세스 토큰 ─────────────────────────────── -->
+    <div class="card p-6">
+      <div class="flex items-center justify-between mb-5">
+        <div class="flex items-center gap-3">
+          <div class="w-9 h-9 bg-blue-50 rounded-lg flex items-center justify-center">
+            <i class="fas fa-ticket-alt text-blue-500"></i>
+          </div>
+          <div>
+            <p class="section-title">2. 액세스 토큰 발급</p>
+            <p class="text-xs text-gray-400">AppKey + AppSecret으로 OAuth 토큰 발급</p>
+          </div>
+        </div>
+        <div class="flex items-center gap-3">
+          <span id="token-badge" class="badge-idle px-3 py-1 rounded-full text-xs font-semibold">대기</span>
+          <button onclick="testToken()" id="btn-token" class="btn-test btn-blue">
+            <i class="fas fa-key"></i> 토큰 발급
+          </button>
+        </div>
+      </div>
+      <div id="token-result" class="result-panel result-idle">토큰 발급 버튼을 눌러주세요.</div>
+    </div>
+
+    <!-- ── 3. 주문가능금액 ─────────────────────────────── -->
+    <div class="card p-6">
+      <div class="flex items-center justify-between mb-5">
+        <div class="flex items-center gap-3">
+          <div class="w-9 h-9 bg-green-50 rounded-lg flex items-center justify-center">
+            <i class="fas fa-wallet text-green-500"></i>
+          </div>
+          <div>
+            <p class="section-title">3. 주문가능금액 조회</p>
+            <p class="text-xs text-gray-400">계좌의 현금 매수 가능 금액</p>
+          </div>
+        </div>
+        <div class="flex items-center gap-3">
+          <span id="orderable-badge" class="badge-idle px-3 py-1 rounded-full text-xs font-semibold">대기</span>
+          <button onclick="testOrderable()" id="btn-orderable" class="btn-test btn-green">
+            <i class="fas fa-coins"></i> 조회
+          </button>
+        </div>
+      </div>
+      <div id="orderable-result" class="result-panel result-idle">조회 버튼을 눌러주세요.</div>
+    </div>
+
+    <!-- ── 4. 계좌잔고 ─────────────────────────────────── -->
+    <div class="card p-6">
+      <div class="flex items-center justify-between mb-5">
+        <div class="flex items-center gap-3">
+          <div class="w-9 h-9 bg-indigo-50 rounded-lg flex items-center justify-center">
+            <i class="fas fa-chart-pie text-indigo-500"></i>
+          </div>
+          <div>
+            <p class="section-title">4. 계좌잔고 조회</p>
+            <p class="text-xs text-gray-400">예수금·총평가금액·평가손익 등 잔고 요약</p>
+          </div>
+        </div>
+        <div class="flex items-center gap-3">
+          <span id="balance-badge" class="badge-idle px-3 py-1 rounded-full text-xs font-semibold">대기</span>
+          <button onclick="testBalance()" id="btn-balance" class="btn-test btn-indigo">
+            <i class="fas fa-chart-bar"></i> 조회
+          </button>
+        </div>
+      </div>
+      <div id="balance-result" class="result-panel result-idle">조회 버튼을 눌러주세요.</div>
+      <div id="balance-table-wrap" class="hidden mt-4 overflow-x-auto rounded-xl border border-gray-100">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>항목</th>
+              <th class="text-right">금액</th>
+            </tr>
+          </thead>
+          <tbody id="balance-table-body"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- ── 5. 보유종목 ─────────────────────────────────── -->
+    <div class="card p-6">
+      <div class="flex items-center justify-between mb-5">
+        <div class="flex items-center gap-3">
+          <div class="w-9 h-9 bg-amber-50 rounded-lg flex items-center justify-center">
+            <i class="fas fa-layer-group text-amber-500"></i>
+          </div>
+          <div>
+            <p class="section-title">5. 보유종목 조회</p>
+            <p class="text-xs text-gray-400">현재 계좌에 보유 중인 주식 목록</p>
+          </div>
+        </div>
+        <div class="flex items-center gap-3">
+          <span id="holdings-badge" class="badge-idle px-3 py-1 rounded-full text-xs font-semibold">대기</span>
+          <button onclick="testHoldings()" id="btn-holdings" class="btn-test btn-amber">
+            <i class="fas fa-list-ul"></i> 조회
+          </button>
+        </div>
+      </div>
+      <div id="holdings-result" class="result-panel result-idle">조회 버튼을 눌러주세요.</div>
+      <div id="holdings-table-wrap" class="hidden mt-4 overflow-x-auto rounded-xl border border-gray-100">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>종목코드</th>
+              <th>종목명</th>
+              <th class="text-right">수량</th>
+              <th class="text-right">평균단가</th>
+              <th class="text-right">현재가</th>
+              <th class="text-right">평가손익</th>
+              <th class="text-right">수익률</th>
+            </tr>
+          </thead>
+          <tbody id="holdings-table-body"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- ── 6. 현재가 단건 조회 ─────────────────────────── -->
+    <div class="card p-6">
+      <div class="flex items-center justify-between mb-5">
+        <div class="flex items-center gap-3">
+          <div class="w-9 h-9 bg-rose-50 rounded-lg flex items-center justify-center">
+            <i class="fas fa-tag text-rose-500"></i>
+          </div>
+          <div>
+            <p class="section-title">6. 현재가 단건 조회</p>
+            <p class="text-xs text-gray-400">종목코드로 실시간 현재가 확인</p>
+          </div>
+        </div>
+        <div class="flex items-center gap-3">
+          <span id="price-badge" class="badge-idle px-3 py-1 rounded-full text-xs font-semibold">대기</span>
+          <input id="price-ticker" type="text" value="005930" maxlength="6" placeholder="종목코드"
+            class="w-28 border border-gray-300 rounded-lg px-3 py-2 text-sm text-center font-mono focus:outline-none focus:ring-2 focus:ring-rose-400" />
+          <button onclick="testPrice()" id="btn-price" class="btn-test btn-rose">
+            <i class="fas fa-search-dollar"></i> 조회
+          </button>
+        </div>
+      </div>
+      <div id="price-result" class="result-panel result-idle">종목코드 입력 후 조회하세요. (기본: 삼성전자 005930)</div>
+    </div>
+
+    <!-- ── 전체 테스트 진행 현황 ─────────────────────── -->
+    <div id="all-test-panel" class="card p-6 hidden">
+      <div class="flex items-center gap-3 mb-5">
+        <div class="w-9 h-9 bg-rose-50 rounded-lg flex items-center justify-center">
+          <i class="fas fa-bolt text-rose-500"></i>
+        </div>
+        <div>
+          <p class="section-title">전체 테스트 진행 현황</p>
+          <p class="text-xs text-gray-400" id="all-test-summary">순서대로 자동 실행 중...</p>
+        </div>
+      </div>
+      <div id="all-steps"></div>
+    </div>
+
+  </div><!-- /max-w -->
+
+<script>
+// ─── 공통 유틸 ──────────────────────────────────────────────
+function setBtn(id, loading) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  if (loading) {
+    el.disabled = true;
+    el._orig = el.innerHTML;
+    el.innerHTML = `<i class="fas fa-circle-notch spin"></i> 요청 중...`;
+  } else {
+    el.disabled = false;
+    if (el._orig) el.innerHTML = el._orig;
+  }
+}
+
+function setBadge(id, state, label) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.className = 'px-3 py-1 rounded-full text-xs font-semibold';
+  const map = { ok:'badge-ok', fail:'badge-fail', warn:'badge-warn', idle:'badge-idle' };
+  el.classList.add(map[state] || 'badge-idle');
+  el.textContent = label;
+}
+
+function setResult(id, ok, html) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.className = 'result-panel ' + (ok === null ? 'result-idle' : ok ? 'result-ok' : 'result-fail');
+  el.innerHTML = html;
+}
+
+function elapsed(ms) {
+  return `<span class="elapsed">(${ms}ms)</span>`;
+}
+
+function fmtNum(n) {
+  if (n == null) return '-';
+  return Number(n).toLocaleString('ko-KR');
+}
+
+function profitSpan(n) {
+  const v = parseFloat(n);
+  const cls = v > 0 ? 'pos' : v < 0 ? 'neg' : 'zero';
+  const sign = v > 0 ? '+' : '';
+  return `<span class="${cls}">${sign}${fmtNum(v)}원</span>`;
+}
+
+function rateSpan(r) {
+  const v = parseFloat(r);
+  const cls = v > 0 ? 'pos' : v < 0 ? 'neg' : 'zero';
+  const sign = v > 0 ? '+' : '';
+  return `<span class="${cls}">${sign}${v.toFixed(2)}%</span>`;
+}
+
+// ─── 1. 환경변수 확인 ────────────────────────────────────────
+async function checkEnv() {
+  setBtn('btn-env', true);
+  try {
+    const r = await axios.get('/api/test/env');
+    const d = r.data;
+    const env = d.env;
+
+    document.getElementById('env-rows').classList.remove('hidden');
+
+    function setEnvRow(key, statusId, valId, noteId, info) {
+      const sEl = document.getElementById(statusId);
+      const vEl = document.getElementById(valId);
+      const nEl = noteId ? document.getElementById(noteId) : null;
+
+      if (info.set && !info.is_placeholder) {
+        sEl.className = 'px-2 py-0.5 rounded-full text-xs font-semibold badge-ok';
+        sEl.textContent = '✓ 설정됨';
+      } else if (info.set && info.is_placeholder) {
+        sEl.className = 'px-2 py-0.5 rounded-full text-xs font-semibold badge-warn';
+        sEl.textContent = '⚠ 플레이스홀더';
+      } else {
+        sEl.className = 'px-2 py-0.5 rounded-full text-xs font-semibold badge-fail';
+        sEl.textContent = '✗ 미설정';
+      }
+
+      if (vEl) {
+        if (info.preview)      vEl.textContent = info.preview;
+        else if (info.value)   vEl.textContent = info.value;
+        else if (info.length)  vEl.textContent = `(${info.length}자)`;
+      }
+      if (nEl && info.length) nEl.textContent = `${info.length}자`;
+    }
+
+    setEnvRow('KIS_APP_KEY',    'env-appkey-status',    'env-appkey-val',    'env-appkey-note',    env.KIS_APP_KEY);
+    setEnvRow('KIS_APP_SECRET', 'env-appsecret-status', 'env-appsecret-val', 'env-appsecret-note', env.KIS_APP_SECRET);
+    setEnvRow('KIS_ACCOUNT_NO', 'env-accountno-status', 'env-accountno-val', null,                 env.KIS_ACCOUNT_NO);
+    setEnvRow('KIS_ACCOUNT_SUFFIX', 'env-suffix-status','env-suffix-val',    null,                 env.KIS_ACCOUNT_SUFFIX);
+
+    if (d.all_set) {
+      setBadge('env-badge', 'ok', '✓ 정상');
+      setResult('env-result', true, `<i class="fas fa-check-circle text-green-500 mr-2"></i><strong>모든 환경변수가 정상 인식되었습니다.</strong> 이제 API 테스트를 진행할 수 있습니다.`);
+    } else {
+      setBadge('env-badge', 'warn', '⚠ 확인 필요');
+      setResult('env-result', false, `<i class="fas fa-exclamation-triangle text-amber-500 mr-2"></i><strong>일부 환경변수가 미설정되었거나 플레이스홀더입니다.</strong><br><span class="text-sm text-gray-600">로컬: .dev.vars 파일을 확인하세요. / 프로덕션: wrangler secret put 명령어로 설정하세요.</span>`);
+    }
+  } catch (e) {
+    setBadge('env-badge', 'fail', '✗ 오류');
+    setResult('env-result', false, `<i class="fas fa-times-circle text-red-500 mr-2"></i>${e.message}`);
+  } finally {
+    setBtn('btn-env', false);
+  }
+}
+
+// ─── 2. 토큰 발급 ────────────────────────────────────────────
+async function testToken() {
+  setBtn('btn-token', true);
+  setBadge('token-badge', 'idle', '요청 중');
+  setResult('token-result', null, '<i class="fas fa-circle-notch spin mr-2"></i>토큰 발급 요청 중...');
+  try {
+    const r = await axios.get('/api/test/token');
+    const d = r.data;
+    if (d.success) {
+      setBadge('token-badge', 'ok', '✓ 성공');
+      setResult('token-result', true, `
+        <div class="flex items-center gap-2 mb-2">
+          <i class="fas fa-check-circle text-green-500"></i>
+          <strong>액세스 토큰 발급 성공</strong> ${elapsed(d.elapsed_ms)}
+        </div>
+        <div class="mt-2 space-y-1 text-sm">
+          <div><span class="text-gray-500">토큰 미리보기:</span> <code class="bg-gray-100 px-2 py-0.5 rounded font-mono text-xs">${d.token_preview}</code></div>
+          <div><span class="text-gray-500">토큰 길이:</span> ${d.token_length}자</div>
+        </div>
+      `);
+    } else {
+      setBadge('token-badge', 'fail', '✗ 실패');
+      setResult('token-result', false, `<i class="fas fa-times-circle text-red-500 mr-2"></i>${d.message}`);
+    }
+  } catch (e) {
+    setBadge('token-badge', 'fail', '✗ 오류');
+    const msg = e.response?.data?.message || e.message;
+    setResult('token-result', false, `<i class="fas fa-times-circle text-red-500 mr-2"></i><strong>요청 실패:</strong> ${msg}`);
+  } finally {
+    setBtn('btn-token', false);
+  }
+}
+
+// ─── 3. 주문가능금액 ─────────────────────────────────────────
+async function testOrderable() {
+  setBtn('btn-orderable', true);
+  setBadge('orderable-badge', 'idle', '요청 중');
+  setResult('orderable-result', null, '<i class="fas fa-circle-notch spin mr-2"></i>주문가능금액 조회 중...');
+  try {
+    const r = await axios.get('/api/test/orderable');
+    const d = r.data;
+    if (d.success) {
+      setBadge('orderable-badge', 'ok', '✓ 성공');
+      setResult('orderable-result', true, `
+        <div class="flex items-center gap-2 mb-3">
+          <i class="fas fa-check-circle text-green-500"></i>
+          <strong>주문가능금액 조회 성공</strong> ${elapsed(d.elapsed_ms)}
+        </div>
+        <div class="text-3xl font-bold text-blue-600 my-2">${d.data.ord_psbl_cash_formatted}</div>
+        <p class="text-xs text-gray-400">현금 매수 가능 금액 (신용·미수 제외)</p>
+      `);
+    } else {
+      setBadge('orderable-badge', 'fail', '✗ 실패');
+      setResult('orderable-result', false, `<i class="fas fa-times-circle text-red-500 mr-2"></i>${d.message}`);
+    }
+  } catch (e) {
+    setBadge('orderable-badge', 'fail', '✗ 오류');
+    const msg = e.response?.data?.message || e.message;
+    setResult('orderable-result', false, `<i class="fas fa-times-circle text-red-500 mr-2"></i>${msg}`);
+  } finally {
+    setBtn('btn-orderable', false);
+  }
+}
+
+// ─── 4. 계좌잔고 ─────────────────────────────────────────────
+async function testBalance() {
+  setBtn('btn-balance', true);
+  setBadge('balance-badge', 'idle', '요청 중');
+  setResult('balance-result', null, '<i class="fas fa-circle-notch spin mr-2"></i>계좌잔고 조회 중...');
+  document.getElementById('balance-table-wrap').classList.add('hidden');
+  try {
+    const r = await axios.get('/api/test/balance');
+    const d = r.data;
+    if (d.success) {
+      setBadge('balance-badge', 'ok', '✓ 성공');
+      setResult('balance-result', true, `
+        <div class="flex items-center gap-2">
+          <i class="fas fa-check-circle text-green-500"></i>
+          <strong>계좌잔고 조회 성공</strong> ${elapsed(d.elapsed_ms)}
+          <span class="text-xs text-gray-400 ml-1">보유종목 ${d.holdings_count}개</span>
+        </div>
+      `);
+
+      // 잔고 테이블
+      if (d.summary) {
+        const tbody = document.getElementById('balance-table-body');
+        const rows = Object.entries(d.summary).map(([k, v]) => {
+          const val = v.formatted;
+          const raw = parseFloat(v.raw || '0');
+          const isProfit = k.includes('손익') || k.includes('수익');
+          const isRate = k.includes('수익률');
+          let display = val;
+          if (isProfit && !isRate) display = profitSpan(raw);
+          if (isRate) display = rateSpan(v.raw);
+          return `<tr><td class="font-medium text-gray-600">${k}</td><td class="text-right">${display}</td></tr>`;
+        }).join('');
+        tbody.innerHTML = rows;
+        document.getElementById('balance-table-wrap').classList.remove('hidden');
+      }
+    } else {
+      setBadge('balance-badge', 'fail', '✗ 실패');
+      setResult('balance-result', false, `<i class="fas fa-times-circle text-red-500 mr-2"></i>${d.message}`);
+    }
+  } catch (e) {
+    setBadge('balance-badge', 'fail', '✗ 오류');
+    const msg = e.response?.data?.message || e.message;
+    setResult('balance-result', false, `<i class="fas fa-times-circle text-red-500 mr-2"></i>${msg}`);
+  } finally {
+    setBtn('btn-balance', false);
+  }
+}
+
+// ─── 5. 보유종목 ─────────────────────────────────────────────
+async function testHoldings() {
+  setBtn('btn-holdings', true);
+  setBadge('holdings-badge', 'idle', '요청 중');
+  setResult('holdings-result', null, '<i class="fas fa-circle-notch spin mr-2"></i>보유종목 조회 중...');
+  document.getElementById('holdings-table-wrap').classList.add('hidden');
+  try {
+    const r = await axios.get('/api/test/holdings');
+    const d = r.data;
+    if (d.success) {
+      setBadge('holdings-badge', 'ok', '✓ 성공');
+
+      if (d.count === 0) {
+        setResult('holdings-result', true, `
+          <div class="flex items-center gap-2">
+            <i class="fas fa-check-circle text-green-500"></i>
+            <strong>보유종목 조회 성공</strong> ${elapsed(d.elapsed_ms)}
+            <span class="text-xs text-gray-400">— 현재 보유 종목 없음</span>
+          </div>
+        `);
+      } else {
+        setResult('holdings-result', true, `
+          <div class="flex items-center gap-2">
+            <i class="fas fa-check-circle text-green-500"></i>
+            <strong>보유종목 ${d.count}개 조회 성공</strong> ${elapsed(d.elapsed_ms)}
+          </div>
+        `);
+
+        const tbody = document.getElementById('holdings-table-body');
+        tbody.innerHTML = d.data.map(h => `
+          <tr>
+            <td class="font-mono text-xs">${h.ticker}</td>
+            <td class="font-medium">${h.ticker_name}</td>
+            <td class="text-right">${fmtNum(h.qty)}주</td>
+            <td class="text-right">${h.avg_price_formatted}</td>
+            <td class="text-right font-semibold">${h.current_price_formatted}</td>
+            <td class="text-right">${profitSpan(h.eval_profit_loss)}</td>
+            <td class="text-right">${rateSpan(h.eval_return_rate)}</td>
+          </tr>
+        `).join('');
+        document.getElementById('holdings-table-wrap').classList.remove('hidden');
+      }
+    } else {
+      setBadge('holdings-badge', 'fail', '✗ 실패');
+      setResult('holdings-result', false, `<i class="fas fa-times-circle text-red-500 mr-2"></i>${d.message}`);
+    }
+  } catch (e) {
+    setBadge('holdings-badge', 'fail', '✗ 오류');
+    const msg = e.response?.data?.message || e.message;
+    setResult('holdings-result', false, `<i class="fas fa-times-circle text-red-500 mr-2"></i>${msg}`);
+  } finally {
+    setBtn('btn-holdings', false);
+  }
+}
+
+// ─── 6. 현재가 단건 조회 ─────────────────────────────────────
+async function testPrice() {
+  const ticker = document.getElementById('price-ticker').value.trim().padStart(6, '0');
+  if (!ticker || ticker.length !== 6) {
+    setResult('price-result', false, '종목코드 6자리를 입력하세요.');
+    return;
+  }
+  setBtn('btn-price', true);
+  setBadge('price-badge', 'idle', '요청 중');
+  setResult('price-result', null, `<i class="fas fa-circle-notch spin mr-2"></i>${ticker} 현재가 조회 중...`);
+  try {
+    const r = await axios.get(`/api/test/price/${ticker}`);
+    const d = r.data;
+    if (d.success) {
+      setBadge('price-badge', 'ok', '✓ 성공');
+      setResult('price-result', true, `
+        <div class="flex items-center gap-2 mb-2">
+          <i class="fas fa-check-circle text-green-500"></i>
+          <strong>${d.data.ticker} 현재가 조회 성공</strong> ${elapsed(d.elapsed_ms)}
+        </div>
+        <div class="text-3xl font-bold text-gray-800 my-2">${d.data.price_formatted}</div>
+        <p class="text-xs text-gray-400">실시간 체결가 기준</p>
+      `);
+    } else {
+      setBadge('price-badge', 'fail', '✗ 실패');
+      setResult('price-result', false, `<i class="fas fa-times-circle text-red-500 mr-2"></i>${d.message}`);
+    }
+  } catch (e) {
+    setBadge('price-badge', 'fail', '✗ 오류');
+    const msg = e.response?.data?.message || e.message;
+    setResult('price-result', false, `<i class="fas fa-times-circle text-red-500 mr-2"></i>${msg}`);
+  } finally {
+    setBtn('btn-price', false);
+  }
+}
+
+// ─── 전체 테스트 실행 ─────────────────────────────────────────
+async function runAllTests() {
+  setBtn('btn-all', true);
+  const panel = document.getElementById('all-test-panel');
+  panel.classList.remove('hidden');
+  panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+
+  const STEPS = [
+    { key:'env',      label:'환경변수 확인',      icon:'fa-key' },
+    { key:'token',    label:'액세스 토큰 발급',    icon:'fa-ticket-alt' },
+    { key:'orderable',label:'주문가능금액 조회',    icon:'fa-wallet' },
+    { key:'balance',  label:'계좌잔고 조회',        icon:'fa-chart-pie' },
+    { key:'holdings', label:'보유종목 조회',         icon:'fa-layer-group' },
+  ];
+
+  const stepsEl = document.getElementById('all-steps');
+  stepsEl.innerHTML = STEPS.map(s => `
+    <div class="step step-pending" id="allstep-${s.key}">
+      <div class="step-icon step-icon-pending" id="allstep-icon-${s.key}">
+        <i class="fas ${s.icon}"></i>
+      </div>
+      <div class="flex-1">
+        <div class="font-semibold text-sm text-gray-700">${s.label}</div>
+        <div class="text-xs text-gray-400" id="allstep-msg-${s.key}">대기 중...</div>
+      </div>
+      <div id="allstep-badge-${s.key}" class="badge-idle px-2 py-0.5 rounded-full text-xs font-semibold">-</div>
+    </div>
+  `).join('');
+
+  document.getElementById('all-test-summary').textContent = '순서대로 자동 실행 중...';
+
+  let allOk = true;
+
+  const apis = [
+    { key:'env',      fn: async () => { const r = await axios.get('/api/test/env');      return r.data; } },
+    { key:'token',    fn: async () => { const r = await axios.get('/api/test/token');    return r.data; } },
+    { key:'orderable',fn: async () => { const r = await axios.get('/api/test/orderable');return r.data; } },
+    { key:'balance',  fn: async () => { const r = await axios.get('/api/test/balance');  return r.data; } },
+    { key:'holdings', fn: async () => { const r = await axios.get('/api/test/holdings'); return r.data; } },
+  ];
+
+  for (const api of apis) {
+    const stepEl   = document.getElementById(`allstep-${api.key}`);
+    const iconEl   = document.getElementById(`allstep-icon-${api.key}`);
+    const msgEl    = document.getElementById(`allstep-msg-${api.key}`);
+    const badgeEl  = document.getElementById(`allstep-badge-${api.key}`);
+
+    // 실행 중
+    stepEl.className  = 'step step-running';
+    iconEl.className  = 'step-icon step-icon-running';
+    iconEl.innerHTML  = '<i class="fas fa-circle-notch spin"></i>';
+    msgEl.textContent = '요청 중...';
+    badgeEl.className = 'badge-idle px-2 py-0.5 rounded-full text-xs font-semibold';
+    badgeEl.textContent = '...';
+
+    const t0 = Date.now();
+    try {
+      const d = await api.fn();
+      const ms = Date.now() - t0;
+
+      const ok = d.success || d.all_set;
+      const label = STEPS.find(s=>s.key===api.key)?.icon || '';
+      if (ok) {
+        stepEl.className = 'step step-ok';
+        iconEl.className = 'step-icon step-icon-ok';
+        iconEl.innerHTML = `<i class="fas fa-check"></i>`;
+        badgeEl.className = 'badge-ok px-2 py-0.5 rounded-full text-xs font-semibold';
+        badgeEl.textContent = '✓ 성공';
+
+        // 메시지
+        if (api.key === 'env')       msgEl.textContent = d.all_set ? '모든 환경변수 정상 인식' : '일부 미설정';
+        else if (api.key === 'token')      msgEl.textContent = `토큰 발급 완료 · ${ms}ms`;
+        else if (api.key === 'orderable')  msgEl.textContent = `주문가능: ${d.data?.ord_psbl_cash_formatted || '-'} · ${ms}ms`;
+        else if (api.key === 'balance')    msgEl.textContent = `잔고 조회 완료 · ${ms}ms`;
+        else if (api.key === 'holdings')   msgEl.textContent = `보유종목 ${d.count}개 · ${ms}ms`;
+      } else {
+        allOk = false;
+        stepEl.className = 'step step-fail';
+        iconEl.className = 'step-icon step-icon-fail';
+        iconEl.innerHTML = `<i class="fas fa-times"></i>`;
+        badgeEl.className = 'badge-fail px-2 py-0.5 rounded-full text-xs font-semibold';
+        badgeEl.textContent = '✗ 실패';
+        msgEl.textContent = d.message || '오류 발생';
+      }
+    } catch (e) {
+      allOk = false;
+      const ms = Date.now() - t0;
+      stepEl.className = 'step step-fail';
+      iconEl.className = 'step-icon step-icon-fail';
+      iconEl.innerHTML = `<i class="fas fa-times"></i>`;
+      badgeEl.className = 'badge-fail px-2 py-0.5 rounded-full text-xs font-semibold';
+      badgeEl.textContent = '✗ 오류';
+      msgEl.textContent = e.response?.data?.message || e.message;
+    }
+  }
+
+  document.getElementById('all-test-summary').textContent =
+    allOk ? '✅ 모든 테스트 통과 — API 연결 정상입니다!' : '⚠️ 일부 테스트 실패 — 위 항목을 확인하세요.';
+
+  setBtn('btn-all', false);
+
+  // 각 개별 섹션도 함께 업데이트
+  checkEnv();
+}
+
+// ─── 초기: 환경변수 자동 확인 ────────────────────────────────
+checkEnv();
+</script>
+
+</body>
+</html>
