@@ -1,11 +1,17 @@
-// API 연결 테스트 라우트
+// API 연결 테스트 라우트 v2
 import { Hono } from 'hono';
 import {
   getAccessToken,
-  getOrderableBalance,
-  getHoldings,
-  getCurrentPrice,
+  getKROrderableCash,
+  getUSOrderableCash,
+  getKRHoldings,
+  getUSHoldings,
+  getKRPrice,
+  getUSPrice,
+  getKR15MinCandles,
+  getUS15MinCandles,
 } from '../lib/kis-api';
+import { calcBB, getBBSignal } from '../lib/bollinger';
 
 type Bindings = {
   DB: D1Database;
@@ -45,7 +51,7 @@ test.get('/env', (c) => {
       },
       KIS_ACCOUNT_NO: {
         set: accountNo.length > 0,
-        value: accountNo,          // 계좌번호는 평문 노출 (민감도 낮음)
+        value: accountNo,
         is_placeholder: accountNo.length === 0 || accountNo === '12345678',
       },
       KIS_ACCOUNT_SUFFIX: {
@@ -70,24 +76,19 @@ test.get('/token', async (c) => {
   const start = Date.now();
   try {
     const token = await getAccessToken(config, c.env.KV);
-    const elapsed = Date.now() - start;
     return c.json({
       success: true,
       message: '액세스 토큰 발급 성공',
-      elapsed_ms: elapsed,
+      elapsed_ms: Date.now() - start,
       token_preview: token.slice(0, 12) + '...' + token.slice(-6),
       token_length: token.length,
     });
   } catch (e) {
-    return c.json({
-      success: false,
-      message: String(e),
-      elapsed_ms: Date.now() - start,
-    }, 500);
+    return c.json({ success: false, message: String(e), elapsed_ms: Date.now() - start }, 500);
   }
 });
 
-// ── 3. 주문가능금액 조회 ─────────────────────────────────────
+// ── 3. KR 주문가능금액 조회 ──────────────────────────────────
 test.get('/orderable', async (c) => {
   const config = buildConfig(c.env);
   const missing = checkMissing(config);
@@ -96,26 +97,26 @@ test.get('/orderable', async (c) => {
   const start = Date.now();
   try {
     const token = await getAccessToken(config, c.env.KV);
-    const balance = await getOrderableBalance(config, token, 0);
+    const krCash = await getKROrderableCash(config, token);
+    let usCash = 0;
+    try { usCash = await getUSOrderableCash(config, token); } catch {}
     return c.json({
       success: true,
-      message: '주문가능금액 조회 성공',
+      message: 'KR+US 주문가능금액 조회 성공',
       elapsed_ms: Date.now() - start,
       data: {
-        ord_psbl_cash: balance.cash,
-        ord_psbl_cash_formatted: balance.cash.toLocaleString('ko-KR') + '원',
+        kr_cash: krCash,
+        kr_cash_formatted: krCash.toLocaleString('ko-KR') + '원',
+        us_cash: usCash,
+        us_cash_formatted: '$' + usCash.toFixed(2),
       },
     });
   } catch (e) {
-    return c.json({
-      success: false,
-      message: String(e),
-      elapsed_ms: Date.now() - start,
-    }, 500);
+    return c.json({ success: false, message: String(e), elapsed_ms: Date.now() - start }, 500);
   }
 });
 
-// ── 4. 계좌잔고 전체 조회 (output2 포함) ────────────────────
+// ── 4. 계좌잔고 전체 조회 ────────────────────────────────────
 test.get('/balance', async (c) => {
   const config = buildConfig(c.env);
   const missing = checkMissing(config);
@@ -154,56 +155,30 @@ test.get('/balance', async (c) => {
     );
 
     const raw = await res.json() as {
-      rt_cd: string;
-      msg_cd: string;
-      msg1: string;
+      rt_cd: string; msg_cd: string; msg1: string;
       output1: unknown[];
       output2: Array<{
-        dnca_tot_amt: string;         // 예수금 총금액
-        nxdy_excc_amt: string;        // 익일 정산금액
-        prvs_rcdl_excc_amt: string;   // 가수도 정산금액
-        cma_evlu_amt: string;         // CMA 평가금액
-        bfdy_buy_amt: string;         // 전일 매수금액
-        thdt_buyamt: string;          // 금일 매수금액
-        nxdy_auto_rdpt_amt: string;   // 익일 자동상환금액
-        bfdy_sll_amt: string;         // 전일 매도금액
-        thdt_sll_amt: string;         // 금일 매도금액
-        d2_auto_rdpt_amt: string;     // D+2 자동상환금액
-        bfdy_tlex_amt: string;        // 전일 제비용금액
-        thdt_tlex_amt: string;        // 금일 제비용금액
-        tot_loan_amt: string;         // 총 대출금액
-        scts_evlu_amt: string;        // 유가증권 평가금액
-        tot_evlu_amt: string;         // 총 평가금액
-        nass_amt: string;             // 순자산금액
-        fncg_gld_auto_rdpt_yn: string;
-        pchs_amt_smtl_amt: string;    // 매입금액 합계금액
-        evlu_amt_smtl_amt: string;    // 평가금액 합계금액
-        evlu_pfls_smtl_amt: string;   // 평가손익 합계금액
-        tot_stln_slng_chgs: string;   // 총 대주매각대금
-        bfdy_tot_asst_evlu_amt: string; // 전일 총자산 평가금액
-        asst_icdc_amt: string;        // 자산 증감금액
-        asst_icdc_erng_rt: string;    // 자산 증감 수익률
+        dnca_tot_amt: string; nxdy_excc_amt: string;
+        scts_evlu_amt: string; tot_evlu_amt: string; nass_amt: string;
+        pchs_amt_smtl_amt: string; evlu_pfls_smtl_amt: string;
+        thdt_buyamt: string; thdt_sll_amt: string; asst_icdc_erng_rt: string;
       }>;
     };
 
-    if (raw.rt_cd !== '0') {
-      return c.json({ success: false, message: raw.msg1, raw }, 500);
-    }
+    if (raw.rt_cd !== '0') return c.json({ success: false, message: raw.msg1, raw }, 500);
 
     const s = raw.output2?.[0];
-    const summary = s
-      ? {
-          예수금총금액:      { raw: s.dnca_tot_amt,       formatted: fmt(s.dnca_tot_amt) },
-          유가증권평가금액:  { raw: s.scts_evlu_amt,      formatted: fmt(s.scts_evlu_amt) },
-          총평가금액:        { raw: s.tot_evlu_amt,        formatted: fmt(s.tot_evlu_amt) },
-          순자산금액:        { raw: s.nass_amt,            formatted: fmt(s.nass_amt) },
-          매입금액합계:      { raw: s.pchs_amt_smtl_amt,   formatted: fmt(s.pchs_amt_smtl_amt) },
-          평가손익합계:      { raw: s.evlu_pfls_smtl_amt,  formatted: fmt(s.evlu_pfls_smtl_amt) },
-          금일매수금액:      { raw: s.thdt_buyamt,         formatted: fmt(s.thdt_buyamt) },
-          금일매도금액:      { raw: s.thdt_sll_amt,        formatted: fmt(s.thdt_sll_amt) },
-          자산증감수익률:    { raw: s.asst_icdc_erng_rt,   formatted: s.asst_icdc_erng_rt + '%' },
-        }
-      : null;
+    const summary = s ? {
+      예수금총금액:     { raw: s.dnca_tot_amt,      formatted: fmt(s.dnca_tot_amt) },
+      유가증권평가금액: { raw: s.scts_evlu_amt,     formatted: fmt(s.scts_evlu_amt) },
+      총평가금액:       { raw: s.tot_evlu_amt,       formatted: fmt(s.tot_evlu_amt) },
+      순자산금액:       { raw: s.nass_amt,           formatted: fmt(s.nass_amt) },
+      매입금액합계:     { raw: s.pchs_amt_smtl_amt,  formatted: fmt(s.pchs_amt_smtl_amt) },
+      평가손익합계:     { raw: s.evlu_pfls_smtl_amt, formatted: fmt(s.evlu_pfls_smtl_amt) },
+      금일매수금액:     { raw: s.thdt_buyamt,        formatted: fmt(s.thdt_buyamt) },
+      금일매도금액:     { raw: s.thdt_sll_amt,       formatted: fmt(s.thdt_sll_amt) },
+      자산증감수익률:   { raw: s.asst_icdc_erng_rt,  formatted: s.asst_icdc_erng_rt + '%' },
+    } : null;
 
     return c.json({
       success: true,
@@ -211,19 +186,13 @@ test.get('/balance', async (c) => {
       elapsed_ms: Date.now() - start,
       summary,
       holdings_count: (raw.output1 || []).length,
-      rt_cd: raw.rt_cd,
-      msg1: raw.msg1,
     });
   } catch (e) {
-    return c.json({
-      success: false,
-      message: String(e),
-      elapsed_ms: Date.now() - start,
-    }, 500);
+    return c.json({ success: false, message: String(e), elapsed_ms: Date.now() - start }, 500);
   }
 });
 
-// ── 5. 보유종목 조회 ────────────────────────────────────────
+// ── 5. KR 보유종목 조회 (v2) ────────────────────────────────
 test.get('/holdings', async (c) => {
   const config = buildConfig(c.env);
   const missing = checkMissing(config);
@@ -232,33 +201,35 @@ test.get('/holdings', async (c) => {
   const start = Date.now();
   try {
     const token = await getAccessToken(config, c.env.KV);
-    const holdings = await getHoldings(config, token);
-
+    const [krH, usH] = await Promise.all([
+      getKRHoldings(config, token).catch(() => []),
+      getUSHoldings(config, token).catch(() => []),
+    ]);
+    const all = [...krH, ...usH];
     return c.json({
       success: true,
-      message: `보유종목 조회 성공 (${holdings.length}개)`,
+      message: `KR ${krH.length}개 + US ${usH.length}개 보유종목 조회 성공`,
       elapsed_ms: Date.now() - start,
-      count: holdings.length,
-      data: holdings.map((h) => ({
+      count: all.length,
+      kr_count: krH.length,
+      us_count: usH.length,
+      data: all.map(h => ({
         ...h,
-        avg_price_formatted:        h.avg_price.toLocaleString('ko-KR') + '원',
-        current_price_formatted:    h.current_price.toLocaleString('ko-KR') + '원',
-        eval_profit_loss_formatted: h.eval_profit_loss.toLocaleString('ko-KR') + '원',
+        avg_price_formatted:        h.market === 'KR' ? h.avg_price.toLocaleString('ko-KR') + '원' : '$' + h.avg_price.toFixed(2),
+        current_price_formatted:    h.market === 'KR' ? h.current_price.toLocaleString('ko-KR') + '원' : '$' + h.current_price.toFixed(2),
+        eval_profit_loss_formatted: h.market === 'KR' ? h.eval_profit_loss.toLocaleString('ko-KR') + '원' : '$' + h.eval_profit_loss.toFixed(2),
         eval_return_rate_formatted: h.eval_return_rate.toFixed(2) + '%',
       })),
     });
   } catch (e) {
-    return c.json({
-      success: false,
-      message: String(e),
-      elapsed_ms: Date.now() - start,
-    }, 500);
+    return c.json({ success: false, message: String(e), elapsed_ms: Date.now() - start }, 500);
   }
 });
 
-// ── 6. 현재가 조회 (단건) ────────────────────────────────────
-test.get('/price/:ticker', async (c) => {
-  const ticker = c.req.param('ticker');
+// ── 6. 현재가 조회 (:market/:ticker) ────────────────────────
+test.get('/price/:market/:ticker', async (c) => {
+  const market = (c.req.param('market') || 'KR').toUpperCase() as 'KR' | 'US';
+  const ticker = c.req.param('ticker').toUpperCase();
   const config = buildConfig(c.env);
   const missing = checkMissing(config);
   if (missing) return c.json({ success: false, message: missing }, 400);
@@ -266,28 +237,84 @@ test.get('/price/:ticker', async (c) => {
   const start = Date.now();
   try {
     const token = await getAccessToken(config, c.env.KV);
-    const price  = await getCurrentPrice(config, token, ticker);
+    const price = market === 'KR'
+      ? await getKRPrice(config, token, ticker)
+      : await getUSPrice(config, token, ticker);
 
     return c.json({
       success: true,
-      message: `${ticker} 현재가 조회 성공`,
+      message: `[${market}] ${ticker} 현재가 조회 성공`,
       elapsed_ms: Date.now() - start,
       data: {
-        ticker,
-        price,
-        price_formatted: price.toLocaleString('ko-KR') + '원',
+        ticker, market, price,
+        price_formatted: market === 'KR' ? price.toLocaleString('ko-KR') + '원' : '$' + price.toFixed(2),
       },
     });
   } catch (e) {
-    return c.json({
-      success: false,
-      message: String(e),
-      elapsed_ms: Date.now() - start,
-    }, 500);
+    return c.json({ success: false, message: String(e), elapsed_ms: Date.now() - start }, 500);
   }
 });
 
-// ── 7. 전체 연결 상태 한번에 확인 ────────────────────────────
+// ── 하위 호환: /price/:ticker (KR 기본) ─────────────────────
+test.get('/price/:ticker', async (c) => {
+  const ticker = c.req.param('ticker').toUpperCase();
+  const config = buildConfig(c.env);
+  const missing = checkMissing(config);
+  if (missing) return c.json({ success: false, message: missing }, 400);
+
+  const start = Date.now();
+  try {
+    const token = await getAccessToken(config, c.env.KV);
+    const price = await getKRPrice(config, token, ticker);
+    return c.json({
+      success: true,
+      message: `[KR] ${ticker} 현재가 조회 성공`,
+      elapsed_ms: Date.now() - start,
+      data: { ticker, market: 'KR', price, price_formatted: price.toLocaleString('ko-KR') + '원' },
+    });
+  } catch (e) {
+    return c.json({ success: false, message: String(e), elapsed_ms: Date.now() - start }, 500);
+  }
+});
+
+// ── 7. 15분봉 + BB 신호 테스트 ──────────────────────────────
+test.get('/bb/:market/:ticker', async (c) => {
+  const market = (c.req.param('market') || 'KR').toUpperCase() as 'KR' | 'US';
+  const ticker = c.req.param('ticker').toUpperCase();
+  const config = buildConfig(c.env);
+  const missing = checkMissing(config);
+  if (missing) return c.json({ success: false, message: missing }, 400);
+
+  const start = Date.now();
+  try {
+    const token = await getAccessToken(config, c.env.KV);
+    const candles = market === 'KR'
+      ? await getKR15MinCandles(config, token, ticker, 40)
+      : await getUS15MinCandles(config, token, ticker, 40);
+
+    const closes = candles.map(c => c.close);
+    const dts    = candles.map(c => c.datetime);
+    const bands  = calcBB(closes, dts);
+    const signal = getBBSignal(bands, false, false);
+    const recent = bands.slice(-5);
+
+    return c.json({
+      success: true,
+      message: `[${market}] ${ticker} 15분봉 BB 테스트 성공`,
+      elapsed_ms: Date.now() - start,
+      candle_count: candles.length,
+      signal: signal.action,
+      reason: signal.reason,
+      current_band: signal.current,
+      prev_band: signal.prev,
+      recent_bands: recent,
+    });
+  } catch (e) {
+    return c.json({ success: false, message: String(e), elapsed_ms: Date.now() - start }, 500);
+  }
+});
+
+// ── 8. 전체 연결 상태 한번에 확인 ────────────────────────────
 test.get('/all', async (c) => {
   const config = buildConfig(c.env);
   const results: Record<string, { success: boolean; message: string; elapsed_ms: number; data?: unknown }> = {};
@@ -317,46 +344,74 @@ test.get('/all', async (c) => {
   }
 
   if (!token) {
-    return c.json({
-      success: false,
-      message: '토큰 발급 실패 — 이후 테스트 중단',
-      results,
-    });
+    return c.json({ success: false, message: '토큰 발급 실패 — 이후 테스트 중단', results });
   }
 
-  // (3) 주문가능금액
+  // (3) KR 주문가능금액
   {
     const t0 = Date.now();
     try {
-      const bal = await getOrderableBalance(config, token, 0);
-      results.orderable = {
+      const cash = await getKROrderableCash(config, token);
+      results.kr_orderable = {
         success: true,
-        message: `주문가능금액: ${bal.cash.toLocaleString('ko-KR')}원`,
+        message: `KR 주문가능금액: ${cash.toLocaleString('ko-KR')}원`,
         elapsed_ms: Date.now() - t0,
-        data: bal,
+        data: { cash },
       };
     } catch (e) {
-      results.orderable = { success: false, message: String(e), elapsed_ms: Date.now() - t0 };
+      results.kr_orderable = { success: false, message: String(e), elapsed_ms: Date.now() - t0 };
     }
   }
 
-  // (4) 보유종목
+  // (4) US 주문가능금액
   {
     const t0 = Date.now();
     try {
-      const holdings = await getHoldings(config, token);
-      results.holdings = {
+      const cash = await getUSOrderableCash(config, token);
+      results.us_orderable = {
         success: true,
-        message: `보유종목 ${holdings.length}개`,
+        message: `US 주문가능금액: $${cash.toFixed(2)}`,
+        elapsed_ms: Date.now() - t0,
+        data: { cash },
+      };
+    } catch (e) {
+      results.us_orderable = { success: false, message: String(e), elapsed_ms: Date.now() - t0 };
+    }
+  }
+
+  // (5) KR 보유종목
+  {
+    const t0 = Date.now();
+    try {
+      const holdings = await getKRHoldings(config, token);
+      results.kr_holdings = {
+        success: true,
+        message: `KR 보유종목 ${holdings.length}개`,
         elapsed_ms: Date.now() - t0,
         data: holdings,
       };
     } catch (e) {
-      results.holdings = { success: false, message: String(e), elapsed_ms: Date.now() - t0 };
+      results.kr_holdings = { success: false, message: String(e), elapsed_ms: Date.now() - t0 };
     }
   }
 
-  const allOk = Object.values(results).every((r) => r.success);
+  // (6) US 보유종목
+  {
+    const t0 = Date.now();
+    try {
+      const holdings = await getUSHoldings(config, token);
+      results.us_holdings = {
+        success: true,
+        message: `US 보유종목 ${holdings.length}개`,
+        elapsed_ms: Date.now() - t0,
+        data: holdings,
+      };
+    } catch (e) {
+      results.us_holdings = { success: false, message: String(e), elapsed_ms: Date.now() - t0 };
+    }
+  }
+
+  const allOk = Object.values(results).every(r => r.success);
   return c.json({ success: allOk, message: allOk ? '전체 연결 정상' : '일부 항목 실패', results });
 });
 
@@ -378,8 +433,7 @@ function checkMissing(cfg: ReturnType<typeof buildConfig>): string | null {
 }
 
 function fmt(s: string): string {
-  const n = parseFloat(s || '0');
-  return n.toLocaleString('ko-KR') + '원';
+  return parseFloat(s || '0').toLocaleString('ko-KR') + '원';
 }
 
 export default test;
