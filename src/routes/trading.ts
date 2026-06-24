@@ -1,4 +1,4 @@
-// 트레이딩 API 라우트 v3
+// 트레이딩 API 라우트 v4
 import { Hono } from 'hono';
 import { runTradeScan, syncHoldings, isKRMarketOpen, isUSMarketOpen } from '../lib/trade-engine';
 import {
@@ -10,7 +10,7 @@ import { calcBB, getBBSignal } from '../lib/bollinger';
 import { runKISBacktest } from '../lib/backtest';
 import {
   loadUniverseToDB, getScanStats, getSignalStocks,
-  getUniverseStats, STOCK_UNIVERSE,
+  loadFullUniverseFromKIS, getDBUniverseStats,
 } from '../lib/stock-universe';
 
 type Bindings = {
@@ -55,23 +55,27 @@ trading.get('/dashboard', async (c) => {
 // ─── 스캔 현황 (전체시장 스캔 대시보드용) ────────────────────
 trading.get('/scan-status', async (c) => {
   try {
-    const [stats, buySigs, sellSigs, cfgRows] = await Promise.all([
+    const [stats, buySigs, sellSigs, cfgRows, dbUniverse] = await Promise.all([
       getScanStats(c.env.DB),
       getSignalStocks(c.env.DB, 'BUY', 50),
       getSignalStocks(c.env.DB, 'SELL', 50),
       c.env.DB.prepare(
         `SELECT key, value FROM system_config WHERE key IN (
           'last_scan_at','scan_batch_size','scan_batch_offset_kr','scan_batch_offset_us',
-          'kr_trade_enabled','us_trade_enabled','scan_kr_enabled','scan_us_enabled'
+          'kr_trade_enabled','us_trade_enabled','scan_kr_enabled','scan_us_enabled',
+          'universe_load_source','universe_load_date','universe_loaded_at'
         )`
       ).all<{ key: string; value: string }>(),
+      getDBUniverseStats(c.env.DB),
     ]);
 
     const cfgMap: Record<string, string> = {};
     (cfgRows.results || []).forEach(r => { cfgMap[r.key] = r.value; });
 
-    const universeStats = getUniverseStats();
-    const batchSize = parseInt(cfgMap['scan_batch_size'] || '20');
+    const batchSize = parseInt(
+      (await c.env.DB.prepare("SELECT value FROM system_config WHERE key='scan_batch_size'")
+        .first<{value:string}>())?.value || '20'
+    );
     const krOffset  = parseInt(cfgMap['scan_batch_offset_kr'] || '0');
     const usOffset  = parseInt(cfgMap['scan_batch_offset_us'] || '0');
 
@@ -84,8 +88,8 @@ trading.get('/scan-status', async (c) => {
     return c.json({
       success: true,
       data: {
-        // 전체 종목 수
-        universe: universeStats,
+        // DB 기반 실제 종목 수
+        universe: dbUniverse,
         // 스캔 통계
         scan: {
           ...stats,
@@ -116,9 +120,11 @@ trading.get('/scan-status', async (c) => {
           sell_condition: 'above_upper=true AND current.close < current.upper',
           batch_size: batchSize,
           markets: ['KOSPI', 'KOSDAQ', 'NASD', 'NYSE', 'AMEX'],
-          kr_scan_tickers: universeStats.kr_total,
-          us_scan_tickers: universeStats.us_total,
-          total_scan_tickers: universeStats.total,
+          kr_scan_tickers: dbUniverse.kr_total,
+          us_scan_tickers: dbUniverse.us_total,
+          total_scan_tickers: dbUniverse.total,
+          load_source: dbUniverse.load_source,
+          load_date: dbUniverse.load_date,
         },
       },
     });
@@ -138,9 +144,38 @@ trading.post('/universe/load', async (c) => {
 });
 
 trading.get('/universe/stats', async (c) => {
-  const stats = getUniverseStats();
-  const dbRow = await c.env.DB.prepare('SELECT COUNT(*) as cnt FROM stock_universe WHERE is_active=1').first<{cnt:number}>();
-  return c.json({ success: true, data: { ...stats, db_count: dbRow?.cnt || 0 } });
+  try {
+    const dbStats = await getDBUniverseStats(c.env.DB);
+    return c.json({ success: true, data: dbStats });
+  } catch (e) {
+    return c.json({ success: false, message: String(e) }, 500);
+  }
+});
+
+// ─── KIS 마스터 파일에서 전체 종목 로드 ──────────────────────
+// 최초 또는 주기적으로 실행 — KOSPI/KOSDAQ ~3,600종목 + NASD/NYSE/AMEX ~12,000+ 종목
+// 수 분 소요 가능 (15분봉 API와 다른 공개 URL에서 다운로드)
+trading.post('/universe/fetch-from-kis', async (c) => {
+  const body = await c.req.json().catch(() => ({})) as {
+    markets?: string[];
+    include_etf?: boolean;
+  };
+  const markets = (body.markets || ['KOSPI','KOSDAQ','NASD','NYSE','AMEX']) as Array<'KOSPI'|'KOSDAQ'|'NASD'|'NYSE'|'AMEX'>;
+  const includeETF = body.include_etf !== false;
+
+  try {
+    const result = await loadFullUniverseFromKIS(c.env.DB, markets, includeETF);
+    // 완료 후 DB 실제 통계도 같이 반환
+    const dbStats = await getDBUniverseStats(c.env.DB);
+    return c.json({
+      success: true,
+      message: `KIS 마스터 로드 완료: ${result.total_inserted}개 신규, ${result.total_updated}개 업데이트`,
+      ...result,
+      db_stats: dbStats,
+    });
+  } catch (e) {
+    return c.json({ success: false, message: String(e) }, 500);
+  }
 });
 
 trading.get('/universe/list', async (c) => {

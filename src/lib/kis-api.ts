@@ -408,6 +408,188 @@ export async function sellUS(
 }
 
 // ══════════════════════════════════════════════════════════════
+//  KIS 종목 마스터 파일 다운로드 & 파싱
+//  URL: https://new.real.download.dws.co.kr/common/master/
+//  KR:  kospi_code.mst.zip, kosdaq_code.mst.zip
+//  US:  nasmst.cod.zip, nysmst.cod.zip, amsmst.cod.zip
+// ══════════════════════════════════════════════════════════════
+
+export interface MasterStock {
+  ticker: string;
+  ticker_name: string;
+  market: 'KR' | 'US';
+  exchange: 'KOSPI' | 'KOSDAQ' | 'NASD' | 'NYSE' | 'AMEX';
+}
+
+const MASTER_BASE = 'https://new.real.download.dws.co.kr/common/master';
+
+/**
+ * KIS KOSPI/KOSDAQ 종목 마스터 파일 다운로드 & 파싱
+ * 파일 포맷: 고정 바이너리 혼합 텍스트 (CP949)
+ *   - 단축코드 9바이트 (0~8)
+ *   - 표준코드 12바이트 (9~20)
+ *   - 한글명 가변 (21 ~ len-228)
+ *   - 나머지 228바이트: 재무 등 부가정보
+ * 
+ * Cloudflare Workers에서는 unzip을 직접 못하므로
+ * pako(inflate) 또는 DecompressionStream 사용
+ */
+export async function fetchKRMasterStocks(
+  exchange: 'KOSPI' | 'KOSDAQ'
+): Promise<MasterStock[]> {
+  const fname = exchange === 'KOSPI' ? 'kospi_code.mst.zip' : 'kosdaq_code.mst.zip';
+  const url = `${MASTER_BASE}/${fname}`;
+
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`KR Master fetch failed: ${res.status} ${url}`);
+
+  const zipBuf = await res.arrayBuffer();
+  // ZIP 파싱: Central Directory를 찾아 첫 번째 Local File을 deflate 해제
+  const mstBuf = await extractFirstFileFromZip(zipBuf);
+  return parseKRMaster(mstBuf, exchange);
+}
+
+/**
+ * KIS 미국 종목 마스터 파일 다운로드 & 파싱
+ * 파일 포맷: 탭 구분 텍스트 (CP949)
+ *   컬럼: National code, Exchange id, Exchange code, Exchange name,
+ *          Symbol(4), realtime symbol(5), Korea name(6), English name(7),
+ *          Security type(8): 1=Index, 2=Stock, 3=ETP(ETF), 4=Warrant
+ */
+export async function fetchUSMasterStocks(
+  exchange: 'NASD' | 'NYSE' | 'AMEX',
+  includeETF = true
+): Promise<MasterStock[]> {
+  const codeMap = { NASD: 'nas', NYSE: 'nys', AMEX: 'ams' };
+  const val = codeMap[exchange];
+  const url = `${MASTER_BASE}/${val}mst.cod.zip`;
+
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`US Master fetch failed: ${res.status} ${url}`);
+
+  const zipBuf = await res.arrayBuffer();
+  const codBuf = await extractFirstFileFromZip(zipBuf);
+  return parseUSMaster(codBuf, exchange, includeETF);
+}
+
+// ── ZIP 파싱: 첫 번째 로컬 파일을 deflate 해제 ───────────────
+async function extractFirstFileFromZip(zipBuf: ArrayBuffer): Promise<ArrayBuffer> {
+  const view = new DataView(zipBuf);
+  const bytes = new Uint8Array(zipBuf);
+
+  // Local File Header signature: PK\x03\x04 (0x04034b50)
+  if (view.getUint32(0, true) !== 0x04034b50) {
+    throw new Error('Invalid ZIP: no local file header');
+  }
+
+  const compression   = view.getUint16(8, true);   // 0=stored, 8=deflate
+  const compressedSz  = view.getUint32(18, true);
+  const fileNameLen   = view.getUint16(26, true);
+  const extraLen      = view.getUint16(28, true);
+  const dataOffset    = 30 + fileNameLen + extraLen;
+
+  const compressedData = bytes.slice(dataOffset, dataOffset + compressedSz);
+
+  if (compression === 0) {
+    // Stored (no compression)
+    return compressedData.buffer;
+  } else if (compression === 8) {
+    // Deflate — use DecompressionStream (Web API, supported in CF Workers)
+    const ds = new DecompressionStream('deflate-raw');
+    const writer = ds.writable.getWriter();
+    const reader = ds.readable.getReader();
+    writer.write(compressedData);
+    writer.close();
+
+    const chunks: Uint8Array[] = [];
+    let totalLen = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      totalLen += value.length;
+    }
+    const result = new Uint8Array(totalLen);
+    let offset = 0;
+    for (const chunk of chunks) { result.set(chunk, offset); offset += chunk.length; }
+    return result.buffer;
+  } else {
+    throw new Error(`Unsupported ZIP compression: ${compression}`);
+  }
+}
+
+// ── KR 마스터 파싱 (고정 바이너리 혼합 텍스트, CP949) ─────────
+function parseKRMaster(buf: ArrayBuffer, exchange: 'KOSPI' | 'KOSDAQ'): MasterStock[] {
+  const decoder = new TextDecoder('euc-kr');
+  const bytes   = new Uint8Array(buf);
+  const results: MasterStock[] = [];
+
+  let pos = 0;
+  while (pos < bytes.length) {
+    // 줄 끝(\r\n 또는 \n) 찾기
+    let lineEnd = pos;
+    while (lineEnd < bytes.length && bytes[lineEnd] !== 0x0A) lineEnd++;
+    if (lineEnd >= bytes.length) break;
+
+    const lineLen = lineEnd - pos + 1;
+    if (lineLen < 30) { pos = lineEnd + 1; continue; }
+
+    const line = bytes.slice(pos, lineEnd);
+    pos = lineEnd + 1;
+
+    try {
+      // 단축코드: 첫 9바이트
+      const code = decoder.decode(line.slice(0, 9)).trim();
+      // 6자리 숫자 = 일반 주식 (우선주 포함)
+      if (!/^\d{6}$/.test(code)) continue;
+
+      // 한글명: 21 ~ (len-228) 바이트 구간
+      const trailingLen = Math.min(228, line.length - 21);
+      const nameEnd = line.length - trailingLen;
+      const name = decoder.decode(line.slice(21, nameEnd)).trim();
+      if (!name) continue;
+
+      results.push({ ticker: code, ticker_name: name, market: 'KR', exchange });
+    } catch (_) { /* skip */ }
+  }
+  return results;
+}
+
+// ── US 마스터 파싱 (탭 구분, CP949) ──────────────────────────
+function parseUSMaster(buf: ArrayBuffer, exchange: 'NASD' | 'NYSE' | 'AMEX', includeETF: boolean): MasterStock[] {
+  const decoder = new TextDecoder('euc-kr');
+  const text    = decoder.decode(new Uint8Array(buf));
+  const results: MasterStock[] = [];
+
+  for (const line of text.split('\n')) {
+    const parts = line.split('\t');
+    if (parts.length < 9) continue;
+
+    const symbol   = parts[4]?.trim();
+    const krName   = parts[6]?.trim();
+    const enName   = parts[7]?.trim();
+    const secType  = parts[8]?.trim();
+
+    if (!symbol || symbol.length === 0) continue;
+    // type: 2=Stock, 3=ETF/ETP
+    const isStock = secType === '2';
+    const isETF   = secType === '3';
+    if (!isStock && !(includeETF && isETF)) continue;
+
+    // 티커에 특수문자 포함된 경우 스킵 (KIS 주문 불가)
+    if (/[^A-Z0-9.]/.test(symbol)) continue;
+
+    results.push({
+      ticker: symbol,
+      ticker_name: krName || enName || symbol,
+      market: 'US',
+      exchange,
+    });
+  }
+  return results;
+}
+
+// ══════════════════════════════════════════════════════════════
 //  내부 헬퍼
 // ══════════════════════════════════════════════════════════════
 

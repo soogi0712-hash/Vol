@@ -359,3 +359,153 @@ export async function getSignalStocks(
   ).bind(signal, todayStr, limit).all();
   return rows.results as Array<{ticker:string;ticker_name:string;market:string;exchange:string;last_scanned_at:string}>;
 }
+
+// ── KIS 마스터 파일로 전체 종목 로드 ──────────────────────────
+
+export interface FullUniverseResult {
+  total_inserted: number;
+  total_updated: number;
+  total_skipped: number;
+  by_exchange: Record<string, number>;
+  errors: string[];
+  source: 'kis_master';
+}
+
+/**
+ * KIS 마스터 파일에서 전체 종목을 DB에 로드한다.
+ * - KOSPI: ~1,800종목 (6자리 코드 주식)
+ * - KOSDAQ: ~1,800종목
+ * - NASD: ~5,200종목 (주식+ETF)
+ * - NYSE: ~2,900종목
+ * - AMEX: ~4,500종목
+ * 
+ * 기존 임베드된 343종목은 그대로 유지 (UNIQUE 제약으로 중복 무시)
+ * 새로 로드된 종목이 추가되고, 이름은 KIS 마스터 기준으로 업데이트
+ * 
+ * @param db  D1Database
+ * @param markets  로드할 시장 목록 (기본: 전체)
+ * @param includeETF  US ETF 포함 여부 (기본: true)
+ */
+export async function loadFullUniverseFromKIS(
+  db: D1Database,
+  markets: Array<'KOSPI'|'KOSDAQ'|'NASD'|'NYSE'|'AMEX'> = ['KOSPI','KOSDAQ','NASD','NYSE','AMEX'],
+  includeETF = true
+): Promise<FullUniverseResult> {
+  const { fetchKRMasterStocks, fetchUSMasterStocks } = await import('./kis-api');
+  const byExchange: Record<string, number> = {};
+  const errors: string[] = [];
+  let total_inserted = 0;
+  let total_updated  = 0;
+  let total_skipped  = 0;
+
+  // 처리할 거래소가 1개라도 제한 이내로 처리
+  for (const exch of markets) {
+    try {
+      let stocks: Array<{ ticker: string; ticker_name: string; market: 'KR' | 'US'; exchange: string }> = [];
+
+      if (exch === 'KOSPI' || exch === 'KOSDAQ') {
+        stocks = await fetchKRMasterStocks(exch);
+      } else {
+        stocks = await fetchUSMasterStocks(exch as 'NASD'|'NYSE'|'AMEX', includeETF);
+      }
+
+      // D1 batch API로 대량 UPSERT (INSERT OR REPLACE)
+      // ticker + exchange UNIQUE 제약 활용 — 기존 row는 이름만 갱신
+      // 500개씩 D1 batch — 1회 batch = 1 HTTP round-trip
+      const BATCH = 500;
+      let exchInserted = 0;
+      let exchUpdated  = 0;
+
+      for (let i = 0; i < stocks.length; i += BATCH) {
+        const chunk = stocks.slice(i, i + BATCH);
+
+        // D1 batch: statements 배열로 단일 트랜잭션 처리
+        const stmts = chunk.map(s =>
+          db.prepare(
+            `INSERT INTO stock_universe (ticker, ticker_name, market, exchange)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT(ticker, exchange) DO UPDATE SET
+               ticker_name = excluded.ticker_name,
+               is_active   = 1,
+               updated_at  = CURRENT_TIMESTAMP`
+          ).bind(s.ticker, s.ticker_name, s.market, s.exchange)
+        );
+
+        const results = await db.batch(stmts);
+        for (const r of results) {
+          const changes = r.meta?.changes ?? 0;
+          if (changes > 0) {
+            // changes=1: INSERT 또는 UPDATE (rows_written > rows_read = insert)
+            exchInserted++;
+          } else {
+            exchUpdated++;
+          }
+        }
+      }
+
+      total_inserted += exchInserted;
+      total_updated  += exchUpdated;
+      byExchange[exch] = stocks.length;
+
+    } catch (e) {
+      const msg = `${exch} 로드 실패: ${e}`;
+      errors.push(msg);
+      byExchange[exch] = 0;
+    }
+  }
+
+  // system_config 업데이트
+  const now = new Date().toISOString();
+  const krTotal = (byExchange['KOSPI']||0) + (byExchange['KOSDAQ']||0);
+  const usTotal = (byExchange['NASD']||0) + (byExchange['NYSE']||0) + (byExchange['AMEX']||0);
+
+  await db.batch([
+    db.prepare("INSERT OR REPLACE INTO system_config (key, value, description) VALUES ('universe_loaded_at', ?, '종목 유니버스 마지막 로드 시각')").bind(now),
+    db.prepare("INSERT OR REPLACE INTO system_config (key, value, description) VALUES ('universe_load_source', 'kis_master', '마지막 로드 소스')"),
+    db.prepare("INSERT OR REPLACE INTO system_config (key, value, description) VALUES ('universe_load_date', ?, '마지막 종목 마스터 로드 날짜')").bind(now.slice(0,10)),
+    db.prepare("INSERT OR REPLACE INTO system_config (key, value, description) VALUES ('universe_kr_count', ?, 'DB에 로드된 KR 종목 수')").bind(String(krTotal)),
+    db.prepare("INSERT OR REPLACE INTO system_config (key, value, description) VALUES ('universe_us_count', ?, 'DB에 로드된 US 종목 수')").bind(String(usTotal)),
+  ]);
+
+  return { total_inserted, total_updated, total_skipped, by_exchange: byExchange, errors, source: 'kis_master' };
+}
+
+/**
+ * DB의 실제 거래소별 종목 수 조회
+ */
+export async function getDBUniverseStats(db: D1Database): Promise<{
+  total: number;
+  by_exchange: Record<string, number>;
+  kr_total: number;
+  us_total: number;
+  load_source: string;
+  load_date: string;
+  loaded_at: string;
+}> {
+  const rows = await db.prepare(
+    `SELECT exchange, COUNT(*) as cnt FROM stock_universe WHERE is_active=1 GROUP BY exchange`
+  ).all<{exchange:string; cnt:number}>();
+
+  const by_exchange: Record<string, number> = {};
+  let total = 0;
+  for (const r of (rows.results||[])) {
+    by_exchange[r.exchange] = r.cnt;
+    total += r.cnt;
+  }
+
+  const cfgRows = await db.prepare(
+    `SELECT key, value FROM system_config WHERE key IN ('universe_load_source','universe_load_date','universe_loaded_at')`
+  ).all<{key:string;value:string}>();
+  const cfg: Record<string,string> = {};
+  (cfgRows.results||[]).forEach(r => { cfg[r.key] = r.value; });
+
+  const kr_total = (by_exchange['KOSPI']||0) + (by_exchange['KOSDAQ']||0);
+  const us_total = (by_exchange['NASD']||0) + (by_exchange['NYSE']||0) + (by_exchange['AMEX']||0);
+
+  return {
+    total, by_exchange, kr_total, us_total,
+    load_source: cfg['universe_load_source'] || 'embedded',
+    load_date:   cfg['universe_load_date'] || '',
+    loaded_at:   cfg['universe_loaded_at'] || '',
+  };
+}

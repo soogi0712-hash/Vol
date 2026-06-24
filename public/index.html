@@ -144,9 +144,12 @@
     <!-- 스캔 현황 헤더 -->
     <div class="flex items-center justify-between mb-4">
       <h2 class="text-base font-bold text-gray-800"><i class="fas fa-satellite-dish text-blue-600 mr-2"></i>전체시장 배치 스캔 현황</h2>
-      <div class="flex gap-2">
+      <div class="flex gap-2 flex-wrap justify-end">
         <button onclick="loadUniverse()" class="btn-success text-xs py-1.5 px-3" id="load-universe-btn">
-          <i class="fas fa-download mr-1"></i>종목 로드
+          <i class="fas fa-download mr-1"></i>샘플 종목 로드
+        </button>
+        <button onclick="loadKISMasterFull()" class="btn-primary text-xs py-1.5 px-3" id="btn-kis-master" title="KIS 공개 마스터 파일에서 KOSPI/KOSDAQ/NASD/NYSE/AMEX 전체 종목 로드">
+          <i class="fas fa-cloud-download-alt mr-1"></i>KIS 전체 종목 로드
         </button>
         <button onclick="loadScanStatus()" class="btn-gray text-xs py-1.5 px-3">
           <i class="fas fa-refresh mr-1"></i>새로고침
@@ -189,6 +192,25 @@
         <div>
           <span class="text-gray-400">매도 조건</span>
           <p class="font-semibold text-red-600 mt-0.5 text-xs" id="fn-sell-cond">-</p>
+        </div>
+      </div>
+      <!-- 종목 마스터 로드 상태 -->
+      <div class="mt-3 pt-3 border-t border-gray-200 grid grid-cols-2 md:grid-cols-4 gap-3 text-xs" id="universe-source-panel">
+        <div>
+          <span class="text-gray-400">종목 소스</span>
+          <p class="font-bold mt-0.5" id="fn-load-source"><span class="text-gray-400">-</span></p>
+        </div>
+        <div>
+          <span class="text-gray-400">마스터 로드일</span>
+          <p class="font-semibold text-gray-800 mt-0.5" id="fn-load-date">-</p>
+        </div>
+        <div>
+          <span class="text-gray-400">KR 등록 종목</span>
+          <p class="font-bold text-blue-700 mt-0.5" id="fn-kr-db-count">-</p>
+        </div>
+        <div>
+          <span class="text-gray-400">US 등록 종목</span>
+          <p class="font-bold text-green-700 mt-0.5" id="fn-us-db-count">-</p>
         </div>
       </div>
     </div>
@@ -628,13 +650,26 @@ async function loadScanStatus() {
     // 스캔 함수 정보
     document.getElementById('fn-name').textContent       = fn.name || '-';
     document.getElementById('fn-strategy').textContent   = fn.strategy || '-';
-    document.getElementById('fn-kr-tickers').textContent = (fn.kr_scan_tickers||0) + '종목';
-    document.getElementById('fn-us-tickers').textContent = (fn.us_scan_tickers||0) + '종목';
+    document.getElementById('fn-kr-tickers').textContent = fmtNum(fn.kr_scan_tickers||0) + '종목';
+    document.getElementById('fn-us-tickers').textContent = fmtNum(fn.us_scan_tickers||0) + '종목';
     document.getElementById('fn-batch').textContent      = (fn.batch_size||20) + '종목/회';
-    document.getElementById('fn-total').textContent      = (fn.total_scan_tickers||0) + '종목';
+    document.getElementById('fn-total').textContent      = fmtNum(fn.total_scan_tickers||0) + '종목';
     document.getElementById('fn-buy-cond').textContent   = fn.buy_condition || '-';
     document.getElementById('fn-sell-cond').textContent  = fn.sell_condition || '-';
-    document.getElementById('total-tickers-badge').textContent = '대상: ' + (fn.total_scan_tickers||0) + '종목';
+    document.getElementById('total-tickers-badge').textContent = '대상: ' + fmtNum(fn.total_scan_tickers||0) + '종목';
+
+    // 종목 마스터 소스 표시
+    const srcEl = document.getElementById('fn-load-source');
+    if (u.load_source === 'kis_master') {
+      srcEl.innerHTML = '<span class="text-green-600 font-bold">✓ KIS 마스터</span>';
+    } else if (u.load_source === 'embedded') {
+      srcEl.innerHTML = '<span class="text-yellow-600 font-bold">⚠ 샘플 내장 데이터</span>';
+    } else {
+      srcEl.innerHTML = '<span class="text-gray-400">-</span>';
+    }
+    document.getElementById('fn-load-date').textContent   = u.load_date || '미로드';
+    document.getElementById('fn-kr-db-count').textContent = fmtNum(u.kr_total||0) + '종목';
+    document.getElementById('fn-us-db-count').textContent = fmtNum(u.us_total||0) + '종목';
 
     // 거래소별 카드
     renderExchangeCards(d.scan.by_exchange);
@@ -746,7 +781,7 @@ async function loadErrorStocks() {
   } catch(e) {}
 }
 
-// ── 종목 유니버스 로드 ───────────────────────────────────────
+// ── 종목 유니버스 로드 (343개 샘플) ─────────────────────────
 async function loadUniverse() {
   const btn = document.getElementById('load-universe-btn');
   btn.disabled = true;
@@ -755,7 +790,7 @@ async function loadUniverse() {
     const res = await fetch('/api/trading/universe/load', { method: 'POST' });
     const json = await res.json();
     if (json.success) {
-      showToast(`종목 로드 완료: 신규 ${json.inserted}개 / 전체 ${json.total}개`, 'success');
+      showToast(`샘플 종목 로드 완료: 신규 ${json.inserted}개 / 전체 ${json.total}개`, 'success');
       loadScanStatus();
     } else {
       showToast('로드 실패: ' + json.message, 'error');
@@ -764,7 +799,74 @@ async function loadUniverse() {
     showToast('오류: ' + e, 'error');
   } finally {
     btn.disabled = false;
-    btn.innerHTML = '<i class="fas fa-download mr-1"></i>종목 로드';
+    btn.innerHTML = '<i class="fas fa-download mr-1"></i>샘플 종목 로드';
+  }
+}
+
+// ── KIS 마스터 파일에서 전체 종목 로드 ──────────────────────
+// KOSPI/KOSDAQ ~3,600 + NASD/NYSE/AMEX ~12,000+ 종목
+// 수십 초 소요 가능 — Cloudflare Workers 30초 CPU 제한 주의
+async function loadKISMasterFull() {
+  const btn = document.getElementById('btn-kis-master');
+  // 사용자 확인
+  if (!confirm(
+    'KIS 공개 마스터 파일에서 전체 종목을 로드합니다.\n' +
+    '• KOSPI + KOSDAQ: 약 3,600종목\n' +
+    '• NASD + NYSE + AMEX: 약 12,000+종목 (ETF 포함)\n\n' +
+    '처음 로드 시 수십 초 소요될 수 있습니다.\n' +
+    '계속하시겠습니까?'
+  )) return;
+
+  btn.disabled = true;
+  btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-1"></i>KIS 마스터 로드 중...';
+
+  // 진행 상태 표시
+  const srcEl = document.getElementById('fn-load-source');
+  if (srcEl) srcEl.innerHTML = '<span class="text-blue-500 animate-pulse">⏳ 로드 중...</span>';
+
+  const startTime = Date.now();
+  try {
+    const res = await fetch('/api/trading/universe/fetch-from-kis', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ markets: ['KOSPI','KOSDAQ','NASD','NYSE','AMEX'], include_etf: true }),
+    });
+    const json = await res.json();
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+
+    if (json.success) {
+      const db = json.db_stats;
+      const byEx = json.by_exchange || {};
+      const lines = [
+        `✅ KIS 마스터 로드 완료 (${elapsed}초)`,
+        `신규: ${fmtNum(json.total_inserted)}개 / 업데이트: ${fmtNum(json.total_updated)}개`,
+        `DB 총 종목: ${fmtNum(db?.total||0)}종목`,
+        `KR: ${fmtNum(db?.kr_total||0)} / US: ${fmtNum(db?.us_total||0)}`,
+      ];
+      if (json.errors && json.errors.length > 0) {
+        lines.push(`⚠ 오류 ${json.errors.length}개: ${json.errors.slice(0,2).join(', ')}`);
+      }
+      showToast(lines.join('\n'), 'success');
+
+      // 거래소별 상세 팝업
+      const detail = Object.entries(byEx)
+        .filter(([,v]) => v > 0)
+        .map(([k,v]) => `${k}: ${fmtNum(v)}종목`)
+        .join(' | ');
+      if (detail) showToast('거래소별 로드: ' + detail, 'success');
+
+      loadScanStatus(); // 화면 갱신
+    } else {
+      showToast('KIS 마스터 로드 실패: ' + (json.message || '알 수 없는 오류'), 'error');
+      if (srcEl) srcEl.innerHTML = '<span class="text-red-500">✗ 로드 실패</span>';
+    }
+  } catch(e) {
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+    showToast(`KIS 마스터 로드 오류 (${elapsed}초): ${e}`, 'error');
+    if (srcEl) srcEl.innerHTML = '<span class="text-red-500">✗ 오류</span>';
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = '<i class="fas fa-cloud-download-alt mr-1"></i>KIS 전체 종목 로드';
   }
 }
 
