@@ -1,12 +1,17 @@
-// 트레이딩 API 라우트 v2
+// 트레이딩 API 라우트 v3
 import { Hono } from 'hono';
-import { runTradeScan, syncHoldings } from '../lib/trade-engine';
+import { runTradeScan, syncHoldings, isKRMarketOpen, isUSMarketOpen } from '../lib/trade-engine';
 import {
   getAccessToken, getKR15MinCandles, getUS15MinCandles,
   getKRHoldings, getUSHoldings, getKROrderableCash, getUSOrderableCash,
+  type ExchangeCode,
 } from '../lib/kis-api';
 import { calcBB, getBBSignal } from '../lib/bollinger';
 import { runKISBacktest } from '../lib/backtest';
+import {
+  loadUniverseToDB, getScanStats, getSignalStocks,
+  getUniverseStats, STOCK_UNIVERSE,
+} from '../lib/stock-universe';
 
 type Bindings = {
   DB: D1Database; KV: KVNamespace;
@@ -38,9 +43,126 @@ trading.get('/dashboard', async (c) => {
       auto_trade_enabled: cfgMap['auto_trade_enabled'] === '1',
       kr_trade_enabled:   cfgMap['kr_trade_enabled']   === '1',
       us_trade_enabled:   cfgMap['us_trade_enabled']   === '1',
-      last_scan_at: cfgMap['last_scan_at'] || null,
+      scan_kr_enabled:    cfgMap['scan_kr_enabled']    === '1',
+      scan_us_enabled:    cfgMap['scan_us_enabled']    === '1',
+      last_scan_at:       cfgMap['last_scan_at'] || null,
+      kr_market_open:     isKRMarketOpen(),
+      us_market_open:     isUSMarketOpen(),
     },
   });
+});
+
+// ─── 스캔 현황 (전체시장 스캔 대시보드용) ────────────────────
+trading.get('/scan-status', async (c) => {
+  try {
+    const [stats, buySigs, sellSigs, cfgRows] = await Promise.all([
+      getScanStats(c.env.DB),
+      getSignalStocks(c.env.DB, 'BUY', 50),
+      getSignalStocks(c.env.DB, 'SELL', 50),
+      c.env.DB.prepare(
+        `SELECT key, value FROM system_config WHERE key IN (
+          'last_scan_at','scan_batch_size','scan_batch_offset_kr','scan_batch_offset_us',
+          'kr_trade_enabled','us_trade_enabled','scan_kr_enabled','scan_us_enabled'
+        )`
+      ).all<{ key: string; value: string }>(),
+    ]);
+
+    const cfgMap: Record<string, string> = {};
+    (cfgRows.results || []).forEach(r => { cfgMap[r.key] = r.value; });
+
+    const universeStats = getUniverseStats();
+    const batchSize = parseInt(cfgMap['scan_batch_size'] || '20');
+    const krOffset  = parseInt(cfgMap['scan_batch_offset_kr'] || '0');
+    const usOffset  = parseInt(cfgMap['scan_batch_offset_us'] || '0');
+
+    // 다음 스캔 예정 시각 (다음 분)
+    const now = new Date();
+    const nextScan = new Date(now);
+    nextScan.setSeconds(0, 0);
+    nextScan.setMinutes(nextScan.getMinutes() + 1);
+
+    return c.json({
+      success: true,
+      data: {
+        // 전체 종목 수
+        universe: universeStats,
+        // 스캔 통계
+        scan: {
+          ...stats,
+          batch_size: batchSize,
+          kr_offset: krOffset,
+          us_offset: usOffset,
+          kr_market_open: isKRMarketOpen(),
+          us_market_open: isUSMarketOpen(),
+          last_scan_at: cfgMap['last_scan_at'] || null,
+          next_scan_at: nextScan.toISOString(),
+        },
+        // 신호 종목
+        buy_signal_stocks: buySigs,
+        sell_signal_stocks: sellSigs,
+        // 설정
+        config: {
+          kr_enabled: cfgMap['kr_trade_enabled'] === '1',
+          us_enabled: cfgMap['us_trade_enabled'] === '1',
+          scan_kr: cfgMap['scan_kr_enabled'] === '1',
+          scan_us: cfgMap['scan_us_enabled'] === '1',
+        },
+        // 스캔 함수 정보 (실제 구현 확인용)
+        scan_function: {
+          name: 'runTradeScan',
+          module: 'src/lib/trade-engine.ts',
+          strategy: '15분봉 BB(20,2) 종가',
+          buy_condition: 'prev.close < prev.lower AND current.close > current.lower',
+          sell_condition: 'above_upper=true AND current.close < current.upper',
+          batch_size: batchSize,
+          markets: ['KOSPI', 'KOSDAQ', 'NASD', 'NYSE', 'AMEX'],
+          kr_scan_tickers: universeStats.kr_total,
+          us_scan_tickers: universeStats.us_total,
+          total_scan_tickers: universeStats.total,
+        },
+      },
+    });
+  } catch (e) {
+    return c.json({ success: false, message: String(e) }, 500);
+  }
+});
+
+// ─── 종목 유니버스 로드/조회 ─────────────────────────────────
+trading.post('/universe/load', async (c) => {
+  try {
+    const result = await loadUniverseToDB(c.env.DB);
+    return c.json({ success: true, message: `종목 유니버스 로드 완료`, ...result });
+  } catch (e) {
+    return c.json({ success: false, message: String(e) }, 500);
+  }
+});
+
+trading.get('/universe/stats', async (c) => {
+  const stats = getUniverseStats();
+  const dbRow = await c.env.DB.prepare('SELECT COUNT(*) as cnt FROM stock_universe WHERE is_active=1').first<{cnt:number}>();
+  return c.json({ success: true, data: { ...stats, db_count: dbRow?.cnt || 0 } });
+});
+
+trading.get('/universe/list', async (c) => {
+  const exchange = c.req.query('exchange');
+  const market   = c.req.query('market');
+  const signal   = c.req.query('signal');
+  const limit    = parseInt(c.req.query('limit') || '100');
+  const offset   = parseInt(c.req.query('offset') || '0');
+
+  let q = 'SELECT * FROM stock_universe WHERE is_active=1';
+  const params: unknown[] = [];
+  if (exchange) { q += ' AND exchange=?'; params.push(exchange); }
+  if (market)   { q += ' AND market=?';   params.push(market); }
+  if (signal)   { q += ' AND last_signal=?'; params.push(signal); }
+  q += ' ORDER BY exchange, ticker LIMIT ? OFFSET ?';
+  params.push(limit, offset);
+
+  const rows  = await c.env.DB.prepare(q).bind(...params).all();
+  const total = await c.env.DB.prepare(
+    q.replace('SELECT *', 'SELECT COUNT(*) as cnt').replace(/ORDER BY.*/, '')
+  ).bind(...params.slice(0, -2)).first<{cnt:number}>();
+  return c.json({ success: true, data: rows.results || [], total: total?.cnt || 0 });
 });
 
 // ─── 주문 내역 ────────────────────────────────────────────────
@@ -108,14 +230,17 @@ trading.get('/holdings', async (c) => {
 
 // ─── 자동매매 ON/OFF ─────────────────────────────────────────
 trading.post('/toggle', async (c) => {
-  const body = await c.req.json() as { enabled: boolean; kr?: boolean; us?: boolean };
+  const body = await c.req.json() as {
+    enabled?: boolean; kr?: boolean; us?: boolean;
+    scan_kr?: boolean; scan_us?: boolean; batch_size?: number;
+  };
   const batch: Promise<unknown>[] = [];
-  if (body.enabled !== undefined)
-    batch.push(c.env.DB.prepare("UPDATE system_config SET value=? WHERE key='auto_trade_enabled'").bind(body.enabled?'1':'0').run());
-  if (body.kr !== undefined)
-    batch.push(c.env.DB.prepare("UPDATE system_config SET value=? WHERE key='kr_trade_enabled'").bind(body.kr?'1':'0').run());
-  if (body.us !== undefined)
-    batch.push(c.env.DB.prepare("UPDATE system_config SET value=? WHERE key='us_trade_enabled'").bind(body.us?'1':'0').run());
+  if (body.enabled    !== undefined) batch.push(c.env.DB.prepare("UPDATE system_config SET value=? WHERE key='auto_trade_enabled'").bind(body.enabled?'1':'0').run());
+  if (body.kr         !== undefined) batch.push(c.env.DB.prepare("UPDATE system_config SET value=? WHERE key='kr_trade_enabled'").bind(body.kr?'1':'0').run());
+  if (body.us         !== undefined) batch.push(c.env.DB.prepare("UPDATE system_config SET value=? WHERE key='us_trade_enabled'").bind(body.us?'1':'0').run());
+  if (body.scan_kr    !== undefined) batch.push(c.env.DB.prepare("UPDATE system_config SET value=? WHERE key='scan_kr_enabled'").bind(body.scan_kr?'1':'0').run());
+  if (body.scan_us    !== undefined) batch.push(c.env.DB.prepare("UPDATE system_config SET value=? WHERE key='scan_us_enabled'").bind(body.scan_us?'1':'0').run());
+  if (body.batch_size !== undefined) batch.push(c.env.DB.prepare("UPDATE system_config SET value=? WHERE key='scan_batch_size'").bind(String(body.batch_size)).run());
   await Promise.all(batch);
   return c.json({ success: true, message: '설정 업데이트 완료' });
 });
@@ -151,7 +276,7 @@ trading.post('/sync-holdings', async (c) => {
   }
 });
 
-// ─── 잔고 조회 ────────────────────────────────────────────────
+// ─── 잔고 조회 (국내+해외 동일 계좌) ──────────────────────────
 trading.get('/balance', async (c) => {
   if (!c.env.KIS_APP_KEY) return c.json({ success: false, message: 'API 키 미설정' }, 400);
   try {
@@ -164,7 +289,14 @@ trading.get('/balance', async (c) => {
       getKROrderableCash(cfg, token).catch(() => 0),
       getUSOrderableCash(cfg, token).catch(() => 0),
     ]);
-    return c.json({ success: true, data: { cash_kr: kr, cash_us: us } });
+    return c.json({
+      success: true,
+      data: {
+        account_no: c.env.KIS_ACCOUNT_NO,
+        cash_kr: kr, cash_kr_formatted: kr.toLocaleString('ko-KR') + '원',
+        cash_us: us, cash_us_formatted: '$' + us.toFixed(2),
+      },
+    });
   } catch (e) {
     return c.json({ success: false, message: String(e) }, 500);
   }
@@ -172,8 +304,9 @@ trading.get('/balance', async (c) => {
 
 // ─── BB 신호 미리보기 ────────────────────────────────────────
 trading.get('/preview/:market/:ticker', async (c) => {
-  const market = c.req.param('market').toUpperCase() as 'KR' | 'US';
-  const ticker = c.req.param('ticker').toUpperCase();
+  const market   = c.req.param('market').toUpperCase() as 'KR' | 'US';
+  const ticker   = c.req.param('ticker').toUpperCase();
+  const exchange = (c.req.query('exchange') || (market === 'US' ? 'NASD' : '')).toUpperCase() as ExchangeCode;
   if (!c.env.KIS_APP_KEY) return c.json({ success: false, message: 'API 키 미설정' }, 400);
 
   try {
@@ -181,10 +314,10 @@ trading.get('/preview/:market/:ticker', async (c) => {
       appKey: c.env.KIS_APP_KEY, appSecret: c.env.KIS_APP_SECRET,
       accountNo: c.env.KIS_ACCOUNT_NO, accountSuffix: c.env.KIS_ACCOUNT_SUFFIX || '01',
     };
-    const token = await getAccessToken(cfg, c.env.KV);
+    const token   = await getAccessToken(cfg, c.env.KV);
     const candles = market === 'KR'
       ? await getKR15MinCandles(cfg, token, ticker, 40)
-      : await getUS15MinCandles(cfg, token, ticker, 40);
+      : await getUS15MinCandles(cfg, token, ticker, 40, exchange || 'NASD');
 
     const closes = candles.map(c => c.close);
     const dts    = candles.map(c => c.datetime);
@@ -197,14 +330,12 @@ trading.get('/preview/:market/:ticker', async (c) => {
     const aboveUpper = hasPos && holdRow!.above_upper === 1;
 
     const signal = getBBSignal(bands, hasPos, aboveUpper);
-    const recent = bands.slice(-5);
-
     return c.json({
-      success: true, ticker, market,
+      success: true, ticker, market, exchange,
       signal: signal.action, reason: signal.reason,
       current_band: signal.current, prev_band: signal.prev,
       above_upper: signal.above_upper, has_position: hasPos,
-      recent_bands: recent,
+      recent_bands: bands.slice(-5),
       candle_count: candles.length,
     });
   } catch (e) {
@@ -216,7 +347,7 @@ trading.get('/preview/:market/:ticker', async (c) => {
 trading.post('/backtest', async (c) => {
   const body = await c.req.json() as {
     ticker: string; ticker_name?: string; market?: 'KR' | 'US';
-    buy_amount?: number; days?: number;
+    exchange?: string; buy_amount?: number; days?: number;
   };
   if (!body.ticker) return c.json({ success: false, message: 'ticker 필수' }, 400);
   if (!c.env.KIS_APP_KEY) return c.json({ success: false, message: 'API 키 미설정' }, 400);
@@ -237,7 +368,6 @@ trading.post('/backtest', async (c) => {
       }
     );
 
-    // DB 저장
     await c.env.DB.prepare(
       `INSERT INTO backtest_results
          (ticker, ticker_name, market, start_date, end_date,

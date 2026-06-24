@@ -3,32 +3,36 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>볼린저밴드 자동매매 v2</title>
+  <title>볼린저밴드 자동매매 v3</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <link href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.4.0/css/all.min.css" rel="stylesheet">
-  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <style>
-    .tab-btn { @apply px-4 py-2 text-sm font-medium rounded-t-lg transition-colors; }
+    .tab-btn { @apply px-4 py-2 text-sm font-medium rounded-t-lg transition-colors cursor-pointer; }
     .tab-btn.active { @apply bg-white text-blue-700 border-b-2 border-blue-600; }
     .tab-btn:not(.active) { @apply text-gray-500 hover:text-gray-700 bg-gray-100; }
     .card { @apply bg-white rounded-xl shadow p-4 mb-4; }
-    .badge-kr { @apply text-xs px-2 py-0.5 rounded-full bg-blue-100 text-blue-700 font-semibold; }
-    .badge-us { @apply text-xs px-2 py-0.5 rounded-full bg-green-100 text-green-700 font-semibold; }
-    .signal-buy    { @apply text-green-600 font-bold; }
-    .signal-sell   { @apply text-red-600 font-bold; }
-    .signal-hold   { @apply text-yellow-600 font-bold; }
-    .signal-none   { @apply text-gray-400; }
+    .badge-kr  { @apply text-xs px-2 py-0.5 rounded-full bg-blue-100 text-blue-700 font-semibold; }
+    .badge-us  { @apply text-xs px-2 py-0.5 rounded-full bg-green-100 text-green-700 font-semibold; }
+    .badge-kospi  { @apply text-xs px-1.5 py-0.5 rounded bg-blue-50 text-blue-600 font-semibold; }
+    .badge-kosdaq { @apply text-xs px-1.5 py-0.5 rounded bg-sky-50 text-sky-600 font-semibold; }
+    .badge-nasd   { @apply text-xs px-1.5 py-0.5 rounded bg-green-50 text-green-600 font-semibold; }
+    .badge-nyse   { @apply text-xs px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-600 font-semibold; }
+    .badge-amex   { @apply text-xs px-1.5 py-0.5 rounded bg-teal-50 text-teal-600 font-semibold; }
+    .signal-buy  { @apply text-green-600 font-bold; }
+    .signal-sell { @apply text-red-600 font-bold; }
+    .signal-hold { @apply text-yellow-600 font-bold; }
+    .signal-none { @apply text-gray-400; }
     .pill-on  { @apply bg-green-500 text-white text-xs px-2 py-0.5 rounded-full; }
     .pill-off { @apply bg-gray-300 text-gray-600 text-xs px-2 py-0.5 rounded-full; }
     .above-upper-flag { @apply text-xs px-2 py-0.5 rounded-full bg-orange-100 text-orange-700 font-semibold; }
-    .scroll-table { overflow-x: auto; }
     .tbl { @apply w-full text-sm text-left; }
     .tbl thead th { @apply px-3 py-2 bg-gray-50 text-gray-500 text-xs font-semibold uppercase tracking-wide; }
     .tbl tbody td { @apply px-3 py-2 border-t text-gray-700; }
     .tbl tbody tr:hover { @apply bg-gray-50; }
-    .btn-primary { @apply px-4 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 transition disabled:opacity-50; }
-    .btn-danger  { @apply px-4 py-2 bg-red-500 text-white rounded-lg text-sm font-medium hover:bg-red-600 transition; }
-    .btn-gray    { @apply px-4 py-2 bg-gray-200 text-gray-700 rounded-lg text-sm font-medium hover:bg-gray-300 transition; }
+    .btn-primary { @apply px-4 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 transition disabled:opacity-50 cursor-pointer; }
+    .btn-success { @apply px-4 py-2 bg-green-600 text-white rounded-lg text-sm font-medium hover:bg-green-700 transition disabled:opacity-50 cursor-pointer; }
+    .btn-danger  { @apply px-4 py-2 bg-red-500 text-white rounded-lg text-sm font-medium hover:bg-red-600 transition cursor-pointer; }
+    .btn-gray    { @apply px-4 py-2 bg-gray-200 text-gray-700 rounded-lg text-sm font-medium hover:bg-gray-300 transition cursor-pointer; }
     .input-field { @apply border border-gray-300 rounded-lg px-3 py-2 text-sm w-full focus:outline-none focus:ring-2 focus:ring-blue-300; }
     .toggle-switch { position:relative; display:inline-block; width:48px; height:26px; }
     .toggle-switch input { opacity:0; width:0; height:0; }
@@ -37,43 +41,58 @@
     input:checked + .slider { background:#2563eb; }
     input:checked + .slider:before { transform:translateX(22px); }
     #toast { position:fixed; bottom:1.5rem; right:1.5rem; z-index:9999; }
-    .toast-msg { @apply mb-2 px-4 py-3 rounded-xl shadow-lg text-sm font-medium text-white; animation: fadeOut 3s forwards; }
-    @keyframes fadeOut { 0%{opacity:1} 80%{opacity:1} 100%{opacity:0; display:none} }
+    .toast-msg { @apply mb-2 px-4 py-3 rounded-xl shadow-lg text-sm font-medium text-white; animation:fadeOut 3s forwards; }
+    @keyframes fadeOut { 0%{opacity:1} 80%{opacity:1} 100%{opacity:0} }
+    .scan-bar-bg { @apply h-3 rounded-full bg-gray-200 overflow-hidden; }
+    .scan-bar-fill { @apply h-full rounded-full transition-all duration-500; }
+    .stat-num { @apply text-2xl font-bold; }
+    .stat-label { @apply text-xs text-gray-500 mt-1; }
+    .exchange-grid { @apply grid grid-cols-5 gap-2; }
+    .exch-card { @apply rounded-lg p-3 text-center; }
+    .market-open  { @apply inline-flex items-center gap-1 text-xs text-green-600 font-semibold; }
+    .market-closed{ @apply inline-flex items-center gap-1 text-xs text-gray-400 font-semibold; }
+    .dot-pulse { @apply w-2 h-2 rounded-full bg-green-500 animate-pulse; }
+    .dot-off   { @apply w-2 h-2 rounded-full bg-gray-300; }
   </style>
 </head>
 <body class="bg-gray-100 min-h-screen">
 
-<!-- Header -->
+<!-- ===== HEADER ===== -->
 <header class="bg-white shadow-sm sticky top-0 z-50">
-  <div class="max-w-7xl mx-auto px-4 py-3 flex items-center justify-between">
+  <div class="max-w-7xl mx-auto px-4 py-3 flex items-center justify-between flex-wrap gap-2">
     <div class="flex items-center gap-3">
       <i class="fas fa-chart-line text-blue-600 text-xl"></i>
-      <h1 class="text-lg font-bold text-gray-800">볼린저밴드 자동매매 <span class="text-xs text-blue-500 font-normal ml-1">v2</span></h1>
+      <h1 class="text-lg font-bold text-gray-800">볼린저밴드 자동매매 <span class="text-xs text-blue-500 font-normal ml-1">v3 전체시장</span></h1>
     </div>
-    <div class="flex items-center gap-4">
-      <!-- KR 토글 -->
+    <div class="flex items-center gap-4 flex-wrap">
       <div class="flex items-center gap-1.5 text-xs">
-        <span class="text-gray-500 font-medium">KR</span>
-        <label class="toggle-switch"><input type="checkbox" id="toggle-kr"><span class="slider"></span></label>
+        <span class="text-gray-500 font-medium">KR스캔</span>
+        <label class="toggle-switch"><input type="checkbox" id="toggle-scan-kr" onchange="toggleScanKR(this.checked)"><span class="slider"></span></label>
       </div>
-      <!-- US 토글 -->
       <div class="flex items-center gap-1.5 text-xs">
-        <span class="text-gray-500 font-medium">US</span>
-        <label class="toggle-switch"><input type="checkbox" id="toggle-us"><span class="slider"></span></label>
+        <span class="text-gray-500 font-medium">US스캔</span>
+        <label class="toggle-switch"><input type="checkbox" id="toggle-scan-us" onchange="toggleScanUS(this.checked)"><span class="slider"></span></label>
       </div>
-      <!-- 자동매매 메인 -->
+      <div class="flex items-center gap-1.5 text-xs">
+        <span class="text-gray-500 font-medium">KR매매</span>
+        <label class="toggle-switch"><input type="checkbox" id="toggle-kr" onchange="toggleKR(this.checked)"><span class="slider"></span></label>
+      </div>
+      <div class="flex items-center gap-1.5 text-xs">
+        <span class="text-gray-500 font-medium">US매매</span>
+        <label class="toggle-switch"><input type="checkbox" id="toggle-us" onchange="toggleUS(this.checked)"><span class="slider"></span></label>
+      </div>
       <div class="flex items-center gap-2">
-        <label class="toggle-switch"><input type="checkbox" id="toggle-main"><span class="slider"></span></label>
+        <label class="toggle-switch"><input type="checkbox" id="toggle-main" onchange="toggleMain(this.checked)"><span class="slider"></span></label>
         <span class="text-sm font-semibold text-gray-700" id="trade-status-label">자동매매 OFF</span>
       </div>
       <button onclick="triggerScan()" class="btn-primary" id="scan-btn">
-        <i class="fas fa-sync mr-1"></i>스캔
+        <i class="fas fa-sync mr-1"></i>수동스캔
       </button>
     </div>
   </div>
 </header>
 
-<!-- Summary Cards -->
+<!-- ===== SUMMARY CARDS ===== -->
 <div class="max-w-7xl mx-auto px-4 mt-4">
   <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
     <div class="card !mb-0">
@@ -96,766 +115,1038 @@
 
   <!-- Strategy Info -->
   <div class="bg-blue-50 border border-blue-200 rounded-xl p-3 mb-4 text-xs text-blue-800">
-    <div class="flex flex-wrap gap-4">
-      <span><i class="fas fa-chart-bar mr-1"></i>15분봉 BB(20,2) 종가</span>
-      <span><i class="fas fa-arrow-down text-green-600 mr-1"></i><b>매수</b>: 직전봉 &lt; 하단 AND 현재봉 &gt; 하단</span>
-      <span><i class="fas fa-arrow-up text-red-600 mr-1"></i><b>매도</b>: 상단 위에 있다가 → 상단 아래로 내려오면 전량</span>
-      <span><i class="fas fa-clock mr-1"></i>KR 09:00–15:30 / US 04:00–20:00 EST</span>
+    <div class="flex flex-wrap gap-4 items-center">
+      <span><i class="fas fa-chart-bar mr-1"></i><strong>스캔함수:</strong> <code class="bg-blue-100 px-1 rounded">runTradeScan</code></span>
+      <span><i class="fas fa-layer-group mr-1"></i>15분봉 BB(20,2) 종가</span>
+      <span><i class="fas fa-arrow-up text-green-600 mr-1"></i>매수: prev_close &lt; lower AND close &gt; lower</span>
+      <span><i class="fas fa-arrow-down text-red-500 mr-1"></i>매도: above_upper=true AND close &lt; upper</span>
+      <span id="total-tickers-badge" class="bg-blue-200 px-2 py-0.5 rounded-full font-bold">대상: -종목</span>
+      <span id="kr-market-status"></span>
+      <span id="us-market-status"></span>
     </div>
   </div>
 
-  <!-- Tabs -->
-  <div class="flex gap-1 mb-0 border-b border-gray-200">
-    <button class="tab-btn active" onclick="switchTab('dashboard')" id="tab-dashboard">
-      <i class="fas fa-home mr-1"></i>대시보드
-    </button>
-    <button class="tab-btn" onclick="switchTab('watchlist')" id="tab-watchlist">
-      <i class="fas fa-list mr-1"></i>감시종목
-    </button>
-    <button class="tab-btn" onclick="switchTab('holdings')" id="tab-holdings">
-      <i class="fas fa-wallet mr-1"></i>보유종목
-    </button>
-    <button class="tab-btn" onclick="switchTab('orders')" id="tab-orders">
-      <i class="fas fa-receipt mr-1"></i>주문내역
-    </button>
-    <button class="tab-btn" onclick="switchTab('logs')" id="tab-logs">
-      <i class="fas fa-file-alt mr-1"></i>매매로그
-    </button>
-    <button class="tab-btn" onclick="switchTab('profits')" id="tab-profits">
-      <i class="fas fa-coins mr-1"></i>실현손익
-    </button>
-    <button class="tab-btn" onclick="switchTab('backtest')" id="tab-backtest">
-      <i class="fas fa-flask mr-1"></i>백테스트
-    </button>
+  <!-- TABS -->
+  <div class="flex gap-1 border-b border-gray-200 mb-0 flex-wrap">
+    <button class="tab-btn active" onclick="switchTab('scan',this)"><i class="fas fa-radar mr-1"></i>전체시장스캔</button>
+    <button class="tab-btn" onclick="switchTab('dashboard',this)"><i class="fas fa-tachometer-alt mr-1"></i>대시보드</button>
+    <button class="tab-btn" onclick="switchTab('universe',this)"><i class="fas fa-list mr-1"></i>종목목록</button>
+    <button class="tab-btn" onclick="switchTab('holdings',this)"><i class="fas fa-wallet mr-1"></i>보유종목</button>
+    <button class="tab-btn" onclick="switchTab('orders',this)"><i class="fas fa-receipt mr-1"></i>주문내역</button>
+    <button class="tab-btn" onclick="switchTab('logs',this)"><i class="fas fa-stream mr-1"></i>매매로그</button>
+    <button class="tab-btn" onclick="switchTab('profits',this)"><i class="fas fa-coins mr-1"></i>실현손익</button>
+    <button class="tab-btn" onclick="switchTab('backtest',this)"><i class="fas fa-flask mr-1"></i>백테스트</button>
   </div>
 
-  <!-- ══════════════════════════════════════════ -->
-  <!--  TAB: 대시보드                             -->
-  <!-- ══════════════════════════════════════════ -->
-  <div id="pane-dashboard" class="tab-pane pt-4">
-    <div class="grid md:grid-cols-2 gap-4">
+  <!-- ===== TAB: 전체시장 스캔 ===== -->
+  <div id="tab-scan" class="tab-content bg-white rounded-b-xl shadow p-4">
 
-      <!-- 보유 종목 요약 -->
-      <div class="card">
-        <div class="flex items-center justify-between mb-3">
-          <h3 class="font-semibold text-gray-700"><i class="fas fa-wallet mr-2 text-blue-500"></i>보유 종목</h3>
-          <button onclick="syncHoldings()" class="btn-gray text-xs py-1">
-            <i class="fas fa-sync mr-1"></i>KIS동기화
-          </button>
+    <!-- 스캔 현황 헤더 -->
+    <div class="flex items-center justify-between mb-4">
+      <h2 class="text-base font-bold text-gray-800"><i class="fas fa-satellite-dish text-blue-600 mr-2"></i>전체시장 배치 스캔 현황</h2>
+      <div class="flex gap-2">
+        <button onclick="loadUniverse()" class="btn-success text-xs py-1.5 px-3" id="load-universe-btn">
+          <i class="fas fa-download mr-1"></i>종목 로드
+        </button>
+        <button onclick="loadScanStatus()" class="btn-gray text-xs py-1.5 px-3">
+          <i class="fas fa-refresh mr-1"></i>새로고침
+        </button>
+      </div>
+    </div>
+
+    <!-- 스캔 함수 정보 -->
+    <div class="bg-gray-50 border border-gray-200 rounded-xl p-4 mb-4" id="scan-function-info">
+      <h3 class="text-xs font-bold text-gray-600 uppercase tracking-wide mb-3">스캔 구현 확인</h3>
+      <div class="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs">
+        <div>
+          <span class="text-gray-400">함수명</span>
+          <p class="font-bold text-gray-800 font-mono mt-0.5" id="fn-name">-</p>
         </div>
-        <div id="dashboard-holdings" class="text-sm text-gray-500">로딩 중...</div>
-      </div>
-
-      <!-- 최근 주문 -->
-      <div class="card">
-        <h3 class="font-semibold text-gray-700 mb-3"><i class="fas fa-receipt mr-2 text-purple-500"></i>최근 주문</h3>
-        <div id="dashboard-orders" class="text-sm text-gray-500">로딩 중...</div>
-      </div>
-
-      <!-- 마지막 스캔 -->
-      <div class="card md:col-span-2">
-        <h3 class="font-semibold text-gray-700 mb-3"><i class="fas fa-clock mr-2 text-gray-500"></i>시스템 상태</h3>
-        <div class="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm">
-          <div><p class="text-xs text-gray-500">자동매매</p><p id="sys-auto" class="font-semibold">-</p></div>
-          <div><p class="text-xs text-gray-500">KR 거래</p><p id="sys-kr" class="font-semibold">-</p></div>
-          <div><p class="text-xs text-gray-500">US 거래</p><p id="sys-us" class="font-semibold">-</p></div>
-          <div><p class="text-xs text-gray-500">마지막 스캔</p><p id="sys-last-scan" class="font-semibold">-</p></div>
+        <div>
+          <span class="text-gray-400">전략</span>
+          <p class="font-semibold text-gray-800 mt-0.5" id="fn-strategy">-</p>
+        </div>
+        <div>
+          <span class="text-gray-400">KR 스캔 대상</span>
+          <p class="font-bold text-blue-700 text-base mt-0.5" id="fn-kr-tickers">-</p>
+        </div>
+        <div>
+          <span class="text-gray-400">US 스캔 대상</span>
+          <p class="font-bold text-green-700 text-base mt-0.5" id="fn-us-tickers">-</p>
+        </div>
+        <div>
+          <span class="text-gray-400">배치 크기</span>
+          <p class="font-semibold text-gray-800 mt-0.5" id="fn-batch">-종목/회</p>
+        </div>
+        <div>
+          <span class="text-gray-400">총 스캔 대상</span>
+          <p class="font-bold text-purple-700 text-xl mt-0.5" id="fn-total">-</p>
+        </div>
+        <div>
+          <span class="text-gray-400">매수 조건</span>
+          <p class="font-semibold text-green-700 mt-0.5 text-xs" id="fn-buy-cond">-</p>
+        </div>
+        <div>
+          <span class="text-gray-400">매도 조건</span>
+          <p class="font-semibold text-red-600 mt-0.5 text-xs" id="fn-sell-cond">-</p>
         </div>
       </div>
+    </div>
 
+    <!-- 거래소별 통계 카드 -->
+    <div class="exchange-grid mb-4" id="exchange-cards">
+      <!-- JS로 렌더링 -->
+    </div>
+
+    <!-- 전체 스캔 진행 상황 -->
+    <div class="grid grid-cols-2 md:grid-cols-6 gap-3 mb-4">
+      <div class="bg-gray-50 rounded-xl p-3 text-center">
+        <div class="stat-num text-gray-800" id="stat-total">-</div>
+        <div class="stat-label">전체 등록 종목</div>
+      </div>
+      <div class="bg-blue-50 rounded-xl p-3 text-center">
+        <div class="stat-num text-blue-700" id="stat-scanned">-</div>
+        <div class="stat-label">오늘 스캔 완료</div>
+      </div>
+      <div class="bg-yellow-50 rounded-xl p-3 text-center">
+        <div class="stat-num text-yellow-700" id="stat-pending">-</div>
+        <div class="stat-label">남은 종목</div>
+      </div>
+      <div class="bg-green-50 rounded-xl p-3 text-center">
+        <div class="stat-num text-green-700" id="stat-buy-sig">-</div>
+        <div class="stat-label">매수 신호</div>
+      </div>
+      <div class="bg-red-50 rounded-xl p-3 text-center">
+        <div class="stat-num text-red-600" id="stat-sell-sig">-</div>
+        <div class="stat-label">매도 신호</div>
+      </div>
+      <div class="bg-orange-50 rounded-xl p-3 text-center">
+        <div class="stat-num text-orange-600" id="stat-errors">-</div>
+        <div class="stat-label">API 오류</div>
+      </div>
+    </div>
+
+    <!-- 스캔 진행 바 -->
+    <div class="mb-4">
+      <div class="flex justify-between text-xs text-gray-500 mb-1">
+        <span>오늘 스캔 진행률</span>
+        <span id="scan-progress-pct">0%</span>
+      </div>
+      <div class="scan-bar-bg">
+        <div class="scan-bar-fill bg-blue-500" id="scan-bar" style="width:0%"></div>
+      </div>
+    </div>
+
+    <!-- 시간 정보 -->
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
+      <div class="bg-white border rounded-xl p-3">
+        <p class="text-xs text-gray-400">마지막 스캔</p>
+        <p class="font-semibold text-sm text-gray-800 mt-0.5" id="last-scan-time">-</p>
+      </div>
+      <div class="bg-white border rounded-xl p-3">
+        <p class="text-xs text-gray-400">다음 스캔 예정</p>
+        <p class="font-semibold text-sm text-blue-600 mt-0.5" id="next-scan-time">-</p>
+      </div>
+      <div class="bg-white border rounded-xl p-3">
+        <p class="text-xs text-gray-400">KR 배치 위치</p>
+        <p class="font-semibold text-sm text-gray-800 mt-0.5" id="kr-offset">-</p>
+      </div>
+      <div class="bg-white border rounded-xl p-3">
+        <p class="text-xs text-gray-400">US 배치 위치</p>
+        <p class="font-semibold text-sm text-gray-800 mt-0.5" id="us-offset">-</p>
+      </div>
+    </div>
+
+    <!-- 신호 종목 -->
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+      <!-- 매수 신호 -->
+      <div>
+        <h3 class="text-sm font-bold text-green-700 mb-2">
+          <i class="fas fa-arrow-up mr-1"></i>매수 신호 종목
+          <span class="text-xs text-gray-400 font-normal ml-1">(오늘 기준)</span>
+        </h3>
+        <div id="buy-signal-list" class="space-y-1 max-h-80 overflow-y-auto">
+          <p class="text-xs text-gray-400 text-center py-4">매수 신호 없음</p>
+        </div>
+      </div>
+      <!-- 매도 신호 -->
+      <div>
+        <h3 class="text-sm font-bold text-red-600 mb-2">
+          <i class="fas fa-arrow-down mr-1"></i>매도 신호 종목
+          <span class="text-xs text-gray-400 font-normal ml-1">(오늘 기준)</span>
+        </h3>
+        <div id="sell-signal-list" class="space-y-1 max-h-80 overflow-y-auto">
+          <p class="text-xs text-gray-400 text-center py-4">매도 신호 없음</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- API 오류 종목 -->
+    <div class="mt-4">
+      <h3 class="text-sm font-bold text-orange-600 mb-2">
+        <i class="fas fa-exclamation-triangle mr-1"></i>API 오류 종목
+        <span class="text-xs text-gray-400 font-normal ml-1">(오늘 기준)</span>
+      </h3>
+      <div id="error-stock-list" class="space-y-1 max-h-48 overflow-y-auto">
+        <p class="text-xs text-gray-400 text-center py-4">오류 없음</p>
+      </div>
     </div>
   </div>
 
-  <!-- ══════════════════════════════════════════ -->
-  <!--  TAB: 감시종목                             -->
-  <!-- ══════════════════════════════════════════ -->
-  <div id="pane-watchlist" class="tab-pane pt-4 hidden">
-
-    <!-- 추가 폼 -->
-    <div class="card">
-      <h3 class="font-semibold text-gray-700 mb-3"><i class="fas fa-plus-circle mr-2 text-green-500"></i>종목 추가</h3>
-      <div class="grid grid-cols-2 md:grid-cols-5 gap-2">
-        <select id="wl-market" class="input-field">
-          <option value="KR">🇰🇷 한국주식 (KR)</option>
-          <option value="US">🇺🇸 미국주식 (US)</option>
-        </select>
-        <input type="text" id="wl-ticker" placeholder="종목코드 (예: 005930, AAPL)" class="input-field md:col-span-2">
-        <input type="text" id="wl-name"   placeholder="종목명" class="input-field">
-        <input type="number" id="wl-amount" placeholder="매수금액(원/$)" value="100000" class="input-field">
-      </div>
-      <div class="flex gap-2 mt-2">
-        <button onclick="addWatchItem()" class="btn-primary">
-          <i class="fas fa-plus mr-1"></i>추가
-        </button>
-        <button onclick="loadWatchlist()" class="btn-gray">
-          <i class="fas fa-sync mr-1"></i>새로고침
-        </button>
-      </div>
+  <!-- ===== TAB: 대시보드 ===== -->
+  <div id="tab-dashboard" class="tab-content hidden bg-white rounded-b-xl shadow p-4">
+    <h2 class="text-base font-bold text-gray-800 mb-4"><i class="fas fa-tachometer-alt text-blue-600 mr-2"></i>대시보드</h2>
+    <div class="mb-4 text-xs text-gray-500" id="dashboard-status">로딩 중...</div>
+    <div class="overflow-x-auto">
+      <table class="tbl" id="dashboard-holdings-table">
+        <thead><tr>
+          <th>종목</th><th>시장</th><th>거래소</th><th>수량</th><th>평균단가</th><th>현재가</th><th>평가손익</th><th>수익률</th><th>상단초과</th>
+        </tr></thead>
+        <tbody id="dashboard-holdings-body"><tr><td colspan="9" class="text-center text-gray-400 py-4">보유종목 없음</td></tr></tbody>
+      </table>
     </div>
-
-    <!-- 감시 종목 테이블 -->
-    <div class="card">
-      <div class="scroll-table">
-        <table class="tbl">
-          <thead><tr>
-            <th>시장</th><th>종목코드</th><th>종목명</th><th>매수금액</th><th>상태</th><th>BB미리보기</th><th>관리</th>
-          </tr></thead>
-          <tbody id="watchlist-body">
-            <tr><td colspan="7" class="text-center text-gray-400 py-6">데이터 없음</td></tr>
-          </tbody>
+    <div class="mt-4">
+      <h3 class="text-sm font-bold text-gray-700 mb-2">최근 주문</h3>
+      <div class="overflow-x-auto">
+        <table class="tbl" id="dashboard-orders-table">
+          <thead><tr><th>시각</th><th>종목</th><th>시장</th><th>유형</th><th>가격</th><th>수량</th><th>상태</th></tr></thead>
+          <tbody id="dashboard-orders-body"><tr><td colspan="7" class="text-center text-gray-400 py-4">주문 없음</td></tr></tbody>
         </table>
       </div>
     </div>
   </div>
 
-  <!-- ══════════════════════════════════════════ -->
-  <!--  TAB: 보유종목                             -->
-  <!-- ══════════════════════════════════════════ -->
-  <div id="pane-holdings" class="tab-pane pt-4 hidden">
-    <div class="card">
-      <div class="flex items-center justify-between mb-3">
-        <h3 class="font-semibold text-gray-700"><i class="fas fa-wallet mr-2 text-blue-500"></i>보유 종목</h3>
-        <button onclick="syncHoldings()" class="btn-gray text-xs py-1">
-          <i class="fas fa-sync mr-1"></i>KIS동기화
-        </button>
-      </div>
-      <div class="scroll-table">
-        <table class="tbl">
-          <thead><tr>
-            <th>시장</th><th>종목코드</th><th>종목명</th><th>수량</th><th>평균단가</th><th>현재가</th>
-            <th>평가손익</th><th>수익률</th><th>상단돌파</th><th>갱신시각</th>
-          </tr></thead>
-          <tbody id="holdings-body">
-            <tr><td colspan="10" class="text-center text-gray-400 py-6">보유 종목 없음</td></tr>
-          </tbody>
-        </table>
-      </div>
-    </div>
-  </div>
-
-  <!-- ══════════════════════════════════════════ -->
-  <!--  TAB: 주문내역                             -->
-  <!-- ══════════════════════════════════════════ -->
-  <div id="pane-orders" class="tab-pane pt-4 hidden">
-    <div class="card">
-      <div class="flex items-center gap-2 mb-3">
-        <select id="order-market-filter" class="input-field w-32" onchange="loadOrders()">
-          <option value="">전체</option><option value="KR">KR</option><option value="US">US</option>
+  <!-- ===== TAB: 종목 목록 ===== -->
+  <div id="tab-universe" class="tab-content hidden bg-white rounded-b-xl shadow p-4">
+    <div class="flex items-center justify-between mb-4">
+      <h2 class="text-base font-bold text-gray-800"><i class="fas fa-list text-blue-600 mr-2"></i>스캔 대상 종목 목록</h2>
+      <div class="flex gap-2">
+        <select id="universe-filter-exchange" class="input-field !w-32 text-xs" onchange="loadUniverse_list()">
+          <option value="">전체 거래소</option>
+          <option value="KOSPI">KOSPI</option>
+          <option value="KOSDAQ">KOSDAQ</option>
+          <option value="NASD">NASD</option>
+          <option value="NYSE">NYSE</option>
+          <option value="AMEX">AMEX</option>
         </select>
-        <button onclick="loadOrders()" class="btn-gray">
-          <i class="fas fa-sync mr-1"></i>새로고침
-        </button>
-      </div>
-      <div class="scroll-table">
-        <table class="tbl">
-          <thead><tr>
-            <th>시장</th><th>종목</th><th>구분</th><th>가격</th><th>수량</th><th>사유</th><th>상태</th><th>시각</th>
-          </tr></thead>
-          <tbody id="orders-body">
-            <tr><td colspan="8" class="text-center text-gray-400 py-6">주문 내역 없음</td></tr>
-          </tbody>
-        </table>
-      </div>
-    </div>
-  </div>
-
-  <!-- ══════════════════════════════════════════ -->
-  <!--  TAB: 매매로그                             -->
-  <!-- ══════════════════════════════════════════ -->
-  <div id="pane-logs" class="tab-pane pt-4 hidden">
-    <div class="card">
-      <div class="flex items-center gap-2 mb-3">
-        <select id="log-market-filter" class="input-field w-32" onchange="loadLogs()">
-          <option value="">전체</option><option value="KR">KR</option><option value="US">US</option>
-        </select>
-        <select id="log-action-filter" class="input-field w-40" onchange="loadLogs()">
-          <option value="">전체 액션</option>
-          <option value="SIGNAL_BUY">매수 신호</option>
-          <option value="SIGNAL_SELL">매도 신호</option>
-          <option value="SIGNAL_HOLD">보유</option>
-          <option value="NO_SIGNAL">신호없음</option>
+        <select id="universe-filter-signal" class="input-field !w-28 text-xs" onchange="loadUniverse_list()">
+          <option value="">전체 신호</option>
+          <option value="BUY">매수</option>
+          <option value="SELL">매도</option>
+          <option value="HOLD">홀드</option>
           <option value="ERROR">오류</option>
         </select>
-        <button onclick="loadLogs()" class="btn-gray">
-          <i class="fas fa-sync mr-1"></i>새로고침
-        </button>
+        <button onclick="loadUniverse_list()" class="btn-gray text-xs py-1.5 px-3"><i class="fas fa-refresh mr-1"></i>조회</button>
       </div>
-      <div class="scroll-table">
-        <table class="tbl">
-          <thead><tr>
-            <th>시각</th><th>시장</th><th>종목</th><th>액션</th><th>현재가</th>
-            <th>BB상단</th><th>BB중단</th><th>BB하단</th><th>상단돌파</th><th>메시지</th>
-          </tr></thead>
-          <tbody id="logs-body">
-            <tr><td colspan="10" class="text-center text-gray-400 py-6">로그 없음</td></tr>
-          </tbody>
-        </table>
+    </div>
+    <div class="overflow-x-auto">
+      <table class="tbl">
+        <thead><tr>
+          <th>종목코드</th><th>종목명</th><th>시장</th><th>거래소</th><th>마지막 신호</th><th>마지막 스캔</th><th>오류</th>
+        </tr></thead>
+        <tbody id="universe-list-body">
+          <tr><td colspan="7" class="text-center text-gray-400 py-6">종목 로드 버튼을 눌러 종목을 먼저 로드하세요</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="flex justify-between items-center mt-3 text-xs text-gray-500">
+      <span id="universe-total-label">-</span>
+      <div class="flex gap-2">
+        <button onclick="universePrev()" class="btn-gray text-xs py-1 px-2">이전</button>
+        <span id="universe-page-label">1 페이지</span>
+        <button onclick="universeNext()" class="btn-gray text-xs py-1 px-2">다음</button>
       </div>
     </div>
   </div>
 
-  <!-- ══════════════════════════════════════════ -->
-  <!--  TAB: 실현손익                             -->
-  <!-- ══════════════════════════════════════════ -->
-  <div id="pane-profits" class="tab-pane pt-4 hidden">
-    <div class="grid md:grid-cols-3 gap-3 mb-4">
-      <div class="card !mb-0 text-center">
-        <p class="text-xs text-gray-500">총 실현손익</p>
-        <p class="text-2xl font-bold" id="profit-total">-</p>
-      </div>
-      <div class="card !mb-0 text-center">
-        <p class="text-xs text-gray-500">거래 횟수</p>
-        <p class="text-2xl font-bold text-gray-700" id="profit-count">-</p>
-      </div>
-      <div class="card !mb-0 text-center">
-        <p class="text-xs text-gray-500">평균 수익률</p>
-        <p class="text-2xl font-bold" id="profit-avg-rate">-</p>
-      </div>
+  <!-- ===== TAB: 보유 종목 ===== -->
+  <div id="tab-holdings" class="tab-content hidden bg-white rounded-b-xl shadow p-4">
+    <div class="flex items-center justify-between mb-4">
+      <h2 class="text-base font-bold text-gray-800"><i class="fas fa-wallet text-blue-600 mr-2"></i>보유 종목 (국내+해외 동일 계좌)</h2>
+      <button onclick="syncHoldings()" class="btn-gray text-xs py-1.5 px-3"><i class="fas fa-sync mr-1"></i>KIS 동기화</button>
     </div>
-    <div class="card">
-      <div class="scroll-table">
-        <table class="tbl">
-          <thead><tr>
-            <th>시장</th><th>종목</th><th>수량</th><th>매수가</th><th>매도가</th><th>손익</th><th>수익률</th><th>사유</th><th>시각</th>
-          </tr></thead>
-          <tbody id="profits-body">
-            <tr><td colspan="9" class="text-center text-gray-400 py-6">실현 손익 없음</td></tr>
-          </tbody>
-        </table>
-      </div>
+    <div class="overflow-x-auto">
+      <table class="tbl">
+        <thead><tr>
+          <th>종목코드</th><th>종목명</th><th>시장</th><th>거래소</th><th>수량</th><th>평균단가</th><th>현재가</th><th>평가손익</th><th>수익률</th><th>상단초과</th>
+        </tr></thead>
+        <tbody id="holdings-body">
+          <tr><td colspan="10" class="text-center text-gray-400 py-6">보유 종목 없음</td></tr>
+        </tbody>
+      </table>
     </div>
   </div>
 
-  <!-- ══════════════════════════════════════════ -->
-  <!--  TAB: 백테스트                             -->
-  <!-- ══════════════════════════════════════════ -->
-  <div id="pane-backtest" class="tab-pane pt-4 hidden">
-    <!-- 실행 폼 -->
-    <div class="card">
-      <h3 class="font-semibold text-gray-700 mb-3">
-        <i class="fas fa-flask mr-2 text-purple-500"></i>백테스트 실행
-        <span class="text-xs text-gray-400 ml-2">15분봉 BB(20,2) — KIS API 실데이터</span>
-      </h3>
-      <div class="grid grid-cols-2 md:grid-cols-5 gap-2">
-        <select id="bt-market" class="input-field">
-          <option value="KR">🇰🇷 한국주식</option>
-          <option value="US">🇺🇸 미국주식</option>
+  <!-- ===== TAB: 주문 내역 ===== -->
+  <div id="tab-orders" class="tab-content hidden bg-white rounded-b-xl shadow p-4">
+    <div class="flex items-center justify-between mb-4">
+      <h2 class="text-base font-bold text-gray-800"><i class="fas fa-receipt text-blue-600 mr-2"></i>주문 내역</h2>
+      <div class="flex gap-2">
+        <select id="orders-market-filter" class="input-field !w-28 text-xs" onchange="loadOrders()">
+          <option value="">전체</option><option value="KR">KR</option><option value="US">US</option>
         </select>
-        <input type="text" id="bt-ticker"  placeholder="종목코드" class="input-field">
-        <input type="text" id="bt-name"    placeholder="종목명 (선택)" class="input-field">
-        <input type="number" id="bt-amount" placeholder="매수금액" value="100000" class="input-field">
-        <input type="number" id="bt-days"   placeholder="기간(일)" value="7" min="1" max="30" class="input-field">
       </div>
-      <button onclick="runBacktest()" class="btn-primary mt-2" id="bt-run-btn">
-        <i class="fas fa-play mr-1"></i>백테스트 실행
-      </button>
     </div>
+    <div class="overflow-x-auto">
+      <table class="tbl">
+        <thead><tr>
+          <th>시각</th><th>종목</th><th>종목명</th><th>시장</th><th>유형</th><th>가격</th><th>수량</th><th>상태</th><th>사유</th>
+        </tr></thead>
+        <tbody id="orders-body">
+          <tr><td colspan="9" class="text-center text-gray-400 py-6">주문 내역 없음</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="flex justify-end gap-2 mt-3">
+      <button onclick="ordersPrev()" class="btn-gray text-xs py-1 px-2">이전</button>
+      <span class="text-xs text-gray-500 self-center" id="orders-page-label">1 페이지</span>
+      <button onclick="ordersNext()" class="btn-gray text-xs py-1 px-2">다음</button>
+    </div>
+  </div>
 
-    <!-- 결과 -->
+  <!-- ===== TAB: 매매 로그 ===== -->
+  <div id="tab-logs" class="tab-content hidden bg-white rounded-b-xl shadow p-4">
+    <div class="flex items-center justify-between mb-4">
+      <h2 class="text-base font-bold text-gray-800"><i class="fas fa-stream text-blue-600 mr-2"></i>매매 로그</h2>
+      <div class="flex gap-2">
+        <select id="logs-action-filter" class="input-field !w-36 text-xs" onchange="loadLogs()">
+          <option value="">전체</option>
+          <option value="SIGNAL_BUY">매수신호</option>
+          <option value="SIGNAL_SELL">매도신호</option>
+          <option value="NO_SIGNAL">신호없음</option>
+        </select>
+        <select id="logs-market-filter" class="input-field !w-24 text-xs" onchange="loadLogs()">
+          <option value="">전체</option><option value="KR">KR</option><option value="US">US</option>
+        </select>
+      </div>
+    </div>
+    <div class="overflow-x-auto">
+      <table class="tbl">
+        <thead><tr>
+          <th>시각</th><th>종목</th><th>시장</th><th>액션</th><th>현재가</th><th>상단</th><th>중단</th><th>하단</th><th>상단초과</th><th>메시지</th>
+        </tr></thead>
+        <tbody id="logs-body">
+          <tr><td colspan="10" class="text-center text-gray-400 py-6">로그 없음</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- ===== TAB: 실현 손익 ===== -->
+  <div id="tab-profits" class="tab-content hidden bg-white rounded-b-xl shadow p-4">
+    <h2 class="text-base font-bold text-gray-800 mb-4"><i class="fas fa-coins text-blue-600 mr-2"></i>실현 손익</h2>
+    <div class="grid grid-cols-3 gap-3 mb-4">
+      <div class="bg-gray-50 rounded-xl p-3 text-center">
+        <div class="text-xl font-bold" id="profits-total">-</div>
+        <div class="text-xs text-gray-500 mt-1">총 실현손익</div>
+      </div>
+      <div class="bg-gray-50 rounded-xl p-3 text-center">
+        <div class="text-xl font-bold text-gray-700" id="profits-count">-</div>
+        <div class="text-xs text-gray-500 mt-1">총 거래 수</div>
+      </div>
+      <div class="bg-gray-50 rounded-xl p-3 text-center">
+        <div class="text-xl font-bold text-blue-600" id="profits-avg-rate">-</div>
+        <div class="text-xs text-gray-500 mt-1">평균 수익률</div>
+      </div>
+    </div>
+    <div class="overflow-x-auto">
+      <table class="tbl">
+        <thead><tr>
+          <th>시각</th><th>종목</th><th>시장</th><th>매수가</th><th>매도가</th><th>수량</th><th>손익</th><th>수익률</th><th>매도사유</th>
+        </tr></thead>
+        <tbody id="profits-body">
+          <tr><td colspan="9" class="text-center text-gray-400 py-6">실현 손익 없음</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- ===== TAB: 백테스트 ===== -->
+  <div id="tab-backtest" class="tab-content hidden bg-white rounded-b-xl shadow p-4">
+    <h2 class="text-base font-bold text-gray-800 mb-4"><i class="fas fa-flask text-blue-600 mr-2"></i>백테스트</h2>
+    <div class="grid grid-cols-2 md:grid-cols-5 gap-3 mb-4 items-end">
+      <div>
+        <label class="text-xs text-gray-500 block mb-1">시장</label>
+        <select id="bt-market" class="input-field text-sm" onchange="onBtMarketChange()">
+          <option value="KR">KR 국내</option>
+          <option value="US">US 해외</option>
+        </select>
+      </div>
+      <div>
+        <label class="text-xs text-gray-500 block mb-1">종목코드</label>
+        <input type="text" id="bt-ticker" class="input-field text-sm" placeholder="예: 005930 / AAPL">
+      </div>
+      <div id="bt-exchange-wrap">
+        <label class="text-xs text-gray-500 block mb-1">거래소(US)</label>
+        <select id="bt-exchange" class="input-field text-sm">
+          <option value="NASD">NASD</option><option value="NYSE">NYSE</option><option value="AMEX">AMEX</option>
+        </select>
+      </div>
+      <div>
+        <label class="text-xs text-gray-500 block mb-1">1회 매수금액</label>
+        <input type="number" id="bt-amount" class="input-field text-sm" value="100000" placeholder="원/달러">
+      </div>
+      <div>
+        <label class="text-xs text-gray-500 block mb-1">기간(일)</label>
+        <input type="number" id="bt-days" class="input-field text-sm" value="7" min="1" max="30">
+      </div>
+    </div>
+    <button onclick="runBacktest()" class="btn-primary mb-4" id="bt-run-btn">
+      <i class="fas fa-play mr-1"></i>백테스트 실행
+    </button>
+
     <div id="bt-result" class="hidden">
-      <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
-        <div class="card !mb-0 text-center">
-          <p class="text-xs text-gray-500">총 거래</p>
-          <p class="text-2xl font-bold text-gray-700" id="bt-total-trades">-</p>
+      <div class="grid grid-cols-2 md:grid-cols-5 gap-3 mb-4">
+        <div class="bg-gray-50 rounded-xl p-3 text-center">
+          <div class="text-xl font-bold text-gray-800" id="bt-total-trades">-</div>
+          <div class="text-xs text-gray-500 mt-1">총 거래</div>
         </div>
-        <div class="card !mb-0 text-center">
-          <p class="text-xs text-gray-500">승률</p>
-          <p class="text-2xl font-bold" id="bt-win-rate">-</p>
+        <div class="bg-green-50 rounded-xl p-3 text-center">
+          <div class="text-xl font-bold text-green-700" id="bt-win">-</div>
+          <div class="text-xs text-gray-500 mt-1">승리</div>
         </div>
-        <div class="card !mb-0 text-center">
-          <p class="text-xs text-gray-500">총 손익</p>
-          <p class="text-2xl font-bold" id="bt-total-profit">-</p>
+        <div class="bg-red-50 rounded-xl p-3 text-center">
+          <div class="text-xl font-bold text-red-600" id="bt-loss">-</div>
+          <div class="text-xs text-gray-500 mt-1">패배</div>
         </div>
-        <div class="card !mb-0 text-center">
-          <p class="text-xs text-gray-500">최대 낙폭</p>
-          <p class="text-2xl font-bold text-red-500" id="bt-max-dd">-</p>
+        <div class="bg-blue-50 rounded-xl p-3 text-center">
+          <div class="text-xl font-bold text-blue-700" id="bt-winrate">-</div>
+          <div class="text-xs text-gray-500 mt-1">승률</div>
         </div>
-      </div>
-      <div class="card">
-        <h4 class="font-semibold text-gray-700 mb-2">거래 내역</h4>
-        <div class="scroll-table">
-          <table class="tbl">
-            <thead><tr>
-              <th>#</th><th>매수시각</th><th>매도시각</th><th>매수가</th><th>매도가</th><th>수량</th><th>손익</th><th>수익률</th>
-            </tr></thead>
-            <tbody id="bt-trades-body"></tbody>
-          </table>
+        <div class="bg-purple-50 rounded-xl p-3 text-center">
+          <div class="text-xl font-bold text-purple-700" id="bt-profit">-</div>
+          <div class="text-xs text-gray-500 mt-1">총 손익</div>
         </div>
       </div>
-    </div>
-
-    <!-- 과거 백테스트 이력 -->
-    <div class="card">
-      <div class="flex items-center justify-between mb-3">
-        <h3 class="font-semibold text-gray-700"><i class="fas fa-history mr-2 text-gray-500"></i>백테스트 이력</h3>
-        <button onclick="loadBacktestHistory()" class="btn-gray text-xs py-1">
-          <i class="fas fa-sync mr-1"></i>새로고침
-        </button>
-      </div>
-      <div class="scroll-table">
+      <div class="overflow-x-auto">
         <table class="tbl">
           <thead><tr>
-            <th>시장</th><th>종목</th><th>기간</th><th>거래수</th><th>승률</th><th>총손익</th><th>평균수익률</th><th>최대낙폭</th><th>실행시각</th>
+            <th>#</th><th>매수시각</th><th>매도시각</th><th>매수가</th><th>매도가</th><th>수량</th><th>손익</th><th>수익률</th>
+          </tr></thead>
+          <tbody id="bt-trades-body"></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="mt-4">
+      <h3 class="text-sm font-bold text-gray-700 mb-2">이전 백테스트 이력</h3>
+      <div class="overflow-x-auto">
+        <table class="tbl">
+          <thead><tr>
+            <th>종목</th><th>시장</th><th>기간</th><th>거래수</th><th>승률</th><th>총손익</th><th>평균수익률</th><th>시각</th>
           </tr></thead>
           <tbody id="bt-history-body">
-            <tr><td colspan="9" class="text-center text-gray-400 py-6">이력 없음</td></tr>
+            <tr><td colspan="8" class="text-center text-gray-400 py-4">이력 없음</td></tr>
           </tbody>
         </table>
       </div>
     </div>
   </div>
 
-</div>
+  <div class="h-8"></div>
+</div><!-- end max-w-7xl -->
 
 <!-- Toast -->
 <div id="toast"></div>
 
+<!-- ===== SCRIPTS ===== -->
 <script>
-// ═══════════════════════════════════════════════
-//  유틸리티
-// ═══════════════════════════════════════════════
-const $ = id => document.getElementById(id);
-const fmtKRW = n => (n == null ? '-' : Number(n).toLocaleString('ko-KR') + '원');
-const fmtUSD = n => (n == null ? '-' : '$' + Number(n).toFixed(2));
-const fmtPct = n => (n == null ? '-' : Number(n).toFixed(2) + '%');
-const fmtDt  = s => s ? s.replace(/(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})/, '$1-$2-$3 $4:$5:$6') : '-';
-const colorPL = (n, txt) => {
-  const c = Number(n) > 0 ? 'text-red-600' : Number(n) < 0 ? 'text-blue-600' : 'text-gray-600';
-  return `<span class="${c} font-semibold">${txt}</span>`;
-};
-
-function toast(msg, type = 'success') {
-  const c = type === 'success' ? 'bg-green-600' : type === 'error' ? 'bg-red-600' : 'bg-yellow-500';
-  const d = document.createElement('div');
-  d.className = `toast-msg ${c}`;
-  d.textContent = msg;
-  $('toast').appendChild(d);
-  setTimeout(() => d.remove(), 3200);
-}
-
-function marketBadge(m) {
-  return m === 'US'
-    ? '<span class="badge-us">US</span>'
-    : '<span class="badge-kr">KR</span>';
-}
-
-function signalBadge(action) {
-  const map = { BUY:'signal-buy', SELL:'signal-sell', HOLD:'signal-hold', NONE:'signal-none',
-                SIGNAL_BUY:'signal-buy', SIGNAL_SELL:'signal-sell', SIGNAL_HOLD:'signal-hold', NO_SIGNAL:'signal-none' };
-  const lbl = { BUY:'매수', SELL:'매도', HOLD:'보유', NONE:'없음',
-                SIGNAL_BUY:'매수', SIGNAL_SELL:'매도', SIGNAL_HOLD:'보유', NO_SIGNAL:'없음' };
-  return `<span class="${map[action]||'signal-none'}">${lbl[action]||action}</span>`;
-}
-
-async function api(path, opts = {}) {
-  const res = await fetch(path, opts);
-  return res.json();
-}
-
-// ═══════════════════════════════════════════════
-//  탭 전환
-// ═══════════════════════════════════════════════
-function switchTab(name) {
-  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-  document.querySelectorAll('.tab-pane').forEach(p => p.classList.add('hidden'));
-  $('tab-' + name).classList.add('active');
-  $('pane-' + name).classList.remove('hidden');
-  if (name === 'watchlist') loadWatchlist();
+// ── 탭 전환 ─────────────────────────────────────────────────
+function switchTab(name, btn) {
+  document.querySelectorAll('.tab-content').forEach(el => el.classList.add('hidden'));
+  document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
+  document.getElementById('tab-' + name).classList.remove('hidden');
+  btn.classList.add('active');
+  if (name === 'scan')      loadScanStatus();
+  if (name === 'dashboard') loadDashboard();
+  if (name === 'universe')  loadUniverse_list();
   if (name === 'holdings')  loadHoldings();
   if (name === 'orders')    loadOrders();
   if (name === 'logs')      loadLogs();
   if (name === 'profits')   loadProfits();
   if (name === 'backtest')  loadBacktestHistory();
-  if (name === 'dashboard') loadDashboard();
 }
 
-// ═══════════════════════════════════════════════
-//  대시보드
-// ═══════════════════════════════════════════════
-async function loadDashboard() {
-  const d = await api('/api/trading/dashboard');
-  if (!d.success) return;
-  const data = d.data;
+// ── Toast ────────────────────────────────────────────────────
+function showToast(msg, type='info') {
+  const colors = { success:'bg-green-600', error:'bg-red-500', info:'bg-blue-500', warn:'bg-yellow-500' };
+  const el = document.createElement('div');
+  el.className = `toast-msg ${colors[type]||'bg-blue-500'}`;
+  el.textContent = msg;
+  document.getElementById('toast').appendChild(el);
+  setTimeout(() => el.remove(), 3200);
+}
 
-  // 스위치 동기화
-  $('toggle-main').checked = data.auto_trade_enabled;
-  $('toggle-kr').checked   = data.kr_trade_enabled;
-  $('toggle-us').checked   = data.us_trade_enabled;
-  $('trade-status-label').textContent = data.auto_trade_enabled ? '자동매매 ON' : '자동매매 OFF';
-  $('trade-status-label').className   = data.auto_trade_enabled ? 'text-sm font-semibold text-green-600' : 'text-sm font-semibold text-gray-500';
+function fmtTime(iso) {
+  if (!iso) return '-';
+  const d = new Date(iso);
+  return d.toLocaleString('ko-KR', { month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit', second:'2-digit' });
+}
+function fmtNum(n, dec=0) {
+  if (n == null || n === '') return '-';
+  return Number(n).toLocaleString('ko-KR', { minimumFractionDigits:dec, maximumFractionDigits:dec });
+}
+function colorProfit(v) {
+  if (v > 0) return 'text-red-600';
+  if (v < 0) return 'text-blue-600';
+  return 'text-gray-600';
+}
+function exchangeBadge(ex) {
+  const cls = { KOSPI:'badge-kospi', KOSDAQ:'badge-kosdaq', NASD:'badge-nasd', NYSE:'badge-nyse', AMEX:'badge-amex' };
+  return `<span class="${cls[ex]||'badge-kr'}">${ex||'-'}</span>`;
+}
+function marketBadge(m) {
+  return m === 'US' ? '<span class="badge-us">US</span>' : '<span class="badge-kr">KR</span>';
+}
+function signalBadge(s) {
+  const cls = { BUY:'signal-buy', SELL:'signal-sell', HOLD:'signal-hold' };
+  return `<span class="${cls[s]||'signal-none'}">${s||'NONE'}</span>`;
+}
 
-  $('sys-auto').innerHTML = data.auto_trade_enabled ? '<span class="pill-on">ON</span>' : '<span class="pill-off">OFF</span>';
-  $('sys-kr').innerHTML   = data.kr_trade_enabled   ? '<span class="pill-on">ON</span>' : '<span class="pill-off">OFF</span>';
-  $('sys-us').innerHTML   = data.us_trade_enabled   ? '<span class="pill-on">ON</span>' : '<span class="pill-off">OFF</span>';
-  $('sys-last-scan').textContent = data.last_scan_at ? new Date(data.last_scan_at).toLocaleString('ko-KR') : '없음';
+// ── 장 상태 업데이트 ─────────────────────────────────────────
+function updateMarketStatus(krOpen, usOpen) {
+  const kr = document.getElementById('kr-market-status');
+  const us = document.getElementById('us-market-status');
+  kr.innerHTML = krOpen
+    ? '<span class="market-open"><span class="dot-pulse"></span>KR 장중</span>'
+    : '<span class="market-closed"><span class="dot-off"></span>KR 장마감</span>';
+  us.innerHTML = usOpen
+    ? '<span class="market-open"><span class="dot-pulse"></span>US 장중(프리/정규/애프터)</span>'
+    : '<span class="market-closed"><span class="dot-off"></span>US 장마감</span>';
+}
 
-  const ep = data.total_eval_profit || 0;
-  $('eval-profit').innerHTML = colorPL(ep, fmtKRW(ep));
-  $('realized-profit').innerHTML = colorPL(data.realized_profit, fmtKRW(data.realized_profit));
+// ── 스캔 현황 로드 ──────────────────────────────────────────
+async function loadScanStatus() {
+  try {
+    const res = await fetch('/api/trading/scan-status');
+    const json = await res.json();
+    if (!json.success) return showToast('스캔 현황 로드 실패: ' + json.message, 'error');
+    const d = json.data;
+    const sc = d.scan;
+    const fn = d.scan_function;
+    const u  = d.universe;
 
-  // 보유 종목
-  const holdEl = $('dashboard-holdings');
-  if (!data.holdings.length) {
-    holdEl.innerHTML = '<p class="text-gray-400 text-center py-4">보유 종목 없음</p>';
-  } else {
-    holdEl.innerHTML = data.holdings.map(h => `
-      <div class="flex items-center justify-between py-1.5 border-b last:border-0">
-        <div class="flex items-center gap-2">
-          ${marketBadge(h.market)}
-          <span class="font-medium">${h.ticker}</span>
-          <span class="text-gray-500 text-xs">${h.ticker_name}</span>
-          ${h.above_upper ? '<span class="above-upper-flag">상단돌파</span>' : ''}
-        </div>
-        <div class="text-right">
-          <span class="text-xs text-gray-500">${h.qty}주</span>
-          ${colorPL(h.eval_profit_loss, fmtKRW(h.eval_profit_loss))}
-        </div>
-      </div>`).join('');
+    // 스캔 함수 정보
+    document.getElementById('fn-name').textContent       = fn.name || '-';
+    document.getElementById('fn-strategy').textContent   = fn.strategy || '-';
+    document.getElementById('fn-kr-tickers').textContent = (fn.kr_scan_tickers||0) + '종목';
+    document.getElementById('fn-us-tickers').textContent = (fn.us_scan_tickers||0) + '종목';
+    document.getElementById('fn-batch').textContent      = (fn.batch_size||20) + '종목/회';
+    document.getElementById('fn-total').textContent      = (fn.total_scan_tickers||0) + '종목';
+    document.getElementById('fn-buy-cond').textContent   = fn.buy_condition || '-';
+    document.getElementById('fn-sell-cond').textContent  = fn.sell_condition || '-';
+    document.getElementById('total-tickers-badge').textContent = '대상: ' + (fn.total_scan_tickers||0) + '종목';
+
+    // 거래소별 카드
+    renderExchangeCards(d.scan.by_exchange);
+
+    // 전체 통계
+    document.getElementById('stat-total').textContent    = fmtNum(sc.total);
+    document.getElementById('stat-scanned').textContent  = fmtNum(sc.scanned_today);
+    document.getElementById('stat-pending').textContent  = fmtNum(sc.pending);
+    document.getElementById('stat-buy-sig').textContent  = fmtNum(sc.buy_signals);
+    document.getElementById('stat-sell-sig').textContent = fmtNum(sc.sell_signals);
+    document.getElementById('stat-errors').textContent   = fmtNum(sc.error_count);
+
+    // 진행 바
+    const pct = sc.total > 0 ? Math.round(sc.scanned_today / sc.total * 100) : 0;
+    document.getElementById('scan-bar').style.width = pct + '%';
+    document.getElementById('scan-progress-pct').textContent = pct + '%';
+
+    // 시간 정보
+    document.getElementById('last-scan-time').textContent = fmtTime(sc.last_scan_at);
+    document.getElementById('next-scan-time').textContent = fmtTime(sc.next_scan_at);
+    document.getElementById('kr-offset').textContent      = `${sc.kr_offset||0} / ${u.by_exchange?.KOSPI||0 + u.by_exchange?.KOSDAQ||0}`;
+    document.getElementById('us-offset').textContent      = `${sc.us_offset||0} / ${u.by_exchange?.NASD||0 + u.by_exchange?.NYSE||0 + u.by_exchange?.AMEX||0}`;
+
+    // 장 상태
+    updateMarketStatus(sc.kr_market_open, sc.us_market_open);
+
+    // 신호 종목 렌더
+    renderSignalList('buy-signal-list',  d.buy_signal_stocks,  'buy');
+    renderSignalList('sell-signal-list', d.sell_signal_stocks, 'sell');
+
+    // 오류 종목 (신호 목록에서 error_count 기반 표시)
+    loadErrorStocks();
+
+  } catch (e) {
+    showToast('스캔 현황 오류: ' + e, 'error');
   }
+}
 
-  // 최근 주문
-  const ordEl = $('dashboard-orders');
-  if (!data.recent_orders.length) {
-    ordEl.innerHTML = '<p class="text-gray-400 text-center py-4">주문 내역 없음</p>';
-  } else {
-    ordEl.innerHTML = data.recent_orders.map(o => `
-      <div class="flex items-center justify-between py-1.5 border-b last:border-0 text-xs">
+function renderExchangeCards(byExchange) {
+  const exchanges = ['KOSPI','KOSDAQ','NASD','NYSE','AMEX'];
+  const colors = {
+    KOSPI:  { bg:'bg-blue-50',   border:'border-blue-200',   text:'text-blue-700' },
+    KOSDAQ: { bg:'bg-sky-50',    border:'border-sky-200',    text:'text-sky-700' },
+    NASD:   { bg:'bg-green-50',  border:'border-green-200',  text:'text-green-700' },
+    NYSE:   { bg:'bg-emerald-50',border:'border-emerald-200',text:'text-emerald-700' },
+    AMEX:   { bg:'bg-teal-50',   border:'border-teal-200',   text:'text-teal-700' },
+  };
+  const container = document.getElementById('exchange-cards');
+  container.innerHTML = exchanges.map(ex => {
+    const d = byExchange?.[ex] || { total:0, scanned:0, buy:0, sell:0 };
+    const c = colors[ex];
+    const pct = d.total > 0 ? Math.round(d.scanned/d.total*100) : 0;
+    return `<div class="exch-card border ${c.border} ${c.bg}">
+      <div class="text-xs font-bold ${c.text} mb-1">${ex}</div>
+      <div class="text-lg font-bold text-gray-800">${d.total}</div>
+      <div class="text-xs text-gray-500">등록</div>
+      <div class="mt-1.5 scan-bar-bg !h-1.5">
+        <div class="scan-bar-fill bg-blue-400" style="width:${pct}%"></div>
+      </div>
+      <div class="text-xs text-gray-400 mt-1">${d.scanned}/${d.total} (${pct}%)</div>
+      <div class="flex justify-center gap-2 mt-1 text-xs">
+        <span class="text-green-600 font-semibold">↑${d.buy}</span>
+        <span class="text-red-500 font-semibold">↓${d.sell}</span>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function renderSignalList(containerId, stocks, type) {
+  const el = document.getElementById(containerId);
+  if (!stocks || stocks.length === 0) {
+    el.innerHTML = `<p class="text-xs text-gray-400 text-center py-4">${type === 'buy' ? '매수' : '매도'} 신호 없음</p>`;
+    return;
+  }
+  const colorClass = type === 'buy' ? 'border-green-200 bg-green-50' : 'border-red-200 bg-red-50';
+  const textClass  = type === 'buy' ? 'text-green-700' : 'text-red-700';
+  el.innerHTML = stocks.map(s => `
+    <div class="flex items-center justify-between border ${colorClass} rounded-lg px-3 py-2 text-xs">
+      <div class="flex items-center gap-2">
+        ${exchangeBadge(s.exchange)}
+        <span class="font-bold ${textClass}">${s.ticker}</span>
+        <span class="text-gray-600">${s.ticker_name||''}</span>
+      </div>
+      <span class="text-gray-400">${fmtTime(s.last_scanned_at)}</span>
+    </div>
+  `).join('');
+}
+
+async function loadErrorStocks() {
+  try {
+    const res = await fetch('/api/trading/universe/list?signal=ERROR&limit=30');
+    const json = await res.json();
+    const el = document.getElementById('error-stock-list');
+    const stocks = json.data || [];
+    if (stocks.length === 0) {
+      el.innerHTML = '<p class="text-xs text-gray-400 text-center py-4">오류 없음</p>';
+      return;
+    }
+    el.innerHTML = stocks.map(s => `
+      <div class="flex items-center justify-between border border-orange-200 bg-orange-50 rounded-lg px-3 py-2 text-xs">
         <div class="flex items-center gap-2">
-          ${marketBadge(o.market)}
-          <span class="${o.order_type==='BUY'?'text-red-600':'text-blue-600'} font-bold">${o.order_type==='BUY'?'매수':'매도'}</span>
-          <span class="font-medium">${o.ticker}</span>
+          ${exchangeBadge(s.exchange)}
+          <span class="font-bold text-orange-700">${s.ticker}</span>
+          <span class="text-gray-600 truncate max-w-xs">${s.scan_error||'알 수 없는 오류'}</span>
         </div>
-        <div class="text-right text-gray-500">
-          ${o.qty}주 · ${o.market==='KR' ? fmtKRW(o.price) : fmtUSD(o.price)}
-        </div>
-      </div>`).join('');
+        <span class="text-gray-400">${fmtTime(s.last_scanned_at)}</span>
+      </div>
+    `).join('');
+  } catch(e) {}
+}
+
+// ── 종목 유니버스 로드 ───────────────────────────────────────
+async function loadUniverse() {
+  const btn = document.getElementById('load-universe-btn');
+  btn.disabled = true;
+  btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-1"></i>로드 중...';
+  try {
+    const res = await fetch('/api/trading/universe/load', { method: 'POST' });
+    const json = await res.json();
+    if (json.success) {
+      showToast(`종목 로드 완료: 신규 ${json.inserted}개 / 전체 ${json.total}개`, 'success');
+      loadScanStatus();
+    } else {
+      showToast('로드 실패: ' + json.message, 'error');
+    }
+  } catch(e) {
+    showToast('오류: ' + e, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = '<i class="fas fa-download mr-1"></i>종목 로드';
+  }
+}
+
+// ── 대시보드 ─────────────────────────────────────────────────
+async function loadDashboard() {
+  try {
+    const res = await fetch('/api/trading/dashboard');
+    const json = await res.json();
+    if (!json.success) return;
+    const d = json.data;
+
+    // 설정 토글 동기화
+    document.getElementById('toggle-main').checked    = d.auto_trade_enabled;
+    document.getElementById('toggle-kr').checked      = d.kr_trade_enabled;
+    document.getElementById('toggle-us').checked      = d.us_trade_enabled;
+    document.getElementById('toggle-scan-kr').checked = d.scan_kr_enabled;
+    document.getElementById('toggle-scan-us').checked = d.scan_us_enabled;
+    document.getElementById('trade-status-label').textContent = d.auto_trade_enabled ? '자동매매 ON' : '자동매매 OFF';
+
+    updateMarketStatus(d.kr_market_open, d.us_market_open);
+
+    // 요약 카드
+    const evalProfit = d.total_eval_profit;
+    document.getElementById('eval-profit').className  = 'text-lg font-bold ' + colorProfit(evalProfit);
+    document.getElementById('eval-profit').textContent = fmtNum(evalProfit) + '원';
+    const rp = d.realized_profit;
+    document.getElementById('realized-profit').className  = 'text-lg font-bold ' + colorProfit(rp);
+    document.getElementById('realized-profit').textContent = fmtNum(rp) + '원';
+
+    // 잔고
+    loadBalance();
+
+    // 보유종목 테이블
+    const tbody = document.getElementById('dashboard-holdings-body');
+    tbody.innerHTML = d.holdings.length === 0
+      ? '<tr><td colspan="9" class="text-center text-gray-400 py-4">보유종목 없음</td></tr>'
+      : d.holdings.map(h => `<tr>
+          <td class="font-mono">${h.ticker}</td>
+          <td>${marketBadge(h.market)}</td>
+          <td>${exchangeBadge(h.exchange||'-')}</td>
+          <td>${fmtNum(h.qty)}</td>
+          <td>${fmtNum(h.avg_price, 2)}</td>
+          <td>${fmtNum(h.current_price, 2)}</td>
+          <td class="${colorProfit(h.eval_profit_loss)}">${fmtNum(h.eval_profit_loss, 0)}</td>
+          <td class="${colorProfit(h.eval_return_rate)}">${Number(h.eval_return_rate||0).toFixed(2)}%</td>
+          <td>${h.above_upper ? '<span class="above-upper-flag">상단↑</span>' : '-'}</td>
+        </tr>`).join('');
+
+    // 최근 주문
+    const obody = document.getElementById('dashboard-orders-body');
+    obody.innerHTML = d.recent_orders.length === 0
+      ? '<tr><td colspan="7" class="text-center text-gray-400 py-4">주문 없음</td></tr>'
+      : d.recent_orders.map(o => `<tr>
+          <td class="text-xs text-gray-500">${fmtTime(o.created_at)}</td>
+          <td class="font-mono">${o.ticker}</td>
+          <td>${marketBadge(o.market)}</td>
+          <td class="${o.order_type==='BUY'?'text-red-600 font-bold':'text-blue-600 font-bold'}">${o.order_type}</td>
+          <td>${fmtNum(o.price, 2)}</td>
+          <td>${fmtNum(o.qty)}</td>
+          <td><span class="${o.status==='FILLED'?'text-green-600 font-semibold':'text-gray-500'}">${o.status}</span></td>
+        </tr>`).join('');
+
+    document.getElementById('dashboard-status').textContent =
+      `마지막 스캔: ${fmtTime(d.last_scan_at)} | KR: ${d.kr_market_open?'장중':'장마감'} | US: ${d.us_market_open?'장중':'장마감'}`;
+  } catch (e) {
+    showToast('대시보드 로드 오류: ' + e, 'error');
   }
 }
 
 async function loadBalance() {
-  const d = await api('/api/trading/balance').catch(() => null);
-  if (d?.success) {
-    $('cash-kr').textContent = fmtKRW(d.data.cash_kr);
-    $('cash-us').textContent = fmtUSD(d.data.cash_us);
-  }
-}
-
-// ═══════════════════════════════════════════════
-//  자동매매 토글
-// ═══════════════════════════════════════════════
-async function doToggle(payload, label) {
-  const d = await api('/api/trading/toggle', {
-    method: 'POST', headers: {'Content-Type':'application/json'},
-    body: JSON.stringify(payload),
-  });
-  if (d.success) {
-    toast(label + ' 변경 완료');
-    loadDashboard();
-  } else { toast(d.message, 'error'); }
-}
-
-$('toggle-main').addEventListener('change', e => doToggle({enabled: e.target.checked}, '자동매매'));
-$('toggle-kr').addEventListener('change',   e => doToggle({kr: e.target.checked}, 'KR 거래'));
-$('toggle-us').addEventListener('change',   e => doToggle({us: e.target.checked}, 'US 거래'));
-
-// ═══════════════════════════════════════════════
-//  수동 스캔
-// ═══════════════════════════════════════════════
-async function triggerScan() {
-  const btn = $('scan-btn');
-  btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-1"></i>스캔 중...';
   try {
-    const d = await api('/api/trading/scan', {method:'POST'});
-    if (d.success) {
-      toast(`스캔 완료 — 처리: ${d.scanned}개 | 실행: ${d.actions?.length||0}건`);
-      loadDashboard();
-    } else { toast(d.message || '스캔 실패', 'error'); }
-  } catch(e) { toast(String(e), 'error'); }
-  btn.disabled = false; btn.innerHTML = '<i class="fas fa-sync mr-1"></i>스캔';
+    const r = await fetch('/api/trading/balance');
+    const j = await r.json();
+    if (j.success) {
+      document.getElementById('cash-kr').textContent = j.data.cash_kr_formatted;
+      document.getElementById('cash-us').textContent = j.data.cash_us_formatted;
+    }
+  } catch(e) {}
 }
 
-// ═══════════════════════════════════════════════
-//  감시 종목
-// ═══════════════════════════════════════════════
-async function loadWatchlist() {
-  const d = await api('/api/watchlist');
-  if (!d.success) return;
-  const tbody = $('watchlist-body');
-  if (!d.data.length) {
-    tbody.innerHTML = '<tr><td colspan="7" class="text-center text-gray-400 py-6">감시 종목 없음</td></tr>';
-    return;
-  }
-  tbody.innerHTML = d.data.map(w => `
-    <tr>
-      <td>${marketBadge(w.market)}</td>
-      <td class="font-mono font-medium">${w.ticker}</td>
-      <td>${w.ticker_name}</td>
-      <td>${w.market === 'US' ? fmtUSD(w.buy_amount) : fmtKRW(w.buy_amount)}</td>
-      <td>${w.is_active ? '<span class="pill-on">활성</span>' : '<span class="pill-off">비활성</span>'}</td>
-      <td>
-        <button onclick="previewBB('${w.market}','${w.ticker}')" class="text-blue-500 hover:underline text-xs">
-          <i class="fas fa-chart-bar mr-1"></i>BB신호
-        </button>
-      </td>
-      <td class="flex gap-1">
-        <button onclick="toggleWatchItem(${w.id},${w.is_active})" class="text-xs px-2 py-1 rounded ${w.is_active?'bg-yellow-100 text-yellow-700 hover:bg-yellow-200':'bg-green-100 text-green-700 hover:bg-green-200'}">
-          ${w.is_active?'비활성':'활성'}
-        </button>
-        <button onclick="deleteWatchItem(${w.id},'${w.ticker}')" class="text-xs px-2 py-1 rounded bg-red-100 text-red-600 hover:bg-red-200">삭제</button>
-      </td>
+// ── 종목 목록 페이지네이션 ──────────────────────────────────
+let universeOffset = 0;
+const UNIVERSE_PAGE_SIZE = 100;
+
+async function loadUniverse_list() {
+  universeOffset = 0;
+  await fetchUniverseList();
+}
+async function universeNext() { universeOffset += UNIVERSE_PAGE_SIZE; await fetchUniverseList(); }
+async function universePrev() { universeOffset = Math.max(0, universeOffset - UNIVERSE_PAGE_SIZE); await fetchUniverseList(); }
+
+async function fetchUniverseList() {
+  const exchange = document.getElementById('universe-filter-exchange').value;
+  const signal   = document.getElementById('universe-filter-signal').value;
+  let url = `/api/trading/universe/list?limit=${UNIVERSE_PAGE_SIZE}&offset=${universeOffset}`;
+  if (exchange) url += `&exchange=${exchange}`;
+  if (signal)   url += `&signal=${signal}`;
+
+  try {
+    const res = await fetch(url);
+    const json = await res.json();
+    const tbody = document.getElementById('universe-list-body');
+    const data  = json.data || [];
+    const total = json.total || 0;
+    document.getElementById('universe-total-label').textContent = `전체 ${fmtNum(total)}개`;
+    document.getElementById('universe-page-label').textContent  = `${Math.floor(universeOffset/UNIVERSE_PAGE_SIZE)+1} 페이지`;
+    if (data.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="7" class="text-center text-gray-400 py-6">종목 없음 — 종목 로드 버튼을 눌러주세요</td></tr>';
+      return;
+    }
+    tbody.innerHTML = data.map(s => `<tr>
+      <td class="font-mono text-xs">${s.ticker}</td>
+      <td>${s.ticker_name||'-'}</td>
+      <td>${marketBadge(s.market)}</td>
+      <td>${exchangeBadge(s.exchange)}</td>
+      <td>${signalBadge(s.last_signal)}</td>
+      <td class="text-xs text-gray-400">${fmtTime(s.last_scanned_at)}</td>
+      <td class="text-xs text-orange-600 truncate max-w-xs">${s.scan_error||'-'}</td>
     </tr>`).join('');
+  } catch(e) {
+    showToast('종목 목록 오류: ' + e, 'error');
+  }
 }
 
-async function addWatchItem() {
-  const market = $('wl-market').value;
-  const ticker = $('wl-ticker').value.trim().toUpperCase();
-  const name   = $('wl-name').value.trim();
-  const amount = parseFloat($('wl-amount').value);
-  if (!ticker || !name) return toast('종목코드와 종목명을 입력하세요.', 'warn');
-  const d = await api('/api/watchlist', {
-    method: 'POST', headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({ ticker, ticker_name: name, market, buy_amount: amount }),
-  });
-  if (d.success) { toast(`${ticker} 추가 완료`); loadWatchlist(); $('wl-ticker').value=''; $('wl-name').value=''; }
-  else toast(d.message, 'error');
-}
-
-async function toggleWatchItem(id, current) {
-  const d = await api(`/api/watchlist/${id}`, {
-    method: 'PUT', headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({ is_active: current ? 0 : 1 }),
-  });
-  if (d.success) { toast('상태 변경 완료'); loadWatchlist(); }
-  else toast(d.message, 'error');
-}
-
-async function deleteWatchItem(id, ticker) {
-  if (!confirm(`${ticker}을(를) 감시 목록에서 삭제하시겠습니까?`)) return;
-  const d = await api(`/api/watchlist/${id}`, { method: 'DELETE' });
-  if (d.success) { toast(`${ticker} 삭제 완료`); loadWatchlist(); }
-  else toast(d.message, 'error');
-}
-
-async function previewBB(market, ticker) {
-  toast(`[${market}] ${ticker} BB 신호 조회 중...`, 'info');
-  const d = await api(`/api/trading/preview/${market}/${ticker}`).catch(e=>({success:false,message:String(e)}));
-  if (!d.success) return toast(d.message, 'error');
-  const c = d.current_band;
-  alert(
-    `[${market}] ${ticker} BB 미리보기\n\n` +
-    `신호: ${d.signal}\n이유: ${d.reason}\n\n` +
-    `현재가: ${c?.close?.toFixed(2)}\n` +
-    `BB상단: ${c?.upper?.toFixed(2)}\n` +
-    `BB중단: ${c?.middle?.toFixed(2)}\n` +
-    `BB하단: ${c?.lower?.toFixed(2)}\n` +
-    `상단돌파 플래그: ${d.above_upper}\n` +
-    `보유 여부: ${d.has_position}\n` +
-    `봉 수: ${d.candle_count}`
-  );
-}
-
-// ═══════════════════════════════════════════════
-//  보유 종목
-// ═══════════════════════════════════════════════
+// ── 보유 종목 ────────────────────────────────────────────────
 async function loadHoldings() {
-  const d = await api('/api/trading/holdings');
-  if (!d.success) return;
-  const tbody = $('holdings-body');
-  if (!d.data.length) {
-    tbody.innerHTML = '<tr><td colspan="10" class="text-center text-gray-400 py-6">보유 종목 없음</td></tr>';
-    return;
-  }
-  tbody.innerHTML = d.data.map(h => `
-    <tr>
+  try {
+    const res = await fetch('/api/trading/holdings');
+    const json = await res.json();
+    const tbody = document.getElementById('holdings-body');
+    const data  = json.data || [];
+    if (data.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="10" class="text-center text-gray-400 py-6">보유 종목 없음</td></tr>';
+      return;
+    }
+    tbody.innerHTML = data.map(h => `<tr>
+      <td class="font-mono text-xs">${h.ticker}</td>
+      <td>${h.ticker_name||'-'}</td>
       <td>${marketBadge(h.market)}</td>
-      <td class="font-mono font-medium">${h.ticker}</td>
-      <td>${h.ticker_name}</td>
-      <td class="text-right">${h.qty.toLocaleString()}</td>
-      <td class="text-right">${h.market==='KR' ? fmtKRW(h.avg_price) : fmtUSD(h.avg_price)}</td>
-      <td class="text-right">${h.market==='KR' ? fmtKRW(h.current_price) : fmtUSD(h.current_price)}</td>
-      <td class="text-right">${colorPL(h.eval_profit_loss, h.market==='KR' ? fmtKRW(h.eval_profit_loss) : fmtUSD(h.eval_profit_loss))}</td>
-      <td class="text-right">${colorPL(h.eval_return_rate, fmtPct(h.eval_return_rate))}</td>
-      <td class="text-center">${h.above_upper ? '<span class="above-upper-flag">상단돌파</span>' : '<span class="text-gray-400 text-xs">-</span>'}</td>
-      <td class="text-xs text-gray-400">${h.updated_at ? new Date(h.updated_at).toLocaleString('ko-KR') : '-'}</td>
+      <td>${exchangeBadge(h.exchange||'-')}</td>
+      <td>${fmtNum(h.qty)}</td>
+      <td>${fmtNum(h.avg_price, 2)}</td>
+      <td>${fmtNum(h.current_price, 2)}</td>
+      <td class="${colorProfit(h.eval_profit_loss)}">${fmtNum(h.eval_profit_loss, 0)}</td>
+      <td class="${colorProfit(h.eval_return_rate)}">${Number(h.eval_return_rate||0).toFixed(2)}%</td>
+      <td>${h.above_upper ? '<span class="above-upper-flag">상단↑</span>' : '-'}</td>
     </tr>`).join('');
+  } catch(e) {
+    showToast('보유 종목 오류: ' + e, 'error');
+  }
 }
 
 async function syncHoldings() {
-  toast('KIS에서 보유 종목 동기화 중...', 'info');
-  const d = await api('/api/trading/sync-holdings', {method:'POST'});
-  if (d.success) { toast(d.message); loadHoldings(); loadDashboard(); }
-  else toast(d.message, 'error');
-}
-
-// ═══════════════════════════════════════════════
-//  주문 내역
-// ═══════════════════════════════════════════════
-async function loadOrders() {
-  const market = $('order-market-filter').value;
-  const url = '/api/trading/orders?limit=100' + (market ? '&market='+market : '');
-  const d = await api(url);
-  if (!d.success) return;
-  const tbody = $('orders-body');
-  if (!d.data.length) {
-    tbody.innerHTML = '<tr><td colspan="8" class="text-center text-gray-400 py-6">주문 내역 없음</td></tr>';
-    return;
-  }
-  tbody.innerHTML = d.data.map(o => `
-    <tr>
-      <td>${marketBadge(o.market)}</td>
-      <td><span class="font-mono">${o.ticker}</span> <span class="text-xs text-gray-400">${o.ticker_name}</span></td>
-      <td><span class="${o.order_type==='BUY'?'text-red-600':'text-blue-600'} font-bold text-xs">${o.order_type==='BUY'?'매수':'매도'}</span></td>
-      <td class="text-right">${o.market==='KR' ? fmtKRW(o.price) : fmtUSD(o.price)}</td>
-      <td class="text-right">${o.qty.toLocaleString()}</td>
-      <td class="text-xs text-gray-500">${o.reason||'-'}</td>
-      <td>${o.status==='FILLED'?'<span class="pill-on">체결</span>':'<span class="pill-off">'+o.status+'</span>'}</td>
-      <td class="text-xs text-gray-400">${o.created_at ? new Date(o.created_at).toLocaleString('ko-KR') : '-'}</td>
-    </tr>`).join('');
-}
-
-// ═══════════════════════════════════════════════
-//  매매 로그
-// ═══════════════════════════════════════════════
-async function loadLogs() {
-  const market = $('log-market-filter').value;
-  const action = $('log-action-filter').value;
-  let url = '/api/trading/logs?limit=200';
-  if (market) url += '&market=' + market;
-  if (action) url += '&action=' + action;
-  const d = await api(url);
-  if (!d.success) return;
-  const tbody = $('logs-body');
-  if (!d.data.length) {
-    tbody.innerHTML = '<tr><td colspan="10" class="text-center text-gray-400 py-6">로그 없음</td></tr>';
-    return;
-  }
-  tbody.innerHTML = d.data.map(l => `
-    <tr>
-      <td class="text-xs text-gray-400">${l.created_at ? new Date(l.created_at).toLocaleString('ko-KR') : '-'}</td>
-      <td>${marketBadge(l.market)}</td>
-      <td><span class="font-mono text-xs">${l.ticker}</span></td>
-      <td>${signalBadge(l.action)}</td>
-      <td class="text-right text-xs">${l.current_price > 0 ? Number(l.current_price).toFixed(2) : '-'}</td>
-      <td class="text-right text-xs text-red-400">${l.bb_upper > 0 ? Number(l.bb_upper).toFixed(2) : '-'}</td>
-      <td class="text-right text-xs text-gray-400">${l.bb_middle > 0 ? Number(l.bb_middle).toFixed(2) : '-'}</td>
-      <td class="text-right text-xs text-green-400">${l.bb_lower > 0 ? Number(l.bb_lower).toFixed(2) : '-'}</td>
-      <td class="text-center">${l.above_upper ? '<span class="above-upper-flag">Y</span>' : '<span class="text-gray-300 text-xs">-</span>'}</td>
-      <td class="text-xs text-gray-500 max-w-xs truncate" title="${l.message||''}">${l.message||'-'}</td>
-    </tr>`).join('');
-}
-
-// ═══════════════════════════════════════════════
-//  실현 손익
-// ═══════════════════════════════════════════════
-async function loadProfits() {
-  const d = await api('/api/trading/profits?limit=100');
-  if (!d.success) return;
-  const s = d.summary;
-  $('profit-total').innerHTML = colorPL(s.total_profit, fmtKRW(s.total_profit));
-  $('profit-count').textContent = (s.count || 0) + '건';
-  $('profit-avg-rate').innerHTML = colorPL(s.avg_return_rate, fmtPct(s.avg_return_rate));
-
-  const tbody = $('profits-body');
-  if (!d.data.length) {
-    tbody.innerHTML = '<tr><td colspan="9" class="text-center text-gray-400 py-6">실현 손익 없음</td></tr>';
-    return;
-  }
-  tbody.innerHTML = d.data.map(p => `
-    <tr>
-      <td>${marketBadge(p.market)}</td>
-      <td><span class="font-mono text-xs">${p.ticker}</span> <span class="text-xs text-gray-400">${p.ticker_name}</span></td>
-      <td class="text-right">${p.qty.toLocaleString()}</td>
-      <td class="text-right">${p.market==='KR' ? fmtKRW(p.buy_price) : fmtUSD(p.buy_price)}</td>
-      <td class="text-right">${p.market==='KR' ? fmtKRW(p.sell_price) : fmtUSD(p.sell_price)}</td>
-      <td class="text-right">${colorPL(p.profit_loss, p.market==='KR' ? fmtKRW(p.profit_loss) : fmtUSD(p.profit_loss))}</td>
-      <td class="text-right">${colorPL(p.return_rate, fmtPct(p.return_rate))}</td>
-      <td class="text-xs text-gray-500">${p.sell_reason||'-'}</td>
-      <td class="text-xs text-gray-400">${p.created_at ? new Date(p.created_at).toLocaleString('ko-KR') : '-'}</td>
-    </tr>`).join('');
-}
-
-// ═══════════════════════════════════════════════
-//  백테스트
-// ═══════════════════════════════════════════════
-async function runBacktest() {
-  const ticker = $('bt-ticker').value.trim().toUpperCase();
-  const name   = $('bt-name').value.trim() || ticker;
-  const market = $('bt-market').value;
-  const amount = parseFloat($('bt-amount').value) || 100000;
-  const days   = parseInt($('bt-days').value)   || 7;
-  if (!ticker) return toast('종목코드를 입력하세요.', 'warn');
-
-  const btn = $('bt-run-btn');
-  btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-1"></i>실행 중...';
+  showToast('KIS 동기화 중...', 'info');
   try {
-    const d = await api('/api/trading/backtest', {
-      method: 'POST', headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({ ticker, ticker_name: name, market, buy_amount: amount, days }),
-    });
-    if (!d.success) { toast(d.message, 'error'); return; }
-    const r = d.data;
-    $('bt-result').classList.remove('hidden');
-    $('bt-total-trades').textContent = r.total_trades;
-    $('bt-win-rate').innerHTML = colorPL(r.win_rate - 50, fmtPct(r.win_rate));
-    $('bt-total-profit').innerHTML = colorPL(r.total_profit, market==='KR' ? fmtKRW(r.total_profit) : fmtUSD(r.total_profit));
-    $('bt-max-dd').textContent = market==='KR' ? fmtKRW(r.max_drawdown) : fmtUSD(r.max_drawdown);
+    const res = await fetch('/api/trading/sync-holdings', { method: 'POST' });
+    const json = await res.json();
+    if (json.success) { showToast(json.message, 'success'); loadHoldings(); }
+    else showToast('동기화 실패: ' + json.message, 'error');
+  } catch(e) { showToast('오류: ' + e, 'error'); }
+}
 
-    const tbody = $('bt-trades-body');
-    if (!r.trades.length) {
-      tbody.innerHTML = '<tr><td colspan="8" class="text-center text-gray-400 py-4">거래 없음</td></tr>';
-    } else {
-      tbody.innerHTML = r.trades.map((t, i) => `
-        <tr>
-          <td>${i+1}</td>
-          <td class="text-xs">${fmtDt(t.buy_datetime)}</td>
-          <td class="text-xs">${fmtDt(t.sell_datetime)}</td>
-          <td class="text-right">${market==='KR' ? fmtKRW(t.buy_price) : fmtUSD(t.buy_price)}</td>
-          <td class="text-right">${market==='KR' ? fmtKRW(t.sell_price) : fmtUSD(t.sell_price)}</td>
-          <td class="text-right">${t.qty}</td>
-          <td class="text-right">${colorPL(t.profit_loss, market==='KR' ? fmtKRW(t.profit_loss) : fmtUSD(t.profit_loss))}</td>
-          <td class="text-right">${colorPL(t.return_rate, fmtPct(t.return_rate))}</td>
-        </tr>`).join('');
+// ── 주문 내역 ────────────────────────────────────────────────
+let ordersOffset = 0;
+const ORDERS_PAGE_SIZE = 50;
+async function loadOrders()    { ordersOffset = 0; await fetchOrders(); }
+async function ordersNext()    { ordersOffset += ORDERS_PAGE_SIZE; await fetchOrders(); }
+async function ordersPrev()    { ordersOffset = Math.max(0, ordersOffset - ORDERS_PAGE_SIZE); await fetchOrders(); }
+async function fetchOrders() {
+  const market = document.getElementById('orders-market-filter').value;
+  let url = `/api/trading/orders?limit=${ORDERS_PAGE_SIZE}&offset=${ordersOffset}`;
+  if (market) url += `&market=${market}`;
+  try {
+    const res = await fetch(url);
+    const json = await res.json();
+    const tbody = document.getElementById('orders-body');
+    const data  = json.data || [];
+    document.getElementById('orders-page-label').textContent = `${Math.floor(ordersOffset/ORDERS_PAGE_SIZE)+1} 페이지 (전체 ${json.total||0}건)`;
+    if (data.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="9" class="text-center text-gray-400 py-6">주문 없음</td></tr>';
+      return;
     }
+    tbody.innerHTML = data.map(o => `<tr>
+      <td class="text-xs text-gray-500">${fmtTime(o.created_at)}</td>
+      <td class="font-mono text-xs">${o.ticker}</td>
+      <td>${o.ticker_name||'-'}</td>
+      <td>${marketBadge(o.market)}</td>
+      <td class="${o.order_type==='BUY'?'text-red-600 font-bold':'text-blue-600 font-bold'}">${o.order_type}</td>
+      <td>${fmtNum(o.price, 2)}</td>
+      <td>${fmtNum(o.qty)}</td>
+      <td><span class="${o.status==='FILLED'?'text-green-600 font-semibold':'text-gray-500'}">${o.status}</span></td>
+      <td class="text-xs text-gray-400">${o.reason||'-'}</td>
+    </tr>`).join('');
+  } catch(e) { showToast('주문 내역 오류: ' + e, 'error'); }
+}
+
+// ── 매매 로그 ────────────────────────────────────────────────
+async function loadLogs() {
+  const action = document.getElementById('logs-action-filter').value;
+  const market = document.getElementById('logs-market-filter').value;
+  let url = '/api/trading/logs?limit=200';
+  if (action) url += `&action=${action}`;
+  if (market) url += `&market=${market}`;
+  try {
+    const res  = await fetch(url);
+    const json = await res.json();
+    const tbody = document.getElementById('logs-body');
+    const data  = json.data || [];
+    if (data.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="10" class="text-center text-gray-400 py-6">로그 없음</td></tr>';
+      return;
+    }
+    tbody.innerHTML = data.map(l => `<tr>
+      <td class="text-xs text-gray-500 whitespace-nowrap">${fmtTime(l.created_at)}</td>
+      <td class="font-mono text-xs">${l.ticker}</td>
+      <td>${marketBadge(l.market)}</td>
+      <td class="${l.action==='SIGNAL_BUY'?'signal-buy':l.action==='SIGNAL_SELL'?'signal-sell':'signal-none'} text-xs">${l.action}</td>
+      <td>${fmtNum(l.current_price, 2)}</td>
+      <td class="text-red-400 text-xs">${fmtNum(l.bb_upper, 2)}</td>
+      <td class="text-gray-400 text-xs">${fmtNum(l.bb_middle, 2)}</td>
+      <td class="text-blue-400 text-xs">${fmtNum(l.bb_lower, 2)}</td>
+      <td>${l.above_upper ? '<span class="above-upper-flag">상단↑</span>' : '-'}</td>
+      <td class="text-xs text-gray-400 truncate max-w-xs">${l.message||'-'}</td>
+    </tr>`).join('');
+  } catch(e) { showToast('로그 오류: ' + e, 'error'); }
+}
+
+// ── 실현 손익 ────────────────────────────────────────────────
+async function loadProfits() {
+  try {
+    const res  = await fetch('/api/trading/profits?limit=100');
+    const json = await res.json();
+    const tbody = document.getElementById('profits-body');
+    const data  = json.data || [];
+    const s     = json.summary || {};
+    const totalEl = document.getElementById('profits-total');
+    totalEl.className = 'text-xl font-bold ' + colorProfit(s.total_profit);
+    totalEl.textContent = fmtNum(s.total_profit, 0) + '원';
+    document.getElementById('profits-count').textContent    = fmtNum(s.count) + '건';
+    document.getElementById('profits-avg-rate').textContent = Number(s.avg_return_rate||0).toFixed(2) + '%';
+    if (data.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="9" class="text-center text-gray-400 py-6">실현 손익 없음</td></tr>';
+      return;
+    }
+    tbody.innerHTML = data.map(p => `<tr>
+      <td class="text-xs text-gray-500 whitespace-nowrap">${fmtTime(p.created_at)}</td>
+      <td class="font-mono text-xs">${p.ticker}</td>
+      <td>${marketBadge(p.market)}</td>
+      <td>${fmtNum(p.buy_price, 2)}</td>
+      <td>${fmtNum(p.sell_price, 2)}</td>
+      <td>${fmtNum(p.qty)}</td>
+      <td class="${colorProfit(p.profit_loss)} font-semibold">${fmtNum(p.profit_loss, 0)}</td>
+      <td class="${colorProfit(p.return_rate)}">${Number(p.return_rate||0).toFixed(2)}%</td>
+      <td class="text-xs text-gray-400">${p.sell_reason||'-'}</td>
+    </tr>`).join('');
+  } catch(e) { showToast('손익 오류: ' + e, 'error'); }
+}
+
+// ── 백테스트 ─────────────────────────────────────────────────
+function onBtMarketChange() {
+  const isUS = document.getElementById('bt-market').value === 'US';
+  document.getElementById('bt-exchange-wrap').style.display = isUS ? '' : 'none';
+}
+onBtMarketChange();
+
+async function runBacktest() {
+  const ticker   = document.getElementById('bt-ticker').value.trim().toUpperCase();
+  const market   = document.getElementById('bt-market').value;
+  const exchange = document.getElementById('bt-exchange').value;
+  const amount   = parseFloat(document.getElementById('bt-amount').value) || 100000;
+  const days     = parseInt(document.getElementById('bt-days').value) || 7;
+  if (!ticker) return showToast('종목코드를 입력하세요', 'warn');
+  const btn = document.getElementById('bt-run-btn');
+  btn.disabled = true;
+  btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-1"></i>실행 중...';
+  try {
+    const res  = await fetch('/api/trading/backtest', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ticker, market, exchange: market==='US'?exchange:undefined, buy_amount: amount, days }),
+    });
+    const json = await res.json();
+    if (!json.success) return showToast('백테스트 실패: ' + json.message, 'error');
+    const r = json.data;
+    document.getElementById('bt-result').classList.remove('hidden');
+    document.getElementById('bt-total-trades').textContent = r.total_trades;
+    document.getElementById('bt-win').textContent          = r.win_trades;
+    document.getElementById('bt-loss').textContent         = r.loss_trades;
+    document.getElementById('bt-winrate').textContent      = Number(r.win_rate||0).toFixed(1) + '%';
+    const profEl = document.getElementById('bt-profit');
+    profEl.className = 'text-xl font-bold ' + colorProfit(r.total_profit);
+    profEl.textContent = (market==='US'?'$':'') + fmtNum(r.total_profit, 2);
+    const ttbody = document.getElementById('bt-trades-body');
+    ttbody.innerHTML = (r.trades||[]).map((t, i) => `<tr>
+      <td>${i+1}</td>
+      <td class="text-xs">${t.buy_datetime||'-'}</td>
+      <td class="text-xs">${t.sell_datetime||'-'}</td>
+      <td>${fmtNum(t.buy_price,2)}</td>
+      <td>${fmtNum(t.sell_price,2)}</td>
+      <td>${t.qty}</td>
+      <td class="${colorProfit(t.profit_loss)} font-semibold">${fmtNum(t.profit_loss,2)}</td>
+      <td class="${colorProfit(t.return_rate)}">${Number(t.return_rate||0).toFixed(2)}%</td>
+    </tr>`).join('');
     loadBacktestHistory();
-    toast('백테스트 완료');
-  } catch(e) { toast(String(e), 'error'); }
-  btn.disabled = false; btn.innerHTML = '<i class="fas fa-play mr-1"></i>백테스트 실행';
+  } catch(e) { showToast('오류: ' + e, 'error'); }
+  finally {
+    btn.disabled = false;
+    btn.innerHTML = '<i class="fas fa-play mr-1"></i>백테스트 실행';
+  }
 }
 
 async function loadBacktestHistory() {
-  const d = await api('/api/trading/backtest/history');
-  if (!d.success) return;
-  const tbody = $('bt-history-body');
-  if (!d.data.length) {
-    tbody.innerHTML = '<tr><td colspan="9" class="text-center text-gray-400 py-6">이력 없음</td></tr>';
-    return;
-  }
-  tbody.innerHTML = d.data.map(r => `
-    <tr>
-      <td>${marketBadge(r.market)}</td>
-      <td><span class="font-mono text-xs">${r.ticker}</span> <span class="text-xs text-gray-400">${r.ticker_name}</span></td>
-      <td class="text-xs">${(r.start_date||'').replace(/(\d{4})(\d{2})(\d{2})/,'$1-$2-$3')} ~ ${(r.end_date||'').replace(/(\d{4})(\d{2})(\d{2})/,'$1-$2-$3')}</td>
-      <td class="text-right">${r.total_trades} (승:${r.win_trades}/패:${r.loss_trades})</td>
-      <td class="text-right">${colorPL(r.win_rate-50, fmtPct(r.win_rate))}</td>
-      <td class="text-right">${colorPL(r.total_profit, r.market==='KR' ? fmtKRW(r.total_profit) : fmtUSD(r.total_profit))}</td>
-      <td class="text-right">${colorPL(r.avg_return, fmtPct(r.avg_return))}</td>
-      <td class="text-right text-red-400">${r.market==='KR' ? fmtKRW(r.max_drawdown) : fmtUSD(r.max_drawdown)}</td>
-      <td class="text-xs text-gray-400">${r.created_at ? new Date(r.created_at).toLocaleString('ko-KR') : '-'}</td>
+  try {
+    const res  = await fetch('/api/trading/backtest/history');
+    const json = await res.json();
+    const tbody = document.getElementById('bt-history-body');
+    const data  = json.data || [];
+    if (data.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="8" class="text-center text-gray-400 py-4">이력 없음</td></tr>';
+      return;
+    }
+    tbody.innerHTML = data.map(b => `<tr>
+      <td class="font-mono text-xs">${b.ticker} <span class="text-gray-400">${b.ticker_name||''}</span></td>
+      <td>${marketBadge(b.market)}</td>
+      <td class="text-xs">${b.start_date||''} ~ ${b.end_date||''}</td>
+      <td>${b.total_trades}</td>
+      <td>${Number(b.win_rate||0).toFixed(1)}%</td>
+      <td class="${colorProfit(b.total_profit)} font-semibold">${fmtNum(b.total_profit,0)}</td>
+      <td class="${colorProfit(b.avg_return)}">${Number(b.avg_return||0).toFixed(2)}%</td>
+      <td class="text-xs text-gray-400">${fmtTime(b.created_at)}</td>
     </tr>`).join('');
+  } catch(e) {}
 }
 
-// ═══════════════════════════════════════════════
-//  초기화
-// ═══════════════════════════════════════════════
-(async () => {
-  await Promise.all([loadDashboard(), loadBalance()]);
-  // 30초마다 대시보드 갱신
+// ── 토글 제어 ────────────────────────────────────────────────
+async function toggleMain(v)   { await postToggle({ enabled: v }); document.getElementById('trade-status-label').textContent = v?'자동매매 ON':'자동매매 OFF'; showToast(v?'자동매매 활성화':'자동매매 비활성화', v?'success':'warn'); }
+async function toggleKR(v)     { await postToggle({ kr: v }); showToast('KR 매매 ' + (v?'ON':'OFF'), v?'success':'warn'); }
+async function toggleUS(v)     { await postToggle({ us: v }); showToast('US 매매 ' + (v?'ON':'OFF'), v?'success':'warn'); }
+async function toggleScanKR(v) { await postToggle({ scan_kr: v }); showToast('KR 스캔 ' + (v?'ON':'OFF'), v?'success':'warn'); }
+async function toggleScanUS(v) { await postToggle({ scan_us: v }); showToast('US 스캔 ' + (v?'ON':'OFF'), v?'success':'warn'); }
+async function postToggle(body) {
+  try { await fetch('/api/trading/toggle', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) }); }
+  catch(e) { showToast('설정 오류: ' + e, 'error'); }
+}
+
+// ── 수동 스캔 ────────────────────────────────────────────────
+async function triggerScan() {
+  const btn = document.getElementById('scan-btn');
+  btn.disabled = true;
+  btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-1"></i>스캔 중...';
+  showToast('스캔 실행 중...', 'info');
+  try {
+    const res  = await fetch('/api/trading/scan', { method:'POST' });
+    const json = await res.json();
+    if (json.success) {
+      showToast(`스캔 완료: ${json.scanned}종목 | 배치: ${json.batch_info||'-'}`, 'success');
+      if (json.actions?.length > 0) showToast(json.actions.join(' | '), 'success');
+      if (json.errors?.length > 0)  showToast('오류: ' + json.errors.join(' | '), 'error');
+      loadScanStatus();
+    } else {
+      showToast('스캔 실패: ' + json.message, 'error');
+    }
+  } catch(e) { showToast('스캔 오류: ' + e, 'error'); }
+  finally {
+    btn.disabled = false;
+    btn.innerHTML = '<i class="fas fa-sync mr-1"></i>수동스캔';
+  }
+}
+
+// ── 초기화 ──────────────────────────────────────────────────
+async function init() {
+  await loadDashboard();
+  await loadScanStatus();
+  // 30초마다 스캔 현황 자동 갱신
   setInterval(() => {
-    const active = document.querySelector('.tab-btn.active')?.id?.replace('tab-','');
-    if (active === 'dashboard') loadDashboard();
-    loadBalance();
+    const activeTab = document.querySelector('.tab-btn.active');
+    if (!activeTab) return;
+    const tabName = activeTab.getAttribute('onclick')?.match(/switchTab\('(\w+)'/)?.[1];
+    if (tabName === 'scan') loadScanStatus();
   }, 30000);
-})();
+}
+
+window.addEventListener('DOMContentLoaded', init);
 </script>
 </body>
 </html>
