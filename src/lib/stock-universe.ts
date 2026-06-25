@@ -294,26 +294,42 @@ export async function updateUniverseScanResult(
 
 /**
  * 스캔 통계 조회 (대시보드용)
+ * ─────────────────────────────────────────────────────────────
+ * 5가지 상태 분류:
+ *   normal_count    — 정상 스캔 (NONE/NO_SIGNAL)
+ *   no_data_count   — 데이터 부족 (NO_DATA: 봉수 부족 / 평탄봉 / std=0 / BB폭 너무 좁음)
+ *   error_count     — API 오류 (ERROR / ERROR_US_MARKET_DATA_PERMISSION 포함)
+ *   buy_signals     — 매수 신호 (BUY)
+ *   sell_signals    — 매도 신호 (SELL)
+ *   us_permission_error_count — 해외주식 시세 권한 없음 (ERROR_US_MARKET_DATA_PERMISSION)
  */
 export async function getScanStats(db: D1Database): Promise<{
   total: number;
   scanned_today: number;
   pending: number;
+  normal_count: number;
+  no_data_count: number;
   buy_signals: number;
   sell_signals: number;
   error_count: number;
-  by_exchange: Record<string, { total: number; scanned: number; buy: number; sell: number }>;
+  us_permission_error_count: number;
+  by_exchange: Record<string, { total: number; scanned: number; buy: number; sell: number; no_data: number; error: number }>;
 }> {
   const todayStart = new Date();
   todayStart.setHours(0, 0, 0, 0);
   const todayStr = todayStart.toISOString().slice(0, 10);
 
-  const [totalRow, scannedRow, buyRow, sellRow, errRow] = await Promise.all([
+  const [totalRow, scannedRow, buyRow, sellRow, errRow, noDataRow, usPermErrRow] = await Promise.all([
     db.prepare('SELECT COUNT(*) as cnt FROM stock_universe WHERE is_active=1').first<{cnt:number}>(),
     db.prepare(`SELECT COUNT(*) as cnt FROM stock_universe WHERE is_active=1 AND last_scanned_at >= ?`).bind(todayStr).first<{cnt:number}>(),
     db.prepare(`SELECT COUNT(*) as cnt FROM stock_universe WHERE last_signal='BUY' AND last_scanned_at >= ?`).bind(todayStr).first<{cnt:number}>(),
     db.prepare(`SELECT COUNT(*) as cnt FROM stock_universe WHERE last_signal='SELL' AND last_scanned_at >= ?`).bind(todayStr).first<{cnt:number}>(),
-    db.prepare(`SELECT COUNT(*) as cnt FROM stock_universe WHERE scan_error IS NOT NULL AND last_scanned_at >= ?`).bind(todayStr).first<{cnt:number}>(),
+    // ERROR 계열 전체 (ERROR_US_MARKET_DATA_PERMISSION 포함)
+    db.prepare(`SELECT COUNT(*) as cnt FROM stock_universe WHERE last_signal LIKE 'ERROR%' AND last_scanned_at >= ?`).bind(todayStr).first<{cnt:number}>(),
+    // NO_DATA
+    db.prepare(`SELECT COUNT(*) as cnt FROM stock_universe WHERE last_signal='NO_DATA' AND last_scanned_at >= ?`).bind(todayStr).first<{cnt:number}>(),
+    // 해외주식 시세 권한 없음
+    db.prepare(`SELECT COUNT(*) as cnt FROM stock_universe WHERE last_signal='ERROR_US_MARKET_DATA_PERMISSION' AND last_scanned_at >= ?`).bind(todayStr).first<{cnt:number}>(),
   ]);
 
   const total    = totalRow?.cnt || 0;
@@ -321,25 +337,41 @@ export async function getScanStats(db: D1Database): Promise<{
   const buy      = buyRow?.cnt || 0;
   const sell     = sellRow?.cnt || 0;
   const errors   = errRow?.cnt || 0;
+  const noData   = noDataRow?.cnt || 0;
+  const usPermErr = usPermErrRow?.cnt || 0;
+  // 정상 = 스캔 완료 - 매수 - 매도 - ERROR계열 - NO_DATA
+  const normal   = Math.max(0, scanned - buy - sell - errors - noData);
 
   // 거래소별 통계
   const exchRows = await db.prepare(
     `SELECT exchange,
             COUNT(*) as total,
             SUM(CASE WHEN last_scanned_at >= ? THEN 1 ELSE 0 END) as scanned,
-            SUM(CASE WHEN last_signal='BUY'  AND last_scanned_at >= ? THEN 1 ELSE 0 END) as buy,
-            SUM(CASE WHEN last_signal='SELL' AND last_scanned_at >= ? THEN 1 ELSE 0 END) as sell
+            SUM(CASE WHEN last_signal='BUY'     AND last_scanned_at >= ? THEN 1 ELSE 0 END) as buy,
+            SUM(CASE WHEN last_signal='SELL'    AND last_scanned_at >= ? THEN 1 ELSE 0 END) as sell,
+            SUM(CASE WHEN last_signal='NO_DATA' AND last_scanned_at >= ? THEN 1 ELSE 0 END) as no_data,
+            SUM(CASE WHEN last_signal LIKE 'ERROR%' AND last_scanned_at >= ? THEN 1 ELSE 0 END) as error
      FROM stock_universe WHERE is_active=1 GROUP BY exchange`
-  ).bind(todayStr, todayStr, todayStr).all<{exchange:string;total:number;scanned:number;buy:number;sell:number}>();
+  ).bind(todayStr, todayStr, todayStr, todayStr, todayStr)
+   .all<{exchange:string;total:number;scanned:number;buy:number;sell:number;no_data:number;error:number}>();
 
-  const byExchange: Record<string, {total:number;scanned:number;buy:number;sell:number}> = {};
+  const byExchange: Record<string, {total:number;scanned:number;buy:number;sell:number;no_data:number;error:number}> = {};
   for (const r of (exchRows.results || [])) {
-    byExchange[r.exchange] = { total: r.total, scanned: r.scanned, buy: r.buy, sell: r.sell };
+    byExchange[r.exchange] = {
+      total: r.total, scanned: r.scanned,
+      buy: r.buy, sell: r.sell,
+      no_data: r.no_data, error: r.error,
+    };
   }
 
   return {
     total, scanned_today: scanned, pending: total - scanned,
-    buy_signals: buy, sell_signals: sell, error_count: errors,
+    normal_count: normal,
+    no_data_count: noData,
+    buy_signals: buy,
+    sell_signals: sell,
+    error_count: errors,
+    us_permission_error_count: usPermErr,
     by_exchange: byExchange,
   };
 }

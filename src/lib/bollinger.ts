@@ -1,5 +1,5 @@
 /**
- * 볼린저밴드 계산 엔진 v2
+ * 볼린저밴드 계산 엔진 v3
  * - 15분봉 기준
  * - 기간 20, 표준편차 2 (고정)
  * - 종가 기준
@@ -7,6 +7,12 @@
  * ■ 매수: 직전봉 종가 < 하단선 AND 현재봉 종가 > 하단선
  * ■ 매도: 상단선 위에 있다가 → 상단선 아래로 내려오면 전량 매도
  *         (상단선 위에 있는 동안은 계속 보유)
+ *
+ * ■ 방어 로직 (validateCandleData)
+ *   - 봉 수 30개 미만 → NO_DATA
+ *   - 최근 20개 봉 종가 전부 동일 → NO_DATA (장마감 후 반복 봉)
+ *   - 표준편차 0 → NO_DATA
+ *   - BB폭 < 현재가 × 0.001 → NO_DATA (BB폭 너무 좁음)
  */
 
 export interface BBand {
@@ -15,6 +21,76 @@ export interface BBand {
   upper:    number;
   middle:   number;
   lower:    number;
+}
+
+// ─── 캔들 데이터 품질 검증 ─────────────────────────────────────
+export interface CandleValidation {
+  valid:   boolean;
+  reason:  string;
+  detail?: string;
+}
+
+/**
+ * 15분봉 배열의 품질을 검증한다.
+ * 모든 조건 통과 시 valid=true, 하나라도 실패하면 valid=false + reason 반환.
+ *
+ * @param closes   종가 배열 (오름차순, 최신이 마지막)
+ * @param minCount 최소 봉 수 (기본 30)
+ * @param checkLen 동일종가 검사 구간 (기본 20)
+ * @param bbWidthThreshold BB폭 / 현재가 최소 비율 (기본 0.001 = 0.1%)
+ */
+export function validateCandleData(
+  closes:             number[],
+  minCount           = 30,
+  checkLen           = 20,
+  bbWidthThreshold   = 0.001
+): CandleValidation {
+  const n = closes.length;
+
+  // 1. 봉 수 부족
+  if (n < minCount) {
+    return {
+      valid:  false,
+      reason: `봉 수 부족 (${n}개 < ${minCount}개)`,
+      detail: `MIN_CANDLE`,
+    };
+  }
+
+  // 2. 최근 checkLen개 봉 종가 전부 동일 (장마감 후 반복 봉)
+  const recent = closes.slice(-checkLen);
+  const allSame = recent.every(v => v === recent[0]);
+  if (allSame) {
+    return {
+      valid:  false,
+      reason: `최근 ${checkLen}봉 종가 동일 (${recent[0]}) — 장마감 후 반복 데이터`,
+      detail: `FLAT_CANDLE`,
+    };
+  }
+
+  // 3. 표준편차 0 (최근 20봉 기준)
+  const mean = recent.reduce((s, v) => s + v, 0) / recent.length;
+  const std  = Math.sqrt(recent.reduce((s, v) => s + (v - mean) ** 2, 0) / recent.length);
+  if (std === 0) {
+    return {
+      valid:  false,
+      reason: `표준편차 = 0 — 유효한 가격 변동 없음`,
+      detail: `ZERO_STD`,
+    };
+  }
+
+  // 4. BB폭 너무 좁음 (현재가 기준 0.1% 미만)
+  // BB폭 = 4σ (upper - lower = 2×mult×std, mult=2 → 4σ)
+  const currentClose = closes[n - 1];
+  const bbWidth      = 4 * std;  // upper - lower ≈ 4σ (mult=2)
+  if (currentClose > 0 && bbWidth < currentClose * bbWidthThreshold) {
+    return {
+      valid:  false,
+      reason: `BB폭 너무 좁음 (폭 ${bbWidth.toFixed(4)} < 현재가 ${currentClose} × ${bbWidthThreshold})`,
+      detail: `NARROW_BB`,
+    };
+  }
+
+  return { valid: true, reason: 'OK' };
 }
 
 // 매수/매도 신호

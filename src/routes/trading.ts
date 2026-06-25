@@ -85,14 +85,17 @@ trading.get('/scan-status', async (c) => {
     nextScan.setSeconds(0, 0);
     nextScan.setMinutes(nextScan.getMinutes() + 1);
 
+    // 해외주식 시세 권한 없음 여부 (오늘 ERROR_US_MARKET_DATA_PERMISSION 발생 시 true)
+    const hasUSPermError = (stats.us_permission_error_count ?? 0) > 0;
+
     return c.json({
       success: true,
       data: {
         // DB 기반 실제 종목 수
         universe: dbUniverse,
-        // 스캔 통계
+        // 스캔 통계 (5가지 상태 포함)
         scan: {
-          ...stats,
+          ...stats,              // total, scanned_today, pending, normal_count, no_data_count, buy_signals, sell_signals, error_count, us_permission_error_count, by_exchange
           batch_size: batchSize,
           kr_offset: krOffset,
           us_offset: usOffset,
@@ -100,6 +103,14 @@ trading.get('/scan-status', async (c) => {
           us_market_open: isUSMarketOpen(),
           last_scan_at: cfgMap['last_scan_at'] || null,
           next_scan_at: nextScan.toISOString(),
+        },
+        // 해외주식 시세 권한 경고
+        us_market_data_permission: {
+          has_error: hasUSPermError,
+          error_count: stats.us_permission_error_count ?? 0,
+          message: hasUSPermError
+            ? '해외주식 시세 권한 필요 — KIS HTS에서 해외주식 시세 서비스를 신청하세요.'
+            : null,
         },
         // 신호 종목
         buy_signal_stocks: buySigs,

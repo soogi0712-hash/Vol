@@ -215,13 +215,63 @@
       </div>
     </div>
 
+    <!-- ★ 해외주식 시세 권한 경고 배너 (오류 발생 시 표시) -->
+    <div id="us-permission-banner" class="hidden mb-4 bg-amber-50 border border-amber-300 rounded-xl p-3 flex items-start gap-3">
+      <i class="fas fa-exclamation-triangle text-amber-500 text-lg mt-0.5 flex-shrink-0"></i>
+      <div class="flex-1">
+        <p class="text-sm font-bold text-amber-800">해외주식 시세 권한 필요</p>
+        <p class="text-xs text-amber-700 mt-0.5">
+          KIS HTS에서 <strong>해외주식 시세 서비스</strong>를 신청해야 미국주식 15분봉 데이터를 받을 수 있습니다.<br>
+          미신청 상태에서는 US 종목 <strong>주문이 완전 금지</strong>되고 <code class="bg-amber-100 px-1 rounded">ERROR_US_MARKET_DATA_PERMISSION</code> 상태로 기록됩니다.
+        </p>
+        <p class="text-xs text-amber-600 font-semibold mt-1" id="us-perm-error-count"></p>
+      </div>
+    </div>
+
     <!-- 거래소별 통계 카드 -->
     <div class="exchange-grid mb-4" id="exchange-cards">
       <!-- JS로 렌더링 -->
     </div>
 
-    <!-- 전체 스캔 진행 상황 -->
-    <div class="grid grid-cols-2 md:grid-cols-6 gap-3 mb-4">
+    <!-- ★ 5가지 상태 카드 (오늘 스캔 결과 분류) -->
+    <div class="mb-2">
+      <h3 class="text-xs font-bold text-gray-500 uppercase tracking-wide mb-2"><i class="fas fa-chart-pie mr-1"></i>오늘 스캔 결과 상태 분류</h3>
+    </div>
+    <div class="grid grid-cols-2 md:grid-cols-5 gap-3 mb-4">
+      <!-- 정상 스캔 -->
+      <div class="bg-emerald-50 border border-emerald-200 rounded-xl p-3 text-center">
+        <div class="text-2xl font-bold text-emerald-700" id="stat-normal">-</div>
+        <div class="text-xs text-gray-500 mt-0.5"><i class="fas fa-check-circle text-emerald-500 mr-1"></i>정상 스캔</div>
+        <div class="text-xs text-gray-400 mt-0.5">신호 없음 정상</div>
+      </div>
+      <!-- NO_DATA -->
+      <div class="bg-slate-50 border border-slate-200 rounded-xl p-3 text-center">
+        <div class="text-2xl font-bold text-slate-600" id="stat-no-data">-</div>
+        <div class="text-xs text-gray-500 mt-0.5"><i class="fas fa-ban text-slate-400 mr-1"></i>NO_DATA</div>
+        <div class="text-xs text-gray-400 mt-0.5">봉부족·평탄·BB좁음</div>
+      </div>
+      <!-- API_ERROR -->
+      <div class="bg-orange-50 border border-orange-200 rounded-xl p-3 text-center">
+        <div class="text-2xl font-bold text-orange-600" id="stat-errors">-</div>
+        <div class="text-xs text-gray-500 mt-0.5"><i class="fas fa-exclamation-triangle text-orange-500 mr-1"></i>API_ERROR</div>
+        <div class="text-xs text-gray-400 mt-0.5" id="stat-us-perm-sub">권한오류 포함</div>
+      </div>
+      <!-- 매수 신호 -->
+      <div class="bg-green-50 border border-green-200 rounded-xl p-3 text-center">
+        <div class="text-2xl font-bold text-green-700" id="stat-buy-sig">-</div>
+        <div class="text-xs text-gray-500 mt-0.5"><i class="fas fa-arrow-up text-green-600 mr-1"></i>매수 신호</div>
+        <div class="text-xs text-gray-400 mt-0.5">BB 하단 돌파</div>
+      </div>
+      <!-- 매도 신호 -->
+      <div class="bg-red-50 border border-red-200 rounded-xl p-3 text-center">
+        <div class="text-2xl font-bold text-red-600" id="stat-sell-sig">-</div>
+        <div class="text-xs text-gray-500 mt-0.5"><i class="fas fa-arrow-down text-red-500 mr-1"></i>매도 신호</div>
+        <div class="text-xs text-gray-400 mt-0.5">상단 아래로</div>
+      </div>
+    </div>
+
+    <!-- 전체 스캔 진행 상황 요약 -->
+    <div class="grid grid-cols-3 gap-3 mb-4">
       <div class="bg-gray-50 rounded-xl p-3 text-center">
         <div class="stat-num text-gray-800" id="stat-total">-</div>
         <div class="stat-label">전체 등록 종목</div>
@@ -233,18 +283,6 @@
       <div class="bg-yellow-50 rounded-xl p-3 text-center">
         <div class="stat-num text-yellow-700" id="stat-pending">-</div>
         <div class="stat-label">남은 종목</div>
-      </div>
-      <div class="bg-green-50 rounded-xl p-3 text-center">
-        <div class="stat-num text-green-700" id="stat-buy-sig">-</div>
-        <div class="stat-label">매수 신호</div>
-      </div>
-      <div class="bg-red-50 rounded-xl p-3 text-center">
-        <div class="stat-num text-red-600" id="stat-sell-sig">-</div>
-        <div class="stat-label">매도 신호</div>
-      </div>
-      <div class="bg-orange-50 rounded-xl p-3 text-center">
-        <div class="stat-num text-orange-600" id="stat-errors">-</div>
-        <div class="stat-label">API 오류</div>
       </div>
     </div>
 
@@ -674,13 +712,31 @@ async function loadScanStatus() {
     // 거래소별 카드
     renderExchangeCards(d.scan.by_exchange);
 
-    // 전체 통계
+    // 전체 통계 (5가지 상태 + 요약)
     document.getElementById('stat-total').textContent    = fmtNum(sc.total);
     document.getElementById('stat-scanned').textContent  = fmtNum(sc.scanned_today);
     document.getElementById('stat-pending').textContent  = fmtNum(sc.pending);
+    document.getElementById('stat-normal').textContent   = fmtNum(sc.normal_count ?? 0);
+    document.getElementById('stat-no-data').textContent  = fmtNum(sc.no_data_count ?? 0);
     document.getElementById('stat-buy-sig').textContent  = fmtNum(sc.buy_signals);
     document.getElementById('stat-sell-sig').textContent = fmtNum(sc.sell_signals);
     document.getElementById('stat-errors').textContent   = fmtNum(sc.error_count);
+
+    // API_ERROR 카드 하단 서브 텍스트 (US 권한 에러 건수 표시)
+    const usPermCnt = sc.us_permission_error_count ?? 0;
+    document.getElementById('stat-us-perm-sub').textContent =
+      usPermCnt > 0 ? `권한오류 ${fmtNum(usPermCnt)}건 포함` : '권한오류 없음';
+
+    // 해외주식 시세 권한 경고 배너
+    const permBanner = document.getElementById('us-permission-banner');
+    const permInfo   = d.us_market_data_permission;
+    if (permInfo?.has_error) {
+      permBanner.classList.remove('hidden');
+      document.getElementById('us-perm-error-count').textContent =
+        `오늘 ERROR_US_MARKET_DATA_PERMISSION 발생: ${fmtNum(permInfo.error_count)}건`;
+    } else {
+      permBanner.classList.add('hidden');
+    }
 
     // 진행 바
     const pct = sc.total > 0 ? Math.round(sc.scanned_today / sc.total * 100) : 0;
@@ -719,9 +775,13 @@ function renderExchangeCards(byExchange) {
   };
   const container = document.getElementById('exchange-cards');
   container.innerHTML = exchanges.map(ex => {
-    const d = byExchange?.[ex] || { total:0, scanned:0, buy:0, sell:0 };
+    const d = byExchange?.[ex] || { total:0, scanned:0, buy:0, sell:0, no_data:0, error:0 };
     const c = colors[ex];
     const pct = d.total > 0 ? Math.round(d.scanned/d.total*100) : 0;
+    const noDataBadge = d.no_data > 0
+      ? `<span class="text-slate-400 font-semibold" title="NO_DATA">⊘${d.no_data}</span>` : '';
+    const errBadge = d.error > 0
+      ? `<span class="text-orange-500 font-semibold" title="API_ERROR">!${d.error}</span>` : '';
     return `<div class="exch-card border ${c.border} ${c.bg}">
       <div class="text-xs font-bold ${c.text} mb-1">${ex}</div>
       <div class="text-lg font-bold text-gray-800">${d.total}</div>
@@ -731,8 +791,9 @@ function renderExchangeCards(byExchange) {
       </div>
       <div class="text-xs text-gray-400 mt-1">${d.scanned}/${d.total} (${pct}%)</div>
       <div class="flex justify-center gap-2 mt-1 text-xs">
-        <span class="text-green-600 font-semibold">↑${d.buy}</span>
-        <span class="text-red-500 font-semibold">↓${d.sell}</span>
+        <span class="text-green-600 font-semibold" title="매수신호">↑${d.buy}</span>
+        <span class="text-red-500 font-semibold" title="매도신호">↓${d.sell}</span>
+        ${noDataBadge}${errBadge}
       </div>
     </div>`;
   }).join('');

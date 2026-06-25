@@ -31,7 +31,7 @@ import {
   getKRHoldings, getUSHoldings,
   buyKR, sellKR, buyUS, sellUS,
 } from './kis-api';
-import { calcBB, getBBSignal } from './bollinger';
+import { calcBB, getBBSignal, validateCandleData } from './bollinger';
 import {
   getNextBatch, updateUniverseScanResult, loadUniverseToDB,
   type ExchangeName,
@@ -169,18 +169,37 @@ export async function runTradeScan(env: TradeEnv): Promise<{
       try {
         scanned++;
         const candles = await getKR15MinCandles(kisConfig, token, item.ticker, CANDLE_CNT);
-        if (candles.length < BB_PERIOD + 2) {
-          await updateUniverseScanResult(env.DB, item.ticker, item.exchange, 'NO_DATA');
+        const closes  = candles.map(c => c.close);
+
+        // ── 방어 로직: 캔들 데이터 품질 검증 ────────────────
+        const qv = validateCandleData(closes, 30, 20, 0.001);
+        if (!qv.valid) {
+          await updateUniverseScanResult(env.DB, item.ticker, item.exchange, 'NO_DATA', qv.reason);
+          await logTrade(env.DB, {
+            ticker: item.ticker, ticker_name: item.ticker_name, market: 'KR',
+            action: 'NO_DATA', current_price: closes.at(-1) ?? 0,
+            bb_upper: 0, bb_middle: 0, bb_lower: 0,
+            prev_close: 0, prev_bb_lower: 0, above_upper: 0,
+            message: `[NO_DATA] ${qv.reason} (${qv.detail})`,
+          });
           continue;
         }
-        const bands  = calcBB(candles.map(c => c.close), candles.map(c => c.datetime), BB_PERIOD, BB_STDDEV);
+
+        const bands  = calcBB(closes, candles.map(c => c.datetime), BB_PERIOD, BB_STDDEV);
         const holdRow = await getHoldingRow(env.DB, item.ticker);
         const hasPos  = !!holdRow && holdRow.qty > 0;
         const aboveU  = hasPos ? holdRow!.above_upper === 1 : false;
         const signal  = getBBSignal(bands, hasPos, aboveU);
 
         await updateUniverseScanResult(env.DB, item.ticker, item.exchange, signal.action);
-        await logTrade(env.DB, { ticker: item.ticker, ticker_name: item.ticker_name, market: 'KR', action: signal.action === 'NONE' ? 'NO_SIGNAL' : `SIGNAL_${signal.action}`, current_price: signal.current.close, bb_upper: signal.current.upper, bb_middle: signal.current.middle, bb_lower: signal.current.lower, prev_close: signal.prev.close, prev_bb_lower: signal.prev.lower, above_upper: signal.above_upper ? 1 : 0, message: signal.reason });
+        await logTrade(env.DB, {
+          ticker: item.ticker, ticker_name: item.ticker_name, market: 'KR',
+          action: signal.action === 'NONE' ? 'NO_SIGNAL' : `SIGNAL_${signal.action}`,
+          current_price: signal.current.close, bb_upper: signal.current.upper,
+          bb_middle: signal.current.middle, bb_lower: signal.current.lower,
+          prev_close: signal.prev.close, prev_bb_lower: signal.prev.lower,
+          above_upper: signal.above_upper ? 1 : 0, message: signal.reason,
+        });
 
         if (hasPos && signal.action === 'HOLD') {
           await env.DB.prepare('UPDATE holdings SET above_upper=?,updated_at=CURRENT_TIMESTAMP WHERE ticker=?')
@@ -228,12 +247,49 @@ export async function runTradeScan(env: TradeEnv): Promise<{
       try {
         scanned++;
         const exCode = toExchangeCode(item.exchange);
-        const candles = await getUS15MinCandles(kisConfig, token, item.ticker, CANDLE_CNT, exCode);
-        if (candles.length < BB_PERIOD + 2) {
-          await updateUniverseScanResult(env.DB, item.ticker, item.exchange, 'NO_DATA');
+
+        // ── 해외주식 15분봉 호출 — 404는 시세 권한 없음으로 분리 ────
+        let candles;
+        try {
+          candles = await getUS15MinCandles(kisConfig, token, item.ticker, CANDLE_CNT, exCode);
+        } catch (apiErr) {
+          const errStr = String(apiErr);
+          // 404 = KIS 해외주식 시세 서비스 미신청
+          if (errStr.includes('404')) {
+            const reason = '해외주식 시세 권한 없음 (KIS HTS에서 해외주식 시세 서비스 신청 필요)';
+            await updateUniverseScanResult(env.DB, item.ticker, item.exchange, 'ERROR_US_MARKET_DATA_PERMISSION', reason);
+            await logTrade(env.DB, {
+              ticker: item.ticker, ticker_name: item.ticker_name, market: 'US',
+              action: 'ERROR_US_MARKET_DATA_PERMISSION', current_price: 0,
+              bb_upper: 0, bb_middle: 0, bb_lower: 0,
+              prev_close: 0, prev_bb_lower: 0, above_upper: 0,
+              message: `[ERROR_US_MARKET_DATA_PERMISSION] ${reason}`,
+            });
+            errors.push(`[US시세권한없음] ${item.ticker}: 404 — 해외주식 시세 서비스 미신청`);
+          } else {
+            await updateUniverseScanResult(env.DB, item.ticker, item.exchange, 'ERROR', errStr);
+            errors.push(`[US:${item.ticker}] API 오류: ${errStr}`);
+          }
+          await sleep(50);
+          continue; // 주문 시도 금지 — 다음 종목으로
+        }
+
+        // ── 방어 로직: 캔들 데이터 품질 검증 ────────────────────
+        const closes = candles.map(c => c.close);
+        const qv = validateCandleData(closes, 30, 20, 0.001);
+        if (!qv.valid) {
+          await updateUniverseScanResult(env.DB, item.ticker, item.exchange, 'NO_DATA', qv.reason);
+          await logTrade(env.DB, {
+            ticker: item.ticker, ticker_name: item.ticker_name, market: 'US',
+            action: 'NO_DATA', current_price: closes.at(-1) ?? 0,
+            bb_upper: 0, bb_middle: 0, bb_lower: 0,
+            prev_close: 0, prev_bb_lower: 0, above_upper: 0,
+            message: `[NO_DATA] ${qv.reason} (${qv.detail})`,
+          });
           continue;
         }
-        const bands   = calcBB(candles.map(c => c.close), candles.map(c => c.datetime), BB_PERIOD, BB_STDDEV);
+
+        const bands   = calcBB(closes, candles.map(c => c.datetime), BB_PERIOD, BB_STDDEV);
         const holdRow = await getHoldingRow(env.DB, item.ticker);
         const hasPos  = !!holdRow && holdRow.qty > 0;
         const aboveU  = hasPos ? holdRow!.above_upper === 1 : false;
