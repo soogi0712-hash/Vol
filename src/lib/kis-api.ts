@@ -17,8 +17,8 @@
  *   - 주문가능금액:    TTTS3007R  /uapi/overseas-stock/v1/trading/inquire-psamount
  *   - 시장가 매수:     TTTT1002U  /uapi/overseas-stock/v1/trading/order
  *   - 시장가 매도:     TTTT1006U  /uapi/overseas-stock/v1/trading/order
- *   - 15분봉:          HHDFS76950200 /uapi/overseas-stock/v1/quotations/inquire-time-itemchartprice
- *   - 현재가:          HHDFS00000300 /uapi/overseas-stock/v1/quotations/inquire-price
+ *   - 15분봉:          HHDFS76950200 /uapi/overseas-price/v1/quotations/inquire-time-itemchartprice  ← overseas-price!
+ *   - 현재가:          HHDFS00000300 /uapi/overseas-price/v1/quotations/inquire-price              ← overseas-price!
  *
  * 미국주식 거래소 코드
  *   NASD = 나스닥, NYSE = 뉴욕, AMEX = 아멕스
@@ -246,6 +246,7 @@ export async function sellKR(
 // TR_ID: HHDFS76950200
 // EXCD: NASD(나스닥) / NYSE(뉴욕) / AMEX(아멕스)
 // PINC=1 → 장전+정규+장후 포함
+// ※ 시세조회는 overseas-stock이 아닌 overseas-price 경로 사용
 export async function getUS15MinCandles(
   cfg: KISConfig, token: string, ticker: string,
   count = 40, exchange: ExchangeCode = 'NASD'
@@ -263,7 +264,7 @@ export async function getUS15MinCandles(
   });
 
   const res = await fetch(
-    `${KIS_BASE}/uapi/overseas-stock/v1/quotations/inquire-time-itemchartprice?${params}`,
+    `${KIS_BASE}/uapi/overseas-price/v1/quotations/inquire-time-itemchartprice?${params}`,
     { headers: kis_headers(cfg, token, 'HHDFS76950200') }
   );
   if (!res.ok) throw new Error(`US 15min Error ${res.status}: ${await res.text()}`);
@@ -292,13 +293,14 @@ export async function getUS15MinCandles(
 
 // ─── 해외주식 현재가 ─────────────────────────────────────────
 // TR_ID: HHDFS00000300
+// ※ 시세조회는 overseas-price 경로 사용
 export async function getUSPrice(
   cfg: KISConfig, token: string, ticker: string,
   exchange: ExchangeCode = 'NASD'
 ): Promise<number> {
   const params = new URLSearchParams({ AUTH: '', EXCD: exchange, SYMB: ticker });
   const res = await fetch(
-    `${KIS_BASE}/uapi/overseas-stock/v1/quotations/inquire-price?${params}`,
+    `${KIS_BASE}/uapi/overseas-price/v1/quotations/inquire-price?${params}`,
     { headers: kis_headers(cfg, token, 'HHDFS00000300') }
   );
   if (!res.ok) throw new Error(`US Price Error: ${await res.text()}`);
