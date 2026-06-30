@@ -1,12 +1,11 @@
 /**
- * 백테스트 엔진 v2
- * 15분봉 볼린저밴드 (20, 2) 순수 전략
- * KIS API 일봉/분봉 데이터로 과거 검증
+ * 백테스트 엔진 v3 — BB + RSI(14) 전략
+ * KIS API 15분봉 데이터로 과거 검증
  */
 
 import type { KISConfig } from './kis-api';
 import { getAccessToken, getKR15MinCandles, getUS15MinCandles } from './kis-api';
-import { calcBB, runBacktest, type BacktestTrade } from './bollinger';
+import { calcBB, calcRSI, runBacktest, type BacktestTrade } from './bollinger';
 
 export interface BacktestRequest {
   ticker:      string;
@@ -28,6 +27,7 @@ export interface BacktestSummary {
   avg_return:    number;
   max_drawdown:  number;
   trades:        BacktestTrade[];
+  strategy:      string;  // 전략 설명
 }
 
 /**
@@ -56,6 +56,8 @@ export async function runKISBacktest(
     ? await getKR15MinCandles(cfg, token, req.ticker, maxCandles)
     : await getUS15MinCandles(cfg, token, req.ticker, maxCandles);
 
+  // RSI(14)는 최소 15봉(period+1) 필요, BB(20)는 최소 21봉 필요
+  // → 최소 기준: max(21, 15) = 21봉. 여유있게 35봉 이상 권장
   if (candles.length < 22) {
     throw new Error(`데이터 부족 (${candles.length}봉, 최소 22봉 필요)`);
   }
@@ -63,7 +65,8 @@ export async function runKISBacktest(
   const closes    = candles.map(c => c.close);
   const datetimes = candles.map(c => c.datetime);
   const bands     = calcBB(closes, datetimes);
-  const { trades } = runBacktest(bands, req.buy_amount);
+  const rsiValues = calcRSI(closes, 14);
+  const { trades } = runBacktest(bands, req.buy_amount, 0.00015, rsiValues);
 
   return buildSummary(req, trades);
 }
@@ -76,8 +79,9 @@ export function runCustomBacktest(
   datetimes: string[],
   req: Pick<BacktestRequest, 'ticker' | 'ticker_name' | 'market' | 'buy_amount'>
 ): BacktestSummary {
-  const bands = calcBB(closes, datetimes);
-  const { trades } = runBacktest(bands, req.buy_amount);
+  const bands     = calcBB(closes, datetimes);
+  const rsiValues = calcRSI(closes, 14);
+  const { trades } = runBacktest(bands, req.buy_amount, 0.00015, rsiValues);
   return buildSummary(req, trades);
 }
 
@@ -112,5 +116,6 @@ function buildSummary(
     avg_return:   parseFloat(avgRet.toFixed(4)),
     max_drawdown: parseFloat(maxDD.toFixed(2)),
     trades,
+    strategy: 'BB(20,2) + RSI(14) — 매수: prev<lower AND curr>lower AND RSI≤35 AND RSI상승 / 매도: above_upper→lower',
   };
 }

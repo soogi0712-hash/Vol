@@ -11,7 +11,7 @@ import {
   getKR15MinCandles,
   getUS15MinCandles,
 } from '../lib/kis-api';
-import { calcBB, getBBSignal } from '../lib/bollinger';
+import { calcBB, calcRSI, getBBSignal } from '../lib/bollinger';
 
 type Bindings = {
   DB: D1Database;
@@ -295,18 +295,31 @@ test.get('/bb/:market/:ticker', async (c) => {
     const closes = candles.map(c => c.close);
     const dts    = candles.map(c => c.datetime);
     const bands  = calcBB(closes, dts);
-    const signal = getBBSignal(bands, false, false);
+    const rsiValues = calcRSI(closes, 14);
+    const signal = getBBSignal(bands, false, false, rsiValues);
     const recent = bands.slice(-5);
 
     return c.json({
       success: true,
-      message: `[${market}] ${ticker} 15분봉 BB 테스트 성공`,
+      message: `[${market}] ${ticker} 15분봉 BB+RSI 테스트 성공`,
       elapsed_ms: Date.now() - start,
       candle_count: candles.length,
       signal: signal.action,
       reason: signal.reason,
       current_band: signal.current,
       prev_band: signal.prev,
+      // ─── RSI 정보 ─────────────────────────────────────────
+      rsi: {
+        current:       isNaN(signal.rsi_current) ? null : parseFloat(signal.rsi_current.toFixed(2)),
+        prev:          isNaN(signal.rsi_prev)    ? null : parseFloat(signal.rsi_prev.toFixed(2)),
+        rising:        signal.rsi_rising,
+        threshold:     35,
+        condition_met: signal.buy_conditions.rsi_le_35,
+      },
+      // ─── 매수 조건 상세 ───────────────────────────────────
+      buy_conditions:    signal.buy_conditions,
+      fail_reasons:      signal.fail_reasons,
+      bb_lower_recovery: signal.bb_lower_recovery,
       recent_bands: recent,
     });
   } catch (e) {

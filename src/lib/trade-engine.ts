@@ -31,7 +31,7 @@ import {
   getKRHoldings, getUSHoldings,
   buyKR, sellKR, buyUS, sellUS,
 } from './kis-api';
-import { calcBB, getBBSignal, validateCandleData } from './bollinger';
+import { calcBB, calcRSI, getBBSignal, validateCandleData } from './bollinger';
 import {
   getNextBatch, updateUniverseScanResult, loadUniverseToDB,
   type ExchangeName,
@@ -186,10 +186,11 @@ export async function runTradeScan(env: TradeEnv): Promise<{
         }
 
         const bands  = calcBB(closes, candles.map(c => c.datetime), BB_PERIOD, BB_STDDEV);
+        const rsiValues = calcRSI(closes, 14);
         const holdRow = await getHoldingRow(env.DB, item.ticker);
         const hasPos  = !!holdRow && holdRow.qty > 0;
         const aboveU  = hasPos ? holdRow!.above_upper === 1 : false;
-        const signal  = getBBSignal(bands, hasPos, aboveU);
+        const signal  = getBBSignal(bands, hasPos, aboveU, rsiValues);
 
         await updateUniverseScanResult(env.DB, item.ticker, item.exchange, signal.action);
         await logTrade(env.DB, {
@@ -290,10 +291,11 @@ export async function runTradeScan(env: TradeEnv): Promise<{
         }
 
         const bands   = calcBB(closes, candles.map(c => c.datetime), BB_PERIOD, BB_STDDEV);
+        const rsiValues = calcRSI(closes, 14);
         const holdRow = await getHoldingRow(env.DB, item.ticker);
         const hasPos  = !!holdRow && holdRow.qty > 0;
         const aboveU  = hasPos ? holdRow!.above_upper === 1 : false;
-        const signal  = getBBSignal(bands, hasPos, aboveU);
+        const signal  = getBBSignal(bands, hasPos, aboveU, rsiValues);
 
         await updateUniverseScanResult(env.DB, item.ticker, item.exchange, signal.action);
         await logTrade(env.DB, { ticker: item.ticker, ticker_name: item.ticker_name, market: 'US', action: signal.action === 'NONE' ? 'NO_SIGNAL' : `SIGNAL_${signal.action}`, current_price: signal.current.close, bb_upper: signal.current.upper, bb_middle: signal.current.middle, bb_lower: signal.current.lower, prev_close: signal.prev.close, prev_bb_lower: signal.prev.lower, above_upper: signal.above_upper ? 1 : 0, message: signal.reason });

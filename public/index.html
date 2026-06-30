@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>볼린저밴드 자동매매 v3</title>
+  <title>볼린저밴드+RSI 자동매매 v4</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <link href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.4.0/css/all.min.css" rel="stylesheet">
   <style>
@@ -62,7 +62,7 @@
   <div class="max-w-7xl mx-auto px-4 py-3 flex items-center justify-between flex-wrap gap-2">
     <div class="flex items-center gap-3">
       <i class="fas fa-chart-line text-blue-600 text-xl"></i>
-      <h1 class="text-lg font-bold text-gray-800">볼린저밴드 자동매매 <span class="text-xs text-blue-500 font-normal ml-1">v3 전체시장</span></h1>
+      <h1 class="text-lg font-bold text-gray-800">볼린저밴드 자동매매 <span class="text-xs text-blue-500 font-normal ml-1">v4 BB+RSI</span></h1>
     </div>
     <div class="flex items-center gap-4 flex-wrap">
       <div class="flex items-center gap-1.5 text-xs">
@@ -115,11 +115,11 @@
 
   <!-- Strategy Info -->
   <div class="bg-blue-50 border border-blue-200 rounded-xl p-3 mb-4 text-xs text-blue-800">
-    <div class="flex flex-wrap gap-4 items-center">
+    <div class="flex flex-wrap gap-3 items-center">
       <span><i class="fas fa-chart-bar mr-1"></i><strong>스캔함수:</strong> <code class="bg-blue-100 px-1 rounded">runTradeScan</code></span>
-      <span><i class="fas fa-layer-group mr-1"></i>15분봉 BB(20,2) 종가</span>
-      <span><i class="fas fa-arrow-up text-green-600 mr-1"></i>매수: prev_close &lt; lower AND close &gt; lower</span>
-      <span><i class="fas fa-arrow-down text-red-500 mr-1"></i>매도: above_upper=true AND close &lt; upper</span>
+      <span><i class="fas fa-layer-group mr-1"></i>15분봉 BB(20,2) + RSI(14)</span>
+      <span class="text-green-700 font-semibold"><i class="fas fa-arrow-up mr-1"></i>매수: ①prev&lt;lower ②curr&gt;lower ③RSI≤35 ④RSI상승</span>
+      <span class="text-red-600 font-semibold"><i class="fas fa-arrow-down mr-1"></i>매도: above_upper→lower복귀 전량매도</span>
       <span id="total-tickers-badge" class="bg-blue-200 px-2 py-0.5 rounded-full font-bold">대상: -종목</span>
       <span id="kr-market-status"></span>
       <span id="us-market-status"></span>
@@ -186,12 +186,16 @@
           <p class="font-bold text-purple-700 text-xl mt-0.5" id="fn-total">-</p>
         </div>
         <div>
-          <span class="text-gray-400">매수 조건</span>
+          <span class="text-gray-400">매수 조건 (4개 AND)</span>
           <p class="font-semibold text-green-700 mt-0.5 text-xs" id="fn-buy-cond">-</p>
         </div>
         <div>
           <span class="text-gray-400">매도 조건</span>
           <p class="font-semibold text-red-600 mt-0.5 text-xs" id="fn-sell-cond">-</p>
+        </div>
+        <div>
+          <span class="text-gray-400">RSI 기간 / 임계값</span>
+          <p class="font-bold text-purple-700 mt-0.5 text-sm" id="fn-rsi-info">RSI(14) ≤ 35</p>
         </div>
       </div>
       <!-- 종목 마스터 로드 상태 -->
@@ -260,13 +264,13 @@
       <div class="bg-green-50 border border-green-200 rounded-xl p-3 text-center">
         <div class="text-2xl font-bold text-green-700" id="stat-buy-sig">-</div>
         <div class="text-xs text-gray-500 mt-0.5"><i class="fas fa-arrow-up text-green-600 mr-1"></i>매수 신호</div>
-        <div class="text-xs text-gray-400 mt-0.5">BB 하단 돌파</div>
+        <div class="text-xs text-gray-400 mt-0.5">BB하단복귀+RSI≤35+상승</div>
       </div>
       <!-- 매도 신호 -->
       <div class="bg-red-50 border border-red-200 rounded-xl p-3 text-center">
         <div class="text-2xl font-bold text-red-600" id="stat-sell-sig">-</div>
         <div class="text-xs text-gray-500 mt-0.5"><i class="fas fa-arrow-down text-red-500 mr-1"></i>매도 신호</div>
-        <div class="text-xs text-gray-400 mt-0.5">상단 아래로</div>
+        <div class="text-xs text-gray-400 mt-0.5">상단돌파→하단복귀</div>
       </div>
     </div>
 
@@ -317,13 +321,13 @@
       </div>
     </div>
 
-    <!-- 신호 종목 -->
+      <!-- 신호 종목 -->
     <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
       <!-- 매수 신호 -->
       <div>
         <h3 class="text-sm font-bold text-green-700 mb-2">
           <i class="fas fa-arrow-up mr-1"></i>매수 신호 종목
-          <span class="text-xs text-gray-400 font-normal ml-1">(오늘 기준)</span>
+          <span class="text-xs text-gray-400 font-normal ml-1">(BB하단복귀 + RSI≤35 + RSI상승 4조건 충족)</span>
         </h3>
         <div id="buy-signal-list" class="space-y-1 max-h-80 overflow-y-auto">
           <p class="text-xs text-gray-400 text-center py-4">매수 신호 없음</p>
@@ -338,6 +342,18 @@
         <div id="sell-signal-list" class="space-y-1 max-h-80 overflow-y-auto">
           <p class="text-xs text-gray-400 text-center py-4">매도 신호 없음</p>
         </div>
+      </div>
+    </div>
+
+    <!-- NO_DATA 상세 (신호 없는 종목의 미충족 조건) -->
+    <div class="mt-4">
+      <h3 class="text-sm font-bold text-slate-600 mb-2">
+        <i class="fas fa-info-circle mr-1"></i>조건 미충족 스캔 결과 상세
+        <span class="text-xs text-gray-400 font-normal ml-1">(매수 미발생 종목의 미충족 조건 — 최근 50개)</span>
+        <button onclick="loadNoSignalDetail()" class="ml-2 text-xs bg-gray-100 hover:bg-gray-200 px-2 py-0.5 rounded text-gray-600 cursor-pointer">조회</button>
+      </h3>
+      <div id="no-signal-detail-list" class="space-y-1 max-h-72 overflow-y-auto">
+        <p class="text-xs text-gray-400 text-center py-4">위 [조회] 버튼을 눌러 상세 내용을 불러오세요</p>
       </div>
     </div>
 
@@ -581,7 +597,7 @@
       <div class="overflow-x-auto">
         <table class="tbl">
           <thead><tr>
-            <th>#</th><th>매수시각</th><th>매도시각</th><th>매수가</th><th>매도가</th><th>수량</th><th>손익</th><th>수익률</th>
+            <th>#</th><th>매수시각</th><th>매도시각</th><th>매수가</th><th>매도가</th><th>수량</th><th>매수RSI</th><th>손익</th><th>수익률</th>
           </tr></thead>
           <tbody id="bt-trades-body"></tbody>
         </table>
@@ -694,6 +710,11 @@ async function loadScanStatus() {
     document.getElementById('fn-total').textContent      = fmtNum(fn.total_scan_tickers||0) + '종목';
     document.getElementById('fn-buy-cond').textContent   = fn.buy_condition || '-';
     document.getElementById('fn-sell-cond').textContent  = fn.sell_condition || '-';
+    // RSI 정보 패널
+    const rsiPeriod = fn.rsi_period || 14;
+    const rsiThresh = fn.rsi_threshold || 35;
+    const rsiEl = document.getElementById('fn-rsi-info');
+    if (rsiEl) rsiEl.textContent = `RSI(${rsiPeriod}) ≤ ${rsiThresh} + 상승전환`;
     document.getElementById('total-tickers-badge').textContent = '대상: ' + fmtNum(fn.total_scan_tickers||0) + '종목';
 
     // 종목 마스터 소스 표시
@@ -808,13 +829,15 @@ function renderSignalList(containerId, stocks, type) {
   const colorClass = type === 'buy' ? 'border-green-200 bg-green-50' : 'border-red-200 bg-red-50';
   const textClass  = type === 'buy' ? 'text-green-700' : 'text-red-700';
   el.innerHTML = stocks.map(s => `
-    <div class="flex items-center justify-between border ${colorClass} rounded-lg px-3 py-2 text-xs">
-      <div class="flex items-center gap-2">
-        ${exchangeBadge(s.exchange)}
-        <span class="font-bold ${textClass}">${s.ticker}</span>
-        <span class="text-gray-600">${s.ticker_name||''}</span>
+    <div class="border ${colorClass} rounded-lg px-3 py-2 text-xs mb-1">
+      <div class="flex items-center justify-between">
+        <div class="flex items-center gap-2">
+          ${exchangeBadge(s.exchange)}
+          <span class="font-bold ${textClass}">${s.ticker}</span>
+          <span class="text-gray-600">${s.ticker_name||''}</span>
+        </div>
+        <span class="text-gray-400">${fmtTime(s.last_scanned_at)}</span>
       </div>
-      <span class="text-gray-400">${fmtTime(s.last_scanned_at)}</span>
     </div>
   `).join('');
 }
@@ -840,6 +863,69 @@ async function loadErrorStocks() {
       </div>
     `).join('');
   } catch(e) {}
+}
+
+// ── NO_SIGNAL 상세 (미충족 조건 표시) ────────────────────────────
+async function loadNoSignalDetail() {
+  const el = document.getElementById('no-signal-detail-list');
+  el.innerHTML = '<p class="text-xs text-gray-400 text-center py-4"><i class="fas fa-spinner fa-spin mr-1"></i>로드 중...</p>';
+  try {
+    const res = await fetch('/api/trading/logs?action=NO_SIGNAL&limit=100');
+    const json = await res.json();
+    const logs = json.data || [];
+    if (logs.length === 0) {
+      el.innerHTML = '<p class="text-xs text-gray-400 text-center py-4">NO_SIGNAL 로그 없음</p>';
+      return;
+    }
+    // 중복 제거 (ticker 기준 최신 1개)
+    const seen = new Set();
+    const unique = [];
+    for (const log of logs) {
+      if (!seen.has(log.ticker)) { seen.add(log.ticker); unique.push(log); }
+    }
+    el.innerHTML = unique.map(log => {
+      const msg = log.message || '';
+      // "신호없음 (X/4 조건 충족) — 미충족설명" 형태 파싱
+      const condMatch = msg.match(/\((\d+)\/4 \uc870\uac74 \ucda9\uc871\)/);
+      const metCount  = condMatch ? parseInt(condMatch[1]) : null;
+      const failPart  = msg.includes('—') ? msg.split('—').slice(1).join('—').trim() : '';
+      // 조건별 파싱 (RSI, BB 하단복귀 등)
+      const failItems = failPart ? failPart.split(';').map(s => s.trim()).filter(Boolean) : [];
+      const condBg = metCount === null ? 'bg-gray-50 border-gray-200'
+                   : metCount === 0   ? 'bg-red-50 border-red-200'
+                   : metCount <= 2    ? 'bg-orange-50 border-orange-200'
+                                      : 'bg-yellow-50 border-yellow-200';
+      const metColor = metCount === null ? 'text-gray-400'
+                     : metCount === 0   ? 'text-red-500 font-bold'
+                     : metCount <= 2    ? 'text-orange-500 font-bold'
+                                        : 'text-yellow-600 font-bold';
+      return `
+        <div class="border ${condBg} rounded-lg px-3 py-2 text-xs mb-1">
+          <div class="flex items-center gap-2 mb-1 flex-wrap">
+            <span class="text-xs font-semibold ${log.market === 'US' ? 'text-green-600' : 'text-blue-600'}">[${log.market||'KR'}]</span>
+            <span class="font-bold text-gray-700">${log.ticker}</span>
+            <span class="text-gray-500">${log.ticker_name||''}</span>
+            ${metCount !== null ? `<span class="${metColor}">${metCount}/4 충족</span>` : ''}
+            <span class="text-gray-300 ml-auto">${fmtTime(log.created_at)}</span>
+          </div>
+          ${failItems.length > 0 ? `
+          <ul class="mt-1 space-y-0.5 text-gray-500">
+            ${failItems.map(f => {
+              const isRsi  = f.includes('RSI');
+              const isBB   = f.includes('하단선');
+              const icon   = isRsi ? '📊' : isBB ? '📉' : '⚠️';
+              return `<li class="flex items-start gap-1"><span>${icon}</span><span>${escHtml(f)}</span></li>`;
+            }).join('')}
+          </ul>` : ''}
+        </div>`;
+    }).join('');
+  } catch(e) {
+    el.innerHTML = `<p class="text-xs text-red-400 text-center py-4">로드 실패: ${e}</p>`;
+  }
+}
+
+function escHtml(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
 // ── 종목 유니버스 로드 (343개 샘플) ─────────────────────────
@@ -1220,16 +1306,20 @@ async function runBacktest() {
     profEl.className = 'text-xl font-bold ' + colorProfit(r.total_profit);
     profEl.textContent = (market==='US'?'$':'') + fmtNum(r.total_profit, 2);
     const ttbody = document.getElementById('bt-trades-body');
-    ttbody.innerHTML = (r.trades||[]).map((t, i) => `<tr>
-      <td>${i+1}</td>
-      <td class="text-xs">${t.buy_datetime||'-'}</td>
-      <td class="text-xs">${t.sell_datetime||'-'}</td>
-      <td>${fmtNum(t.buy_price,2)}</td>
-      <td>${fmtNum(t.sell_price,2)}</td>
-      <td>${t.qty}</td>
-      <td class="${colorProfit(t.profit_loss)} font-semibold">${fmtNum(t.profit_loss,2)}</td>
-      <td class="${colorProfit(t.return_rate)}">${Number(t.return_rate||0).toFixed(2)}%</td>
-    </tr>`).join('');
+    ttbody.innerHTML = (r.trades||[]).map((t, i) => {
+      const rsiVal = t.buy_rsi != null && !isNaN(t.buy_rsi) ? Number(t.buy_rsi).toFixed(1) : '-';
+      return `<tr>
+        <td>${i+1}</td>
+        <td class="text-xs">${t.buy_datetime||'-'}</td>
+        <td class="text-xs">${t.sell_datetime||'-'}</td>
+        <td>${fmtNum(t.buy_price,2)}</td>
+        <td>${fmtNum(t.sell_price,2)}</td>
+        <td>${t.qty}</td>
+        <td class="text-purple-600 font-semibold">${rsiVal}</td>
+        <td class="${colorProfit(t.profit_loss)} font-semibold">${fmtNum(t.profit_loss,2)}</td>
+        <td class="${colorProfit(t.return_rate)}">${Number(t.return_rate||0).toFixed(2)}%</td>
+      </tr>`;
+    }).join('');
     loadBacktestHistory();
   } catch(e) { showToast('오류: ' + e, 'error'); }
   finally {

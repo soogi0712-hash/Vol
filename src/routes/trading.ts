@@ -6,7 +6,7 @@ import {
   getKRHoldings, getUSHoldings, getKROrderableCash, getUSOrderableCash,
   type ExchangeCode,
 } from '../lib/kis-api';
-import { calcBB, getBBSignal } from '../lib/bollinger';
+import { calcBB, calcRSI, getBBSignal } from '../lib/bollinger';
 import { runKISBacktest } from '../lib/backtest';
 import {
   loadUniverseToDB, getScanStats, getSignalStocks,
@@ -126,9 +126,13 @@ trading.get('/scan-status', async (c) => {
         scan_function: {
           name: 'runTradeScan',
           module: 'src/lib/trade-engine.ts',
-          strategy: '15분봉 BB(20,2) 종가',
-          buy_condition: 'prev.close < prev.lower AND current.close > current.lower',
+          strategy: '15분봉 BB(20,2) + RSI(14)',
+          buy_condition: '① prev.close < prev.lower  ② current.close > current.lower  ③ RSI ≤ 35  ④ RSI 상승 전환',
           sell_condition: 'above_upper=true AND current.close < current.upper',
+          rsi_threshold: 35,
+          rsi_period: 14,
+          bb_period: 20,
+          bb_stddev: 2,
           batch_size: batchSize,
           markets: ['KOSPI', 'KOSDAQ', 'NASD', 'NYSE', 'AMEX'],
           kr_scan_tickers: dbUniverse.kr_total,
@@ -368,6 +372,7 @@ trading.get('/preview/:market/:ticker', async (c) => {
     const closes = candles.map(c => c.close);
     const dts    = candles.map(c => c.datetime);
     const bands  = calcBB(closes, dts);
+    const rsiValues = calcRSI(closes, 14);
 
     const holdRow = await c.env.DB.prepare(
       'SELECT qty, above_upper FROM holdings WHERE ticker = ?'
@@ -375,12 +380,24 @@ trading.get('/preview/:market/:ticker', async (c) => {
     const hasPos     = !!holdRow && holdRow.qty > 0;
     const aboveUpper = hasPos && holdRow!.above_upper === 1;
 
-    const signal = getBBSignal(bands, hasPos, aboveUpper);
+    const signal = getBBSignal(bands, hasPos, aboveUpper, rsiValues);
     return c.json({
       success: true, ticker, market, exchange,
       signal: signal.action, reason: signal.reason,
       current_band: signal.current, prev_band: signal.prev,
       above_upper: signal.above_upper, has_position: hasPos,
+      // ─── RSI 정보 ──────────────────────────────────────────
+      rsi: {
+        current:          isNaN(signal.rsi_current) ? null : parseFloat(signal.rsi_current.toFixed(2)),
+        prev:             isNaN(signal.rsi_prev)    ? null : parseFloat(signal.rsi_prev.toFixed(2)),
+        rising:           signal.rsi_rising,
+        threshold:        35,
+        condition_met:    signal.buy_conditions.rsi_le_35,
+      },
+      // ─── 매수 조건 상세 ────────────────────────────────────
+      buy_conditions:     signal.buy_conditions,
+      fail_reasons:       signal.fail_reasons,
+      bb_lower_recovery:  signal.bb_lower_recovery,
       recent_bands: bands.slice(-5),
       candle_count: candles.length,
     });
