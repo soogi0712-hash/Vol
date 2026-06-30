@@ -10,6 +10,9 @@
     .tab-btn { @apply px-4 py-2 text-sm font-medium rounded-t-lg transition-colors cursor-pointer; }
     .tab-btn.active { @apply bg-white text-blue-700 border-b-2 border-blue-600; }
     .tab-btn:not(.active) { @apply text-gray-500 hover:text-gray-700 bg-gray-100; }
+    .sub-tab-btn { @apply px-3 py-1.5 text-xs font-medium rounded transition-colors cursor-pointer border; }
+    .sub-tab-btn.active { @apply bg-blue-600 text-white border-blue-600; }
+    .sub-tab-btn:not(.active) { @apply text-gray-600 border-gray-300 bg-gray-50 hover:bg-gray-100; }
     .card { @apply bg-white rounded-xl shadow p-4 mb-4; }
     .badge-kr  { @apply text-xs px-2 py-0.5 rounded-full bg-blue-100 text-blue-700 font-semibold; }
     .badge-us  { @apply text-xs px-2 py-0.5 rounded-full bg-green-100 text-green-700 font-semibold; }
@@ -136,6 +139,7 @@
     <button class="tab-btn" onclick="switchTab('logs',this)"><i class="fas fa-stream mr-1"></i>매매로그</button>
     <button class="tab-btn" onclick="switchTab('profits',this)"><i class="fas fa-coins mr-1"></i>실현손익</button>
     <button class="tab-btn" onclick="switchTab('backtest',this)"><i class="fas fa-flask mr-1"></i>백테스트</button>
+    <button class="tab-btn" onclick="switchTab('aireport',this)"><i class="fas fa-robot mr-1"></i>AI 전략 리포트</button>
   </div>
 
   <!-- ===== TAB: 전체시장 스캔 ===== -->
@@ -618,6 +622,106 @@
     </div>
   </div>
 
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <!-- AI 전략 리포트 탭                                       -->
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <div id="tab-aireport" class="tab-content hidden bg-white rounded-b-xl shadow p-4">
+
+    <!-- 서브탭 네비게이션 -->
+    <div class="flex flex-wrap gap-1 mb-4 border-b border-gray-200 pb-2">
+      <button class="sub-tab-btn active" onclick="switchSubTab('today',this)">
+        <i class="fas fa-calendar-day mr-1"></i>오늘 리포트
+      </button>
+      <button class="sub-tab-btn" onclick="switchSubTab('perf7',this)">
+        <i class="fas fa-chart-line mr-1"></i>7일 성능
+      </button>
+      <button class="sub-tab-btn" onclick="switchSubTab('perf30',this)">
+        <i class="fas fa-chart-line mr-1"></i>30일 성능
+      </button>
+      <button class="sub-tab-btn" onclick="switchSubTab('perf90',this)">
+        <i class="fas fa-chart-line mr-1"></i>90일 성능
+      </button>
+      <button class="sub-tab-btn" onclick="switchSubTab('compare',this)">
+        <i class="fas fa-balance-scale mr-1"></i>전략 비교
+      </button>
+      <button class="sub-tab-btn" onclick="switchSubTab('suggest',this)">
+        <i class="fas fa-lightbulb mr-1"></i>AI 개선 제안
+      </button>
+      <button class="ml-auto px-3 py-1 text-xs bg-blue-600 text-white rounded hover:bg-blue-700"
+              onclick="generateReport()">
+        <i class="fas fa-sync mr-1"></i>리포트 즉시 생성
+      </button>
+    </div>
+
+    <!-- ── 오늘 리포트 ── -->
+    <div id="sub-today" class="sub-tab-content">
+      <h3 class="text-base font-semibold text-gray-700 mb-3">
+        <i class="fas fa-calendar-day text-blue-500 mr-1"></i>
+        오늘 일일 리포트 <span id="report-date-label" class="text-sm font-normal text-gray-400 ml-2"></span>
+      </h3>
+      <div id="today-report-content">
+        <p class="text-gray-400 text-sm text-center py-8">로딩 중...</p>
+      </div>
+    </div>
+
+    <!-- ── 7일 성능 ── -->
+    <div id="sub-perf7" class="sub-tab-content hidden">
+      <h3 class="text-base font-semibold text-gray-700 mb-3">
+        <i class="fas fa-chart-line text-green-500 mr-1"></i>최근 7일 전략 성능
+      </h3>
+      <div id="perf7-content"><p class="text-gray-400 text-sm text-center py-8">로딩 중...</p></div>
+    </div>
+
+    <!-- ── 30일 성능 ── -->
+    <div id="sub-perf30" class="sub-tab-content hidden">
+      <h3 class="text-base font-semibold text-gray-700 mb-3">
+        <i class="fas fa-chart-line text-green-500 mr-1"></i>최근 30일 전략 성능
+      </h3>
+      <div id="perf30-content"><p class="text-gray-400 text-sm text-center py-8">로딩 중...</p></div>
+    </div>
+
+    <!-- ── 90일 성능 ── -->
+    <div id="sub-perf90" class="sub-tab-content hidden">
+      <h3 class="text-base font-semibold text-gray-700 mb-3">
+        <i class="fas fa-chart-line text-green-500 mr-1"></i>최근 90일 전략 성능
+      </h3>
+      <div id="perf90-content"><p class="text-gray-400 text-sm text-center py-8">로딩 중...</p></div>
+    </div>
+
+    <!-- ── 전략 비교 ── -->
+    <div id="sub-compare" class="sub-tab-content hidden">
+      <div class="flex items-center gap-3 mb-3">
+        <h3 class="text-base font-semibold text-gray-700">
+          <i class="fas fa-balance-scale text-purple-500 mr-1"></i>전략 비교 시뮬레이션
+        </h3>
+        <select id="compare-period" class="text-sm border border-gray-300 rounded px-2 py-1"
+                onchange="loadStrategyCompare()">
+          <option value="7">최근 7일</option>
+          <option value="30" selected>최근 30일</option>
+          <option value="90">최근 90일</option>
+        </select>
+      </div>
+      <p class="text-xs text-gray-400 mb-3">
+        <i class="fas fa-info-circle mr-1"></i>
+        실제 체결 데이터 기반 각 전략 조건 재적용 시뮬레이션. AI는 비교 결과만 제공하며 전략 변경은 사용자 승인 후에만 적용됩니다.
+      </p>
+      <div id="compare-content"><p class="text-gray-400 text-sm text-center py-8">로딩 중...</p></div>
+    </div>
+
+    <!-- ── AI 개선 제안 ── -->
+    <div id="sub-suggest" class="sub-tab-content hidden">
+      <h3 class="text-base font-semibold text-gray-700 mb-1">
+        <i class="fas fa-lightbulb text-yellow-500 mr-1"></i>AI 개선 제안
+      </h3>
+      <p class="text-xs text-gray-400 mb-3">
+        <i class="fas fa-shield-alt mr-1 text-red-400"></i>
+        <strong>원칙:</strong> AI는 분석/통계/비교/제안만 수행합니다. 전략 변경은 반드시 사용자 승인 후에만 적용됩니다. 임의 추천 없음 — 모든 제안은 실제 누적 데이터 기반입니다.
+      </p>
+      <div id="suggest-content"><p class="text-gray-400 text-sm text-center py-8">로딩 중...</p></div>
+    </div>
+
+  </div><!-- end tab-aireport -->
+
   <div class="h-8"></div>
 </div><!-- end max-w-7xl -->
 
@@ -640,6 +744,7 @@ function switchTab(name, btn) {
   if (name === 'logs')      loadLogs();
   if (name === 'profits')   loadProfits();
   if (name === 'backtest')  loadBacktestHistory();
+  if (name === 'aireport')  loadAIReport();
 }
 
 // ── Toast ────────────────────────────────────────────────────
@@ -1397,6 +1502,379 @@ async function init() {
     const tabName = activeTab.getAttribute('onclick')?.match(/switchTab\('(\w+)'/)?.[1];
     if (tabName === 'scan') loadScanStatus();
   }, 30000);
+}
+
+// ── AI 전략 리포트 서브탭 전환 ──────────────────────────────
+function switchSubTab(name, btn) {
+  document.querySelectorAll('.sub-tab-content').forEach(el => el.classList.add('hidden'));
+  document.querySelectorAll('.sub-tab-btn').forEach(el => el.classList.remove('active'));
+  document.getElementById('sub-' + name).classList.remove('hidden');
+  btn.classList.add('active');
+  // 서브탭 전환 시 즉시 로드
+  if (name === 'today')   loadTodayReport();
+  if (name === 'perf7')   loadPerfReport(7);
+  if (name === 'perf30')  loadPerfReport(30);
+  if (name === 'perf90')  loadPerfReport(90);
+  if (name === 'compare') loadStrategyCompare();
+  if (name === 'suggest') loadSuggestions();
+}
+
+// ── AI 리포트 메인 로드 ──────────────────────────────────────
+async function loadAIReport() {
+  await loadTodayReport();
+  const activeSub = document.querySelector('.sub-tab-btn.active');
+  if (!activeSub) return;
+  const sub = activeSub.getAttribute('onclick')?.match(/switchSubTab\('(\w+)'/)?.[1];
+  if (sub === 'perf7')   loadPerfReport(7);
+  if (sub === 'perf30')  loadPerfReport(30);
+  if (sub === 'perf90')  loadPerfReport(90);
+  if (sub === 'compare') loadStrategyCompare();
+  if (sub === 'suggest') loadSuggestions();
+}
+
+// ── 오늘 일일 리포트 로드 ────────────────────────────────────
+async function loadTodayReport() {
+  const el = document.getElementById('today-report-content');
+  const label = document.getElementById('report-date-label');
+  try {
+    const res = await fetch('/api/report/daily');
+    const json = await res.json();
+    const today = new Date();
+    const kst = new Date(today.getTime() + 9 * 3600 * 1000);
+    label.textContent = kst.toISOString().slice(0, 10);
+
+    if (!json.success || !json.data) {
+      el.innerHTML = `<div class="text-center py-8 text-gray-400">
+        <i class="fas fa-info-circle text-2xl mb-2 block"></i>
+        <p>오늘 리포트가 아직 생성되지 않았습니다.</p>
+        <p class="text-xs mt-1">장마감(KST 15:35) 후 자동 생성되거나 "리포트 즉시 생성" 버튼을 사용하세요.</p>
+      </div>`;
+      return;
+    }
+
+    const d = json.data;
+    const winRateColor = d.win_rate >= 60 ? 'text-green-600' : d.win_rate >= 40 ? 'text-yellow-600' : 'text-red-500';
+    const pnlColor = d.realized_pnl >= 0 ? 'text-green-600' : 'text-red-500';
+    const source = json.source === 'cache' ? '저장됨' : '실시간';
+
+    el.innerHTML = `
+      <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
+        <div class="bg-blue-50 rounded-lg p-3">
+          <div class="text-xs text-gray-500 mb-1">전체 스캔</div>
+          <div class="text-xl font-bold text-blue-700">${d.total_scanned.toLocaleString()}</div>
+          <div class="text-xs text-gray-400">정상 ${d.normal_scanned} / NO_DATA ${d.no_data_count} / 오류 ${d.api_error_count}</div>
+        </div>
+        <div class="bg-green-50 rounded-lg p-3">
+          <div class="text-xs text-gray-500 mb-1">신호 발생</div>
+          <div class="text-xl font-bold text-green-700">매수 ${d.buy_signal_count} / 매도 ${d.sell_signal_count}</div>
+          <div class="text-xs text-gray-400">실제 매수 ${d.actual_buy_count} / 매도 ${d.actual_sell_count}</div>
+        </div>
+        <div class="bg-yellow-50 rounded-lg p-3">
+          <div class="text-xs text-gray-500 mb-1">실현손익</div>
+          <div class="text-xl font-bold ${pnlColor}">${d.realized_pnl >= 0 ? '+' : ''}${d.realized_pnl.toLocaleString()}원</div>
+          <div class="text-xs text-gray-400">평가손익 ${d.eval_pnl >= 0 ? '+' : ''}${d.eval_pnl.toLocaleString()}원</div>
+        </div>
+        <div class="bg-purple-50 rounded-lg p-3">
+          <div class="text-xs text-gray-500 mb-1">승률</div>
+          <div class="text-xl font-bold ${winRateColor}">${d.win_rate.toFixed(1)}%</div>
+          <div class="text-xs text-gray-400">평균보유 ${d.avg_hold_hours.toFixed(1)}시간</div>
+        </div>
+      </div>
+
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-3 mb-4">
+        <div class="border border-gray-200 rounded-lg p-3">
+          <div class="text-xs font-semibold text-gray-600 mb-2">수익/손실 분석</div>
+          <table class="w-full text-sm">
+            <tr><td class="text-gray-500 py-0.5">평균 수익률</td>
+                <td class="text-right font-medium text-green-600">+${(d.avg_profit_rate * 100).toFixed(2)}%</td></tr>
+            <tr><td class="text-gray-500 py-0.5">평균 손실률</td>
+                <td class="text-right font-medium text-red-500">${(d.avg_loss_rate * 100).toFixed(2)}%</td></tr>
+            <tr><td class="text-gray-500 py-0.5">주문 실패</td>
+                <td class="text-right font-medium ${d.order_fail_count > 0 ? 'text-red-500' : 'text-gray-400'}">${d.order_fail_count}건</td></tr>
+          </table>
+        </div>
+        <div class="border border-gray-200 rounded-lg p-3">
+          <div class="text-xs font-semibold text-gray-600 mb-2">극단 종목</div>
+          <table class="w-full text-sm">
+            <tr><td class="text-gray-500 py-0.5">최대 수익</td>
+                <td class="text-right font-medium text-green-600">
+                  ${d.max_profit_ticker ? `${escHtml(d.max_profit_ticker)} ${(d.max_profit_rate * 100).toFixed(2)}%` : '-'}
+                </td></tr>
+            <tr><td class="text-gray-500 py-0.5">최대 손실</td>
+                <td class="text-right font-medium text-red-500">
+                  ${d.max_loss_ticker ? `${escHtml(d.max_loss_ticker)} ${(d.max_loss_rate * 100).toFixed(2)}%` : '-'}
+                </td></tr>
+          </table>
+        </div>
+      </div>
+
+      <div class="text-xs text-gray-400 text-right">
+        생성: ${d.generated_at ? new Date(d.generated_at).toLocaleString('ko-KR') : '-'} (${source})
+      </div>
+    `;
+  } catch (e) {
+    el.innerHTML = `<div class="text-red-500 text-sm p-4">오류: ${escHtml(String(e))}</div>`;
+  }
+}
+
+// ── 성능 지표 로드 (7/30/90일) ───────────────────────────────
+async function loadPerfReport(days) {
+  const el = document.getElementById(`perf${days}-content`);
+  if (!el) return;
+  try {
+    const res = await fetch(`/api/report/performance?period=${days}`);
+    const json = await res.json();
+    if (!json.success || !json.data?.length) {
+      el.innerHTML = renderNoPerfData(days);
+      return;
+    }
+    const d = json.data[0];
+    el.innerHTML = renderPerfCard(d, days);
+  } catch (e) {
+    el.innerHTML = `<div class="text-red-500 text-sm p-4">오류: ${escHtml(String(e))}</div>`;
+  }
+}
+
+function renderNoPerfData(days) {
+  return `<div class="text-center py-8 text-gray-400">
+    <i class="fas fa-database text-3xl mb-3 block"></i>
+    <p>최근 ${days}일간 체결 데이터가 없습니다.</p>
+    <p class="text-xs mt-1">실제 매매가 발생하면 성능 지표가 자동 계산됩니다.</p>
+  </div>`;
+}
+
+function renderPerfCard(d, days) {
+  const total = d.total_trades ?? 0;
+  if (total === 0) return renderNoPerfData(days);
+
+  const wr = (d.win_rate ?? 0);
+  const ev = ((d.ev ?? 0) * 100);
+  const pf = d.profit_factor ?? 0;
+  const mdd = d.mdd ?? 0;
+  const wrColor = wr >= 60 ? 'text-green-600' : wr >= 40 ? 'text-yellow-600' : 'text-red-500';
+  const evColor = ev >= 0 ? 'text-green-600' : 'text-red-500';
+  const pfColor = pf >= 1.5 ? 'text-green-600' : pf >= 1.0 ? 'text-yellow-600' : 'text-red-500';
+
+  const pfDisplay = pf >= 9999 ? '∞' : pf.toFixed(3);
+
+  return `
+    <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3 mb-4">
+      <div class="bg-gray-50 rounded-lg p-3 text-center">
+        <div class="text-xs text-gray-500 mb-1">총 거래</div>
+        <div class="text-2xl font-bold text-gray-700">${total}</div>
+        <div class="text-xs text-gray-400">승 ${d.win_trades} / 패 ${d.loss_trades}</div>
+      </div>
+      <div class="bg-green-50 rounded-lg p-3 text-center">
+        <div class="text-xs text-gray-500 mb-1">승률</div>
+        <div class="text-2xl font-bold ${wrColor}">${wr.toFixed(1)}%</div>
+      </div>
+      <div class="bg-blue-50 rounded-lg p-3 text-center">
+        <div class="text-xs text-gray-500 mb-1">기대수익(EV)</div>
+        <div class="text-2xl font-bold ${evColor}">${ev >= 0 ? '+' : ''}${ev.toFixed(2)}%</div>
+      </div>
+      <div class="bg-purple-50 rounded-lg p-3 text-center">
+        <div class="text-xs text-gray-500 mb-1">Profit Factor</div>
+        <div class="text-2xl font-bold ${pfColor}">${pfDisplay}</div>
+      </div>
+      <div class="bg-orange-50 rounded-lg p-3 text-center">
+        <div class="text-xs text-gray-500 mb-1">MDD</div>
+        <div class="text-2xl font-bold text-orange-600">${mdd.toLocaleString()}원</div>
+      </div>
+      <div class="bg-yellow-50 rounded-lg p-3 text-center">
+        <div class="text-xs text-gray-500 mb-1">평균보유</div>
+        <div class="text-2xl font-bold text-yellow-600">${(d.avg_hold_hours ?? 0).toFixed(1)}h</div>
+      </div>
+    </div>
+    <div class="border border-gray-200 rounded-lg p-3">
+      <table class="w-full text-sm">
+        <tr class="border-b border-gray-100">
+          <td class="text-gray-500 py-1.5">평균 수익률 (수익 거래)</td>
+          <td class="text-right font-medium text-green-600">+${((d.avg_profit_rate ?? 0)*100).toFixed(2)}%</td>
+          <td class="text-gray-500 py-1.5 pl-6">총 수익</td>
+          <td class="text-right font-medium text-green-600">+${(d.total_profit ?? 0).toLocaleString()}원</td>
+        </tr>
+        <tr>
+          <td class="text-gray-500 py-1.5">평균 손실률 (손실 거래)</td>
+          <td class="text-right font-medium text-red-500">${((d.avg_loss_rate ?? 0)*100).toFixed(2)}%</td>
+          <td class="text-gray-500 py-1.5 pl-6">총 손실</td>
+          <td class="text-right font-medium text-red-500">-${(d.total_loss ?? 0).toLocaleString()}원</td>
+        </tr>
+      </table>
+    </div>
+    <div class="text-xs text-gray-400 mt-2 text-right">
+      기준: 최근 ${days}일 체결 완료 거래 / 전략: BB(20,2) + RSI(14≤35)
+      ${d.source === 'cache' ? ' / 캐시' : ''}
+    </div>
+  `;
+}
+
+// ── 전략 비교 로드 ──────────────────────────────────────────
+async function loadStrategyCompare() {
+  const el = document.getElementById('compare-content');
+  const period = document.getElementById('compare-period').value;
+  try {
+    el.innerHTML = '<p class="text-gray-400 text-sm text-center py-4">계산 중...</p>';
+    const res = await fetch(`/api/report/compare?period=${period}`);
+    const json = await res.json();
+
+    if (!json.success || !json.data?.length) {
+      el.innerHTML = `<div class="text-center py-8 text-gray-400">
+        <i class="fas fa-database text-3xl mb-3 block"></i>
+        <p>최근 ${period}일간 비교할 체결 데이터가 없습니다.</p>
+      </div>`;
+      return;
+    }
+
+    const data = json.data;
+    // 현재 전략 강조
+    const current = data.find(d => d.strategy_key === 'BB_RSI35');
+    // EV 기준 정렬
+    const sorted = [...data].sort((a, b) => (b.ev ?? 0) - (a.ev ?? 0));
+
+    const rows = sorted.map(d => {
+      const isCurrent = d.strategy_key === 'BB_RSI35';
+      const wr = d.win_rate ?? 0;
+      const ev = ((d.ev ?? 0) * 100);
+      const pf = d.profit_factor ?? 0;
+      const pfDisplay = pf >= 9999 ? '∞' : pf.toFixed(3);
+      const evDisplay = `${ev >= 0 ? '+' : ''}${ev.toFixed(2)}%`;
+      const pnlDisplay = (d.total_profit >= 0 ? '+' : '') + (d.total_profit ?? 0).toLocaleString() + '원';
+
+      const rowClass = isCurrent ? 'bg-blue-50 font-semibold' : '';
+      const evColor = ev >= 0 ? 'text-green-600' : 'text-red-500';
+      const pfColor = pf >= 1.5 ? 'text-green-600' : pf >= 1.0 ? 'text-yellow-600' : 'text-red-500';
+      const pnlColor = (d.total_profit ?? 0) >= 0 ? 'text-green-600' : 'text-red-500';
+      const badge = isCurrent ? '<span class="ml-1 px-1 py-0.5 text-xs bg-blue-600 text-white rounded">현재</span>' : '';
+
+      return `<tr class="${rowClass}">
+        <td class="py-2 px-3">${escHtml(d.strategy_label ?? d.strategy_key)}${badge}</td>
+        <td class="py-2 px-3 text-right">${d.total_trades ?? 0}건</td>
+        <td class="py-2 px-3 text-right">${wr.toFixed(1)}%</td>
+        <td class="py-2 px-3 text-right ${evColor}">${evDisplay}</td>
+        <td class="py-2 px-3 text-right ${pfColor}">${pfDisplay}</td>
+        <td class="py-2 px-3 text-right ${pnlColor}">${pnlDisplay}</td>
+      </tr>`;
+    }).join('');
+
+    el.innerHTML = `
+      <div class="overflow-x-auto">
+        <table class="tbl w-full text-sm">
+          <thead>
+            <tr class="bg-gray-50">
+              <th class="py-2 px-3 text-left">전략</th>
+              <th class="py-2 px-3 text-right">거래수</th>
+              <th class="py-2 px-3 text-right">승률</th>
+              <th class="py-2 px-3 text-right">EV</th>
+              <th class="py-2 px-3 text-right">Profit Factor</th>
+              <th class="py-2 px-3 text-right">순손익</th>
+            </tr>
+          </thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>
+      <div class="mt-3 p-3 bg-gray-50 rounded-lg text-xs text-gray-500">
+        <strong>비교 방법:</strong> 실제 체결된 거래에 각 전략의 RSI 조건을 재적용하여 시뮬레이션합니다.
+        BB 단독은 RSI 조건 없이 전체 BB 신호를 포함하며, RSI30은 매수 시 RSI≤30 조건을 적용합니다.
+        <br>EV = 승률×평균수익률 + (1-승률)×평균손실률 / Profit Factor = 총수익/총손실
+      </div>
+    `;
+  } catch (e) {
+    el.innerHTML = `<div class="text-red-500 text-sm p-4">오류: ${escHtml(String(e))}</div>`;
+  }
+}
+
+// ── AI 개선 제안 로드 ────────────────────────────────────────
+async function loadSuggestions() {
+  const el = document.getElementById('suggest-content');
+  try {
+    const res = await fetch('/api/report/suggestions');
+    const json = await res.json();
+
+    if (!json.success || !json.data?.length) {
+      el.innerHTML = `<div class="text-center py-8 text-gray-400">
+        <i class="fas fa-hourglass-half text-3xl mb-3 block"></i>
+        <p>아직 생성된 AI 제안이 없습니다.</p>
+        <p class="text-xs mt-1">충분한 거래 데이터(5건 이상)가 축적되면 자동으로 제안이 생성됩니다.</p>
+      </div>`;
+      return;
+    }
+
+    const priorityIcon = { HIGH: '🔴', MEDIUM: '🟡', LOW: '🟢', INFO: '🔵' };
+    const priorityBg   = { HIGH: 'bg-red-50 border-red-200', MEDIUM: 'bg-yellow-50 border-yellow-200',
+                           LOW: 'bg-green-50 border-green-200', INFO: 'bg-blue-50 border-blue-200' };
+
+    const cards = json.data.map(sug => {
+      const icon = priorityIcon[sug.priority] ?? '🔵';
+      const bg   = priorityBg[sug.priority]   ?? 'bg-blue-50 border-blue-200';
+      let basisHtml = '';
+      if (sug.data_basis) {
+        try {
+          const basis = typeof sug.data_basis === 'string' ? JSON.parse(sug.data_basis) : sug.data_basis;
+          const entries = Object.entries(basis)
+            .filter(([, v]) => typeof v !== 'object')
+            .map(([k, v]) => `<span class="inline-block bg-white border border-gray-200 rounded px-1.5 py-0.5 mr-1 mb-1 text-gray-600">${escHtml(k)}: <strong>${escHtml(String(v))}</strong></span>`).join('');
+          if (entries) basisHtml = `<div class="mt-2">${entries}</div>`;
+        } catch {}
+      }
+      return `
+        <div class="border rounded-lg p-3 mb-3 ${bg}">
+          <div class="flex items-start gap-2">
+            <span class="text-lg leading-tight">${icon}</span>
+            <div class="flex-1">
+              <div class="font-semibold text-gray-800 text-sm">${escHtml(sug.title)}</div>
+              <div class="text-sm text-gray-600 mt-1">${escHtml(sug.description)}</div>
+              ${basisHtml}
+              <div class="text-xs text-gray-400 mt-2">
+                카테고리: ${escHtml(sug.category)} / 우선순위: ${escHtml(sug.priority)}
+                ${sug.suggestion_date ? ` / ${sug.suggestion_date}` : ''}
+              </div>
+            </div>
+          </div>
+        </div>
+      `;
+    }).join('');
+
+    el.innerHTML = `
+      <div>${cards}</div>
+      <div class="text-xs text-gray-400 p-2 border-t border-gray-100 mt-2">
+        <i class="fas fa-shield-alt mr-1 text-red-400"></i>
+        AI 제안은 참고용입니다. 전략 변경은 사용자가 직접 결정해야 하며, 시스템이 자동으로 적용하지 않습니다.
+      </div>
+    `;
+  } catch (e) {
+    el.innerHTML = `<div class="text-red-500 text-sm p-4">오류: ${escHtml(String(e))}</div>`;
+  }
+}
+
+// ── 리포트 즉시 생성 ─────────────────────────────────────────
+async function generateReport() {
+  showToast('리포트 생성 중...', 'info');
+  try {
+    const res = await fetch('/api/report/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ full: true }),
+    });
+    const json = await res.json();
+    if (json.success) {
+      showToast('리포트 생성 완료!', 'success');
+      // 현재 활성 서브탭 새로고침
+      await loadTodayReport();
+      const activeSub = document.querySelector('.sub-tab-btn.active');
+      if (activeSub) {
+        const sub = activeSub.getAttribute('onclick')?.match(/switchSubTab\('(\w+)'/)?.[1];
+        if (sub === 'perf7')   loadPerfReport(7);
+        if (sub === 'perf30')  loadPerfReport(30);
+        if (sub === 'perf90')  loadPerfReport(90);
+        if (sub === 'compare') loadStrategyCompare();
+        if (sub === 'suggest') loadSuggestions();
+      }
+    } else {
+      showToast('생성 실패: ' + (json.error ?? '알 수 없는 오류'), 'error');
+    }
+  } catch (e) {
+    showToast('오류: ' + String(e), 'error');
+  }
 }
 
 window.addEventListener('DOMContentLoaded', init);

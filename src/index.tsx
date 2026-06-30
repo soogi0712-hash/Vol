@@ -4,7 +4,9 @@ import { logger } from 'hono/logger'
 import watchlistRoute from './routes/watchlist'
 import tradingRoute from './routes/trading'
 import testRoute from './routes/api-test'
-import { runTradeScan } from './lib/trade-engine'
+import reportRoute from './routes/report'
+import { runTradeScan, isKRMarketOpen } from './lib/trade-engine'
+import { runFullDailyReport, getKSTDateStr } from './lib/report-engine'
 
 type Bindings = {
   DB: D1Database;
@@ -24,6 +26,7 @@ app.use('/api/*', cors())
 app.route('/api/watchlist', watchlistRoute)
 app.route('/api/trading', tradingRoute)
 app.route('/api/test', testRoute)
+app.route('/api/report', reportRoute)
 
 // 시스템 설정 조회
 app.get('/api/config', async (c) => {
@@ -43,10 +46,11 @@ app.put('/api/config/:key', async (c) => {
   return c.json({ success: true, message: '설정 업데이트 완료' })
 })
 
-// Cron Trigger - 자동매매 스캔 (매분)
+// Cron Trigger - 자동매매 스캔 (매분) + 일일 리포트 자동 생성
 export default {
   fetch: app.fetch,
   async scheduled(_event: ScheduledEvent, env: Bindings, ctx: ExecutionContext) {
+    // ① 매매 스캔 (매분 실행)
     ctx.waitUntil(
       runTradeScan({
         DB: env.DB,
@@ -56,6 +60,32 @@ export default {
         KIS_ACCOUNT_NO: env.KIS_ACCOUNT_NO,
         KIS_ACCOUNT_SUFFIX: env.KIS_ACCOUNT_SUFFIX,
       })
+    )
+
+    // ② 일일 리포트 자동 생성 — KST 15:35 (UTC 06:35) 전후 1분 구간에서 실행
+    // Cron "* 0-6 * * 1-5" → UTC 06:35 = KST 15:35 (장마감 5분 후)
+    ctx.waitUntil(
+      (async () => {
+        try {
+          const now = new Date();
+          const utcH = now.getUTCHours();
+          const utcM = now.getUTCMinutes();
+          // UTC 06:35 ~ 06:36 구간 (KST 15:35 ~ 15:36)
+          if (utcH === 6 && utcM === 35) {
+            // 오늘 이미 생성됐는지 확인
+            const today = getKSTDateStr();
+            const lastGen = await env.DB.prepare(
+              `SELECT value FROM system_config WHERE key = 'report_last_generated'`
+            ).first<{ value: string }>();
+            if (lastGen?.value !== today) {
+              await runFullDailyReport(env.DB);
+              console.log(`[Report] 일일 리포트 자동 생성 완료: ${today}`);
+            }
+          }
+        } catch (e) {
+          console.error('[Report] 일일 리포트 자동 생성 오류:', e);
+        }
+      })()
     )
   },
 }
