@@ -7,7 +7,7 @@
  * - 종가 기준
  *
  * ■ 매수 조건 (4개 AND):
- *   ① 직전봉 종가 < 직전 볼린저 하단선
+ *   ① 직전봉 종가 ≤ 직전 볼린저 하단선 + 1틱 (KRX 호가단위 오차 허용)
  *   ② 현재봉 종가 > 현재 볼린저 하단선  (하단선 복귀)
  *   ③ 현재 RSI ≤ 35
  *   ④ 현재 RSI > 이전 RSI              (RSI 상승 전환)
@@ -22,6 +22,23 @@
  *   - 표준편차 0 → NO_DATA
  *   - BB폭 < 현재가 × 0.001 → NO_DATA (BB폭 너무 좁음)
  */
+
+/**
+ * KRX 호가단위(틱 사이즈) 반환
+ * API 부동소수점 계산 오차 및 가격 호가단위 차이 보정용
+ *
+ * @param price 현재가 (원) — KR 종목 기준
+ * @returns 해당 가격대 최소 호가 변동폭
+ */
+export function getTickSize(price: number): number {
+  if (price < 2000)   return 1;
+  if (price < 5000)   return 5;
+  if (price < 20000)  return 10;
+  if (price < 50000)  return 50;
+  if (price < 200000) return 100;
+  if (price < 500000) return 500;
+  return 1000;
+}
 
 export interface BBand {
   datetime: string;
@@ -117,7 +134,7 @@ export interface BBSignal {
   bb_lower_recovery:   boolean;   // 직전봉 < 하단선 AND 현재봉 > 하단선
   // ─── 매수 조건 충족 여부 (각 조건별) ────────────────────
   buy_conditions: {
-    prev_below_lower:  boolean;   // ① 직전봉 < 하단선
+    prev_below_lower:  boolean;   // ① 직전봉 ≤ 하단선+1틱
     curr_above_lower:  boolean;   // ② 현재봉 > 하단선
     rsi_le_35:         boolean;   // ③ RSI ≤ 35
     rsi_rising:        boolean;   // ④ RSI 상승
@@ -281,7 +298,9 @@ export function getBBSignal(
   }
 
   // ── 미보유 → 매수 조건 4개 판정 ────────────────────────
-  const c1 = prev.close < prev.lower;                              // ① 직전봉 < 하단선
+  // ① 직전봉 ≤ 하단선 + 1틱: API 부동소수점 오차 및 KRX 호가단위 차이 보정
+  const tick = getTickSize(prev.close);
+  const c1 = prev.close <= prev.lower + tick;                      // ① 직전봉 ≤ 하단선+1틱
   const c2 = current.close > current.lower;                       // ② 현재봉 > 하단선 (하단선 복귀)
   const c3 = !isNaN(rsiCurrent) && rsiCurrent <= RSI_THRESHOLD;   // ③ RSI ≤ 35
   const c4 = rsiRising;                                            // ④ RSI 상승
@@ -290,7 +309,9 @@ export function getBBSignal(
   const bbLowerRecovery = c1 && c2;
 
   const failReasons: string[] = [];
-  if (!c1) failReasons.push(`하단선 이탈 미충족 (직전봉 ${fmt(prev.close)} ≥ 하단선 ${fmt(prev.lower)})`);
+  if (!c1) failReasons.push(
+    `하단선 이탈 미충족 (직전봉 ${fmt(prev.close)} > 하단선 ${fmt(prev.lower)} + 1틱(${tick}원))`
+  );
   if (!c2) failReasons.push(`하단선 복귀 미충족 (현재봉 ${fmt(current.close)} ≤ 하단선 ${fmt(current.lower)})`);
   if (!c3) {
     if (isNaN(rsiCurrent)) failReasons.push(`RSI 계산 불가 (데이터 부족)`);
@@ -304,7 +325,7 @@ export function getBBSignal(
   if (allMet) {
     return {
       action: 'BUY',
-      reason: `BB하단복귀(${fmt(prev.close)}<${fmt(prev.lower)}→${fmt(current.close)}>${fmt(current.lower)}) RSI(${fmtRSI(rsiPrev)}→${fmtRSI(rsiCurrent)}≤${RSI_THRESHOLD}) → 매수`,
+      reason: `BB하단복귀(${fmt(prev.close)}≤${fmt(prev.lower)}+${tick}틱→${fmt(current.close)}>${fmt(current.lower)}) RSI(${fmtRSI(rsiPrev)}→${fmtRSI(rsiCurrent)}≤${RSI_THRESHOLD}) → 매수`,
       current, prev, above_upper: false,
       rsi_current: rsiCurrent, rsi_prev: rsiPrev, rsi_rising: rsiRising,
       bb_lower_recovery: bbLowerRecovery,
@@ -377,7 +398,9 @@ export function runBacktest(
 
     if (!inPosition) {
       // 매수 조건 4개 AND
-      const c1 = prev.close < prev.lower;
+      // ① 직전봉 ≤ 하단선 + 1틱: API 부동소수점 오차 및 KRX 호가단위 차이 보정
+      const btTick = getTickSize(prev.close);
+      const c1 = prev.close <= prev.lower + btTick;
       const c2 = current.close > current.lower;
       const c3 = !isNaN(rsiCurr) && rsiCurr <= RSI_THRESHOLD;
       const c4 = rsiRising;

@@ -27,6 +27,7 @@ export interface UniverseItem {
   ticker_name: string;
   market: 'KR' | 'US';
   exchange: ExchangeName;
+  scan_priority?: number;  // 스캔 우선순위 (높을수록 먼저 처리)
 }
 
 // ── KOSPI 대표 종목 (시가총액 상위 + 주요 업종) ──────────────
@@ -216,6 +217,13 @@ export async function loadUniverseToDB(db: D1Database): Promise<{ inserted: numb
 
 /**
  * 배치 스캔 큐에서 다음 처리할 종목 슬라이스 반환
+ *
+ * 스캔 우선순위: scan_priority DESC (↑높음수로 먼저)
+ *   1순위 (priority=100): 거래대금 상위 종목
+ *   2순위 (priority=50) : 시가엑 상위 종목
+ *   3순위 (priority=0)  : 나머지 일반 종목
+ * 동순위 내에서는 exchange, ticker 오름차순
+ *
  * @param db
  * @param batchSize    1회 처리 종목 수
  * @param marketFilter 'KR' | 'US' | 'ALL'
@@ -225,7 +233,7 @@ export async function getNextBatch(
   batchSize: number,
   marketFilter: 'KR' | 'US' | 'ALL' = 'ALL'
 ): Promise<{
-  items: Array<{ ticker: string; ticker_name: string; market: 'KR' | 'US'; exchange: ExchangeName }>;
+  items: Array<{ ticker: string; ticker_name: string; market: 'KR' | 'US'; exchange: ExchangeName; scan_priority: number }>;
   offset: number;
   total: number;
   isNewRound: boolean;
@@ -248,13 +256,17 @@ export async function getNextBatch(
   if (offset >= total) offset = 0; // 순환
 
   const marketCond = marketFilter === 'ALL' ? '' : `AND market = '${marketFilter}'`;
+
+  // 우선순위: scan_priority DESC → 거래대금 상위 → 시가엑 상위 → 나머지
+  // 동순위 안에서는 exchange, ticker 오름차순 (안정적 순환 보장)
   const rows = await db.prepare(
-    `SELECT ticker, ticker_name, market, exchange
+    `SELECT ticker, ticker_name, market, exchange,
+            COALESCE(scan_priority, 0) as scan_priority
      FROM stock_universe
      WHERE is_active = 1 ${marketCond}
-     ORDER BY exchange, ticker
+     ORDER BY scan_priority DESC, exchange ASC, ticker ASC
      LIMIT ? OFFSET ?`
-  ).bind(batchSize, offset).all<{ ticker: string; ticker_name: string; market: 'KR' | 'US'; exchange: ExchangeName }>();
+  ).bind(batchSize, offset).all<{ ticker: string; ticker_name: string; market: 'KR' | 'US'; exchange: ExchangeName; scan_priority: number }>();
 
   const nextOffset = offset + (rows.results?.length || 0);
 
