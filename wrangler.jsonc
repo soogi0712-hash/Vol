@@ -13,13 +13,9 @@
     }
   ],
 
-  "kv_namespaces": [
-    {
-      "binding": "KV",
-      "id": "placeholder-will-be-updated-after-create",
-      "preview_id": "placeholder-will-be-updated-after-create"
-    }
-  ],
+  // KV 바인딩: gsk hosted deploy 파이프라인은 KV를 지원하지 않아 제거
+  // 코드에서 KV는 옵셔널 (KV?: KVNamespace) — 없으면 토큰 캐시 없이 동작
+  // "kv_namespaces": [{ "binding": "KV", ... }],
 
   "triggers": {
     "crons": ["* 0-6 * * 1-5"]
