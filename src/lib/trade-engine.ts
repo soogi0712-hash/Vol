@@ -1,29 +1,29 @@
 /**
- * 자동매매 엔진 v3 — 전체시장 배치 스캔
+ * 자동매매 엔진 v3.1 — 구조적 스캔 결함 수정 (전략 불변)
  * ─────────────────────────────────────────────────────────────
- * 전략: 15분봉 볼린저밴드 (20, 2) 종가 기준
+ * ※ 매수/매도 전략은 v3와 100% 동일하다. (익절·손절·TP·SL 추가 없음)
+ *   - 매수: 직전봉 ≤ 하단선+1틱 AND 현재봉 > 하단선 AND RSI ≤ 35 AND RSI 상승
+ *   - 매도: 상단선 위(above_upper) 였다가 상단선 아래로 내려오면 전량 매도
+ *   → getBBSignal(bands, hasPos, aboveUpper, rsiValues) 원본 그대로 호출
  *
- * 매수: 직전봉 < 하단선 AND 현재봉 > 하단선 → 시장가 매수
- * 매도: 상단선 위에 있다가 상단선 아래로 내려오면 → 시장가 전량 매도
+ * ■ v3에서 "거래가 한 번도 일어나지 않던" 구조적 원인만 수정
+ *   ① watch_list 가 스캔 경로에 전혀 없었다 (getNextBatch 유니버스만 순회).
+ *      → 활성 watch_list 종목을 매 스캔 확인.
+ *   ② 보유 종목은 유니버스 배치가 그 종목에 도달할 때만 매도 신호를 봤다.
+ *      → 보유 종목을 매 스캔 확인.
+ *   ③ 유니버스 전량 순회(배치)는 그대로 유지 (기회 포착).
+ *   ④ 우선셋/배치가 겹치면 티커 기준 1회만 처리 (중복 스캔 제거).
+ *   ⑤ 15분봉은 "확정된 봉"에서만 신호 계산 (형성 중인 최신 봉 제외).
+ *   ⑥ 모든 API 오류·주문 실패를 DB(trade_logs / orders)에 기록.
  *
- * 스캔 방식: 전체시장 배치 방식
- *   - stock_universe 테이블의 KOSPI/KOSDAQ/NASD/NYSE/AMEX 전체 종목 대상
- *   - Cron 1회 실행 시 BATCH_SIZE 종목씩 순차 처리
- *   - KIS API 호출 제한 대응: 종목 간 딜레이 + 오류 재시도 없음(다음 사이클)
- *   - scan_batch_offset_kr / scan_batch_offset_us 로 진행상태 추적
- *
- * 금지: RSI·MACD·이동평균·거래량·AI·손절·익절·신용·미수
+ * ■ 스캔 순서 (매 Cron 사이클)
+ *   1) 우선 스캔셋 — 보유 종목 + 활성 watch_list  (항상, 소수라 신호 놓치지 않음)
+ *   2) 유니버스 배치 — scan_batch_size 종목씩 순차 순회
+ *   중복 티커는 seen 으로 1회만 처리.
  * ─────────────────────────────────────────────────────────────
- *
- * ■ 스캔 함수: runTradeScan(env)
- *   - KR 장중(KST 09:00-15:30): KOSPI+KOSDAQ 배치 스캔
- *   - US 장중(EST 04:00-20:00): NASD+NYSE+AMEX 배치 스캔
- *   - 보유 종목은 장외에도 매도 신호 확인
- *
- * ■ 배치 크기: system_config.scan_batch_size (기본 20)
  */
 
-import type { KISConfig, ExchangeCode } from './kis-api';
+import type { KISConfig, ExchangeCode, Candle } from './kis-api';
 import {
   getAccessToken,
   getKR15MinCandles, getUS15MinCandles,
@@ -56,6 +56,71 @@ interface HoldingRow {
   above_upper: number;
 }
 
+// 스캔 대상 1건
+export interface ScanItem {
+  ticker: string;
+  ticker_name: string;
+  market: 'KR' | 'US';
+  exchange: ExchangeName;
+  source: 'HOLDING' | 'WATCH' | 'UNIVERSE';
+}
+
+// 우선 스캔셋 게이트 — 시장별 개장/거래/스캔 활성 플래그
+export interface ScanGate {
+  krOpen: boolean;
+  usOpen: boolean;
+  krTradeEnabled: boolean;
+  usTradeEnabled: boolean;
+  krScanEnabled: boolean;
+  usScanEnabled: boolean;
+}
+
+/**
+ * 우선 스캔셋 선별 (순수 함수, 테스트 대상).
+ *
+ * 게이트 규칙 — 보유와 감시를 분리 적용:
+ *   • 보유(HOLDING): 해당 시장 개장 AND trade_enabled.
+ *     scan_*_enabled 와 무관하게 매 사이클 매도 관리를 유지한다.
+ *   • 감시(WATCH):   해당 시장 개장 AND trade_enabled AND scan_*_enabled.
+ *     스캔이 꺼져 있으면 매수 후보 평가/주문을 하지 않는다.
+ *
+ * 티커 중복은 보유 우선(먼저 추가)으로 1회만 처리한다. 즉 보유·감시에
+ * 동시에 존재하면 보유 항목으로 1회 스캔되고 감시 중복은 제거된다.
+ */
+export function selectPriorityScanItems(
+  holdings: ScanItem[],
+  watch: ScanItem[],
+  gate: ScanGate,
+): ScanItem[] {
+  const marketGate = (market: 'KR' | 'US') =>
+    market === 'KR'
+      ? { open: gate.krOpen, trade: gate.krTradeEnabled, scan: gate.krScanEnabled }
+      : { open: gate.usOpen, trade: gate.usTradeEnabled, scan: gate.usScanEnabled };
+
+  const out: ScanItem[] = [];
+  const seen = new Set<string>();
+
+  // 보유: 개장 + 거래 활성 (스캔 플래그 무관)
+  for (const h of holdings) {
+    const g = marketGate(h.market);
+    if (!g.open || !g.trade) continue;
+    if (seen.has(h.ticker)) continue;
+    seen.add(h.ticker);
+    out.push(h);
+  }
+
+  // 감시: 개장 + 거래 활성 + 스캔 활성
+  for (const w of watch) {
+    const g = marketGate(w.market);
+    if (!g.open || !g.trade || !g.scan) continue;
+    if (seen.has(w.ticker)) continue;
+    seen.add(w.ticker);
+    out.push(w);
+  }
+
+  return out;
+}
+
 // ─── 장 시간 확인 ─────────────────────────────────────────────
 export function isKRMarketOpen(): boolean {
   const now = new Date();
@@ -84,9 +149,19 @@ function toExchangeCode(exchange: string): ExchangeCode {
   return map[exchange] || 'NASD';
 }
 
+/**
+ * ⑤ 확정봉만 남긴다 — 가장 최근(형성 중일 수 있는) 봉 1개를 제거.
+ * KIS 15분봉 조회는 진행 중인 봉을 최신으로 반환할 수 있어,
+ * 미확정 봉으로 신호를 계산하면 봉이 마감될 때까지 신호가 바뀐다(리페인트).
+ * 전략은 "종가" 기준이므로 마지막 확정봉을 현재봉으로 사용한다.
+ */
+function confirmedCandles(candles: Candle[]): Candle[] {
+  return candles.length > 1 ? candles.slice(0, -1) : candles;
+}
+
 // ─── 메인 스캔 함수 ───────────────────────────────────────────
 /**
- * runTradeScan — 전체시장 배치 스캔
+ * runTradeScan — 우선 스캔셋 + 전체시장 배치 스캔
  * Cron에서 매분 호출됨
  */
 export async function runTradeScan(env: TradeEnv): Promise<{
@@ -135,210 +210,216 @@ export async function runTradeScan(env: TradeEnv): Promise<{
   try {
     token = await getAccessToken(kisConfig, env.KV);
   } catch (e) {
+    await logSystemError(env.DB, 'TOKEN_ERROR', `토큰 발급 실패: ${e}`);
     return { scanned: 0, actions: [], errors: [`토큰 발급 실패: ${e}`], kr_market_open: krOpen, us_market_open: usOpen, batch_info: '' };
   }
 
   // 주문가능 현금
-  let cashKR = 0, cashUS = 0;
-  try { cashKR = await getKROrderableCash(kisConfig, token); } catch (e) { errors.push(`KR 잔고 오류: ${e}`); }
-  try { cashUS = await getUSOrderableCash(kisConfig, token); } catch (e) { errors.push(`US 잔고 오류: ${e}`); }
+  const cash = { kr: 0, us: 0 };
+  try { cash.kr = await getKROrderableCash(kisConfig, token); }
+  catch (e) { errors.push(`KR 잔고 오류: ${e}`); await logSystemError(env.DB, 'API_ERROR', `KR 잔고 오류: ${e}`); }
+  try { cash.us = await getUSOrderableCash(kisConfig, token); }
+  catch (e) { errors.push(`US 잔고 오류: ${e}`); await logSystemError(env.DB, 'API_ERROR', `US 잔고 오류: ${e}`); }
 
   // 보유종목 DB 동기화
   try {
     const [krH, usH] = await Promise.all([
-      getKRHoldings(kisConfig, token).catch(() => []),
-      getUSHoldings(kisConfig, token).catch(() => []),
+      getKRHoldings(kisConfig, token).catch((e) => { throw new Error(`KR 보유조회: ${e}`); }),
+      getUSHoldings(kisConfig, token).catch((e) => { throw new Error(`US 보유조회: ${e}`); }),
     ]);
     await syncHoldings(env.DB, [...krH, ...usH]);
-  } catch (e) { errors.push(`보유종목 동기화 오류: ${e}`); }
+  } catch (e) {
+    errors.push(`보유종목 동기화 오류: ${e}`);
+    await logSystemError(env.DB, 'API_ERROR', `보유종목 동기화 오류: ${e}`);
+  }
 
   const BATCH_SIZE = parseInt(cfgMap['scan_batch_size'] || '20');
   const BB_PERIOD  = 20;
   const BB_STDDEV  = 2;
-  const CANDLE_CNT = 40;
+  // 확정봉 1개 제거 후에도 충분한 봉 수 확보를 위해 1개 더 조회
+  const CANDLE_CNT = 41;
+
+  const krTradeEnabled = cfgMap['kr_trade_enabled'] === '1';
+  const usTradeEnabled = cfgMap['us_trade_enabled'] === '1';
+  const krScanEnabled  = cfgMap['scan_kr_enabled'] === '1';
+  const usScanEnabled  = cfgMap['scan_us_enabled'] === '1';
+
   let scanned = 0;
   const batchInfoParts: string[] = [];
+  const seen = new Set<string>();  // ④ 티커 중복 스캔 제거
 
-  // ── KR 배치 스캔 ────────────────────────────────────────────
-  const krEnabled = cfgMap['kr_trade_enabled'] === '1' && cfgMap['scan_kr_enabled'] === '1';
-  if (krEnabled && krOpen) {
+  /**
+   * 한 종목을 스캔하고 (원본 전략 그대로) 매수/매도 주문을 실행한다.
+   * 우선 스캔셋과 유니버스 배치가 공통으로 사용한다.
+   */
+  async function processSymbol(item: ScanItem): Promise<void> {
+    if (seen.has(item.ticker)) return;   // ④ 중복 제거
+    seen.add(item.ticker);
+    scanned++;
+
+    const isKR   = item.market === 'KR';
+    const exCode = toExchangeCode(item.exchange);
+
+    // ── 15분봉 조회 ──────────────────────────────────────────
+    let raw: Candle[];
+    try {
+      raw = isKR
+        ? await getKR15MinCandles(kisConfig, token, item.ticker, CANDLE_CNT)
+        : await getUS15MinCandles(kisConfig, token, item.ticker, CANDLE_CNT, exCode);
+    } catch (apiErr) {
+      const errStr = String(apiErr);
+      if (!isKR && errStr.includes('404')) {
+        const reason = '해외주식 시세 권한 없음 (KIS HTS에서 해외주식 시세 서비스 신청 필요)';
+        await updateUniverseScanResult(env.DB, item.ticker, item.exchange, 'ERROR_US_MARKET_DATA_PERMISSION', reason);
+        await logTrade(env.DB, blankLog(item, 'ERROR_US_MARKET_DATA_PERMISSION', `[ERROR_US_MARKET_DATA_PERMISSION] ${reason}`));
+        errors.push(`[US시세권한없음] ${item.ticker}: 404 — 해외주식 시세 서비스 미신청`);
+      } else {
+        await updateUniverseScanResult(env.DB, item.ticker, item.exchange, 'ERROR', errStr);
+        await logTrade(env.DB, blankLog(item, 'API_ERROR', `[API_ERROR] ${errStr}`));   // ⑥ API 오류 DB 기록
+        errors.push(`[${item.market}:${item.ticker}] API 오류: ${errStr}`);
+      }
+      return;
+    }
+
+    // ── ⑤ 확정봉만 사용 ─────────────────────────────────────
+    const candles = confirmedCandles(raw);
+    const closes  = candles.map(c => c.close);
+
+    // ── 데이터 품질 검증 ─────────────────────────────────────
+    const qv = validateCandleData(closes, 30, 20, 0.001);
+    if (!qv.valid) {
+      await updateUniverseScanResult(env.DB, item.ticker, item.exchange, 'NO_DATA', qv.reason);
+      await logTrade(env.DB, blankLog(item, 'NO_DATA', `[NO_DATA] ${qv.reason} (${qv.detail})`, closes.at(-1) ?? 0));
+      return;
+    }
+
+    // ── 신호 판단 (원본 전략, 4-인자 호출 그대로) ────────────
+    const bands     = calcBB(closes, candles.map(c => c.datetime), BB_PERIOD, BB_STDDEV);
+    const rsiValues = calcRSI(closes, 14);
+    const holdRow   = await getHoldingRow(env.DB, item.ticker);
+    const hasPos    = !!holdRow && holdRow.qty > 0;
+    const aboveU    = hasPos ? holdRow!.above_upper === 1 : false;
+    const signal    = getBBSignal(bands, hasPos, aboveU, rsiValues);
+
+    await updateUniverseScanResult(env.DB, item.ticker, item.exchange, signal.action);
+    await logTrade(env.DB, {
+      ticker: item.ticker, ticker_name: item.ticker_name, market: item.market,
+      action: signal.action === 'NONE' ? 'NO_SIGNAL' : `SIGNAL_${signal.action}`,
+      current_price: signal.current.close, bb_upper: signal.current.upper,
+      bb_middle: signal.current.middle, bb_lower: signal.current.lower,
+      prev_close: signal.prev.close, prev_bb_lower: signal.prev.lower,
+      above_upper: signal.above_upper ? 1 : 0, message: signal.reason,
+    });
+
+    // 보유 중 HOLD → 상단돌파 플래그 갱신 (원본 동작)
+    if (hasPos && signal.action === 'HOLD') {
+      await env.DB.prepare('UPDATE holdings SET above_upper=?,updated_at=CURRENT_TIMESTAMP WHERE ticker=?')
+        .bind(signal.above_upper ? 1 : 0, item.ticker).run();
+    }
+
+    // ── 매수 (원본 사이징: KR 10만원 / US $500) ──────────────
+    if (signal.action === 'BUY') {
+      const tradeOn = isKR ? krTradeEnabled : usTradeEnabled;
+      if (!tradeOn) return;
+      const price = signal.current.close;
+      const qty   = Math.floor((isKR ? 100000 : 500) / price);
+      const need  = price * qty * 1.002;
+      const bal   = isKR ? cash.kr : cash.us;
+      if (qty < 1) {
+        await logTrade(env.DB, blankLog(item, 'BUY_SKIP', `[BUY_SKIP] 수량 부족 (금액/${price} < 1주)`, price));
+        return;
+      }
+      if (bal < need) {
+        await logTrade(env.DB, blankLog(item, 'BUY_SKIP', `[BUY_SKIP] 잔고부족 (필요 ${need.toFixed(0)} > 가용 ${bal.toFixed(0)})`, price));
+        return;
+      }
+      const res = isKR
+        ? await buyKR(kisConfig, token, item.ticker, qty)
+        : await buyUS(kisConfig, token, item.ticker, qty, exCode);
+      await saveOrder(env.DB, { order_no: res.order_no, ticker: item.ticker, ticker_name: item.ticker_name, market: item.market, order_type: 'BUY', price, qty, status: res.success ? 'FILLED' : 'FAILED', reason: 'BB_BUY', raw_response: JSON.stringify(res.raw) });
+      if (res.success) {
+        if (isKR) cash.kr -= need; else cash.us -= need;
+        actions.push(`[${item.market}매수] ${item.ticker} ${item.ticker_name} ${qty}주 @${price}`);
+      } else {
+        await logTrade(env.DB, blankLog(item, 'BUY_FAIL', `[BUY_FAIL] ${res.message}`, price));   // ⑥ 주문 실패 DB 기록
+        errors.push(`[${item.market}매수실패] ${item.ticker}: ${res.message}`);
+      }
+      return;
+    }
+
+    // ── 매도 (원본: 상단돌파 후 하락) ────────────────────────
+    if (signal.action === 'SELL' && holdRow && holdRow.qty > 0) {
+      const res = isKR
+        ? await sellKR(kisConfig, token, item.ticker, holdRow.qty)
+        : await sellUS(kisConfig, token, item.ticker, holdRow.qty, toExchangeCode(holdRow.exchange || item.exchange));
+      const ordId = await saveOrder(env.DB, { order_no: res.order_no, ticker: item.ticker, ticker_name: item.ticker_name, market: item.market, order_type: 'SELL', price: signal.current.close, qty: holdRow.qty, status: res.success ? 'FILLED' : 'FAILED', reason: 'BB_SELL_UPPER_BREAK', raw_response: JSON.stringify(res.raw) });
+      if (res.success) {
+        const pl  = (signal.current.close - holdRow.avg_price) * holdRow.qty;
+        const ret = holdRow.avg_price > 0 ? (signal.current.close - holdRow.avg_price) / holdRow.avg_price * 100 : 0;
+        await env.DB.prepare(
+          `INSERT INTO realized_profits (ticker,ticker_name,market,sell_order_id,buy_price,sell_price,qty,profit_loss,return_rate,sell_reason)
+           VALUES (?,?,?,?,?,?,?,?,?,?)`
+        ).bind(item.ticker, item.ticker_name, item.market, ordId, holdRow.avg_price, signal.current.close, holdRow.qty, parseFloat(pl.toFixed(2)), parseFloat(ret.toFixed(4)), 'BB_SELL_UPPER_BREAK').run();
+        await env.DB.prepare('DELETE FROM holdings WHERE ticker=?').bind(item.ticker).run();
+        actions.push(`[${item.market}매도] ${item.ticker} ${holdRow.qty}주 @${signal.current.close} 손익:${pl.toFixed(isKR ? 0 : 2)}`);
+      } else {
+        await logTrade(env.DB, blankLog(item, 'SELL_FAIL', `[SELL_FAIL] ${res.message}`, signal.current.close));   // ⑥ 주문 실패 DB 기록
+        errors.push(`[${item.market}매도실패] ${item.ticker}: ${res.message}`);
+      }
+    }
+  }
+
+  // ── ① 우선 스캔셋: 보유종목 + 활성 감시종목 (매 사이클) ──────
+  // 게이트는 순수 함수(selectPriorityScanItems)에서 보유/감시를 분리 적용:
+  //   • 보유: 개장 + trade_enabled          (scan_*_enabled 무관 → 매도 관리 유지)
+  //   • 감시: 개장 + trade_enabled + scan_*_enabled  (스캔 꺼지면 매수 후보 제외)
+  const [holdingItems, watchItems] = await Promise.all([
+    buildHoldingScanItems(env.DB),
+    buildWatchScanItems(env.DB),
+  ]);
+  const priorityItems = selectPriorityScanItems(holdingItems, watchItems, {
+    krOpen, usOpen,
+    krTradeEnabled, usTradeEnabled,
+    krScanEnabled, usScanEnabled,
+  });
+  let priorityScanned = 0;
+  for (const item of priorityItems) {
+    priorityScanned++;
+    try { await processSymbol(item); }
+    catch (e) {
+      errors.push(`[우선:${item.ticker}] ${e}`);
+      await logTrade(env.DB, blankLog(item, 'API_ERROR', `[API_ERROR] ${e}`));
+    }
+    await sleep(50);
+  }
+  if (priorityScanned) batchInfoParts.push(`우선셋[${priorityScanned}]`);
+
+  // ── ② 유니버스 배치 스캔 (기존 유지) ────────────────────────
+  if (krTradeEnabled && krScanEnabled && krOpen) {
     const batch = await getNextBatch(env.DB, BATCH_SIZE, 'KR');
     batchInfoParts.push(`KR[${batch.offset}/${batch.total}]`);
-
-    for (const item of batch.items) {
-      try {
-        scanned++;
-        const candles = await getKR15MinCandles(kisConfig, token, item.ticker, CANDLE_CNT);
-        const closes  = candles.map(c => c.close);
-
-        // ── 방어 로직: 캔들 데이터 품질 검증 ────────────────
-        const qv = validateCandleData(closes, 30, 20, 0.001);
-        if (!qv.valid) {
-          await updateUniverseScanResult(env.DB, item.ticker, item.exchange, 'NO_DATA', qv.reason);
-          await logTrade(env.DB, {
-            ticker: item.ticker, ticker_name: item.ticker_name, market: 'KR',
-            action: 'NO_DATA', current_price: closes.at(-1) ?? 0,
-            bb_upper: 0, bb_middle: 0, bb_lower: 0,
-            prev_close: 0, prev_bb_lower: 0, above_upper: 0,
-            message: `[NO_DATA] ${qv.reason} (${qv.detail})`,
-          });
-          continue;
-        }
-
-        const bands  = calcBB(closes, candles.map(c => c.datetime), BB_PERIOD, BB_STDDEV);
-        const rsiValues = calcRSI(closes, 14);
-        const holdRow = await getHoldingRow(env.DB, item.ticker);
-        const hasPos  = !!holdRow && holdRow.qty > 0;
-        const aboveU  = hasPos ? holdRow!.above_upper === 1 : false;
-        const signal  = getBBSignal(bands, hasPos, aboveU, rsiValues);
-
-        await updateUniverseScanResult(env.DB, item.ticker, item.exchange, signal.action);
-        await logTrade(env.DB, {
-          ticker: item.ticker, ticker_name: item.ticker_name, market: 'KR',
-          action: signal.action === 'NONE' ? 'NO_SIGNAL' : `SIGNAL_${signal.action}`,
-          current_price: signal.current.close, bb_upper: signal.current.upper,
-          bb_middle: signal.current.middle, bb_lower: signal.current.lower,
-          prev_close: signal.prev.close, prev_bb_lower: signal.prev.lower,
-          above_upper: signal.above_upper ? 1 : 0, message: signal.reason,
-        });
-
-        if (hasPos && signal.action === 'HOLD') {
-          await env.DB.prepare('UPDATE holdings SET above_upper=?,updated_at=CURRENT_TIMESTAMP WHERE ticker=?')
-            .bind(signal.above_upper ? 1 : 0, item.ticker).run();
-        }
-
-        if (signal.action === 'BUY') {
-          const qty  = Math.floor(100000 / signal.current.close); // 기본 10만원
-          if (qty >= 1 && cashKR >= signal.current.close * qty * 1.002) {
-            const res = await buyKR(kisConfig, token, item.ticker, qty);
-            await saveOrder(env.DB, { order_no: res.order_no, ticker: item.ticker, ticker_name: item.ticker_name, market: 'KR', order_type: 'BUY', price: signal.current.close, qty, status: res.success ? 'FILLED' : 'FAILED', reason: 'BB_BUY', raw_response: JSON.stringify(res.raw) });
-            if (res.success) { cashKR -= signal.current.close * qty * 1.002; actions.push(`[KR매수] ${item.ticker} ${item.ticker_name} ${qty}주 @${signal.current.close}`); }
-            else errors.push(`[KR매수실패] ${item.ticker}: ${res.message}`);
-          }
-        }
-
-        if (signal.action === 'SELL' && holdRow && holdRow.qty > 0) {
-          const res = await sellKR(kisConfig, token, item.ticker, holdRow.qty);
-          const ordId = await saveOrder(env.DB, { order_no: res.order_no, ticker: item.ticker, ticker_name: item.ticker_name, market: 'KR', order_type: 'SELL', price: signal.current.close, qty: holdRow.qty, status: res.success ? 'FILLED' : 'FAILED', reason: 'BB_SELL_UPPER_BREAK', raw_response: JSON.stringify(res.raw) });
-          if (res.success) {
-            const pl = (signal.current.close - holdRow.avg_price) * holdRow.qty;
-            await env.DB.prepare(`INSERT INTO realized_profits (ticker,ticker_name,market,sell_order_id,buy_price,sell_price,qty,profit_loss,return_rate,sell_reason) VALUES (?,?,?,?,?,?,?,?,?,?)`)
-              .bind(item.ticker, item.ticker_name, 'KR', ordId, holdRow.avg_price, signal.current.close, holdRow.qty, parseFloat(pl.toFixed(2)), parseFloat(((signal.current.close - holdRow.avg_price)/holdRow.avg_price*100).toFixed(4)), 'BB_SELL_UPPER_BREAK').run();
-            await env.DB.prepare('DELETE FROM holdings WHERE ticker=?').bind(item.ticker).run();
-            actions.push(`[KR매도] ${item.ticker} ${holdRow.qty}주 @${signal.current.close} 손익:${pl.toFixed(0)}`);
-          } else errors.push(`[KR매도실패] ${item.ticker}: ${res.message}`);
-        }
-      } catch (e) {
-        const msg = `[KR:${item.ticker}] 처리오류: ${e}`;
-        errors.push(msg);
-        await updateUniverseScanResult(env.DB, item.ticker, item.exchange, 'ERROR', String(e));
+    for (const it of batch.items) {
+      try { await processSymbol({ ticker: it.ticker, ticker_name: it.ticker_name, market: 'KR', exchange: it.exchange, source: 'UNIVERSE' }); }
+      catch (e) {
+        errors.push(`[KR:${it.ticker}] 처리오류: ${e}`);
+        await updateUniverseScanResult(env.DB, it.ticker, it.exchange, 'ERROR', String(e));
       }
-      // API 호출 제한 대응: 종목 간 50ms 딜레이
       await sleep(50);
     }
   }
 
-  // ── US 배치 스캔 ────────────────────────────────────────────
-  const usEnabled = cfgMap['us_trade_enabled'] === '1' && cfgMap['scan_us_enabled'] === '1';
-  if (usEnabled && usOpen) {
+  if (usTradeEnabled && usScanEnabled && usOpen) {
     const batch = await getNextBatch(env.DB, BATCH_SIZE, 'US');
     batchInfoParts.push(`US[${batch.offset}/${batch.total}]`);
-
-    for (const item of batch.items) {
-      try {
-        scanned++;
-        const exCode = toExchangeCode(item.exchange);
-
-        // ── 해외주식 15분봉 호출 — 404는 시세 권한 없음으로 분리 ────
-        let candles;
-        try {
-          candles = await getUS15MinCandles(kisConfig, token, item.ticker, CANDLE_CNT, exCode);
-        } catch (apiErr) {
-          const errStr = String(apiErr);
-          // 404 = KIS 해외주식 시세 서비스 미신청
-          if (errStr.includes('404')) {
-            const reason = '해외주식 시세 권한 없음 (KIS HTS에서 해외주식 시세 서비스 신청 필요)';
-            await updateUniverseScanResult(env.DB, item.ticker, item.exchange, 'ERROR_US_MARKET_DATA_PERMISSION', reason);
-            await logTrade(env.DB, {
-              ticker: item.ticker, ticker_name: item.ticker_name, market: 'US',
-              action: 'ERROR_US_MARKET_DATA_PERMISSION', current_price: 0,
-              bb_upper: 0, bb_middle: 0, bb_lower: 0,
-              prev_close: 0, prev_bb_lower: 0, above_upper: 0,
-              message: `[ERROR_US_MARKET_DATA_PERMISSION] ${reason}`,
-            });
-            errors.push(`[US시세권한없음] ${item.ticker}: 404 — 해외주식 시세 서비스 미신청`);
-          } else {
-            await updateUniverseScanResult(env.DB, item.ticker, item.exchange, 'ERROR', errStr);
-            errors.push(`[US:${item.ticker}] API 오류: ${errStr}`);
-          }
-          await sleep(50);
-          continue; // 주문 시도 금지 — 다음 종목으로
-        }
-
-        // ── 방어 로직: 캔들 데이터 품질 검증 ────────────────────
-        const closes = candles.map(c => c.close);
-        const qv = validateCandleData(closes, 30, 20, 0.001);
-        if (!qv.valid) {
-          await updateUniverseScanResult(env.DB, item.ticker, item.exchange, 'NO_DATA', qv.reason);
-          await logTrade(env.DB, {
-            ticker: item.ticker, ticker_name: item.ticker_name, market: 'US',
-            action: 'NO_DATA', current_price: closes.at(-1) ?? 0,
-            bb_upper: 0, bb_middle: 0, bb_lower: 0,
-            prev_close: 0, prev_bb_lower: 0, above_upper: 0,
-            message: `[NO_DATA] ${qv.reason} (${qv.detail})`,
-          });
-          continue;
-        }
-
-        const bands   = calcBB(closes, candles.map(c => c.datetime), BB_PERIOD, BB_STDDEV);
-        const rsiValues = calcRSI(closes, 14);
-        const holdRow = await getHoldingRow(env.DB, item.ticker);
-        const hasPos  = !!holdRow && holdRow.qty > 0;
-        const aboveU  = hasPos ? holdRow!.above_upper === 1 : false;
-        const signal  = getBBSignal(bands, hasPos, aboveU, rsiValues);
-
-        await updateUniverseScanResult(env.DB, item.ticker, item.exchange, signal.action);
-        await logTrade(env.DB, { ticker: item.ticker, ticker_name: item.ticker_name, market: 'US', action: signal.action === 'NONE' ? 'NO_SIGNAL' : `SIGNAL_${signal.action}`, current_price: signal.current.close, bb_upper: signal.current.upper, bb_middle: signal.current.middle, bb_lower: signal.current.lower, prev_close: signal.prev.close, prev_bb_lower: signal.prev.lower, above_upper: signal.above_upper ? 1 : 0, message: signal.reason });
-
-        if (hasPos && signal.action === 'HOLD') {
-          await env.DB.prepare('UPDATE holdings SET above_upper=?,updated_at=CURRENT_TIMESTAMP WHERE ticker=?')
-            .bind(signal.above_upper ? 1 : 0, item.ticker).run();
-        }
-
-        if (signal.action === 'BUY') {
-          const qty = Math.floor(500 / signal.current.close); // 기본 $500
-          if (qty >= 1 && cashUS >= signal.current.close * qty * 1.002) {
-            const res = await buyUS(kisConfig, token, item.ticker, qty, exCode);
-            await saveOrder(env.DB, { order_no: res.order_no, ticker: item.ticker, ticker_name: item.ticker_name, market: 'US', order_type: 'BUY', price: signal.current.close, qty, status: res.success ? 'FILLED' : 'FAILED', reason: 'BB_BUY', raw_response: JSON.stringify(res.raw) });
-            if (res.success) { cashUS -= signal.current.close * qty * 1.002; actions.push(`[US매수] ${item.ticker}(${exCode}) ${qty}주 @$${signal.current.close}`); }
-            else errors.push(`[US매수실패] ${item.ticker}: ${res.message}`);
-          }
-        }
-
-        if (signal.action === 'SELL' && holdRow && holdRow.qty > 0) {
-          const exCodeHold = toExchangeCode(holdRow.exchange || item.exchange);
-          const res = await sellUS(kisConfig, token, item.ticker, holdRow.qty, exCodeHold);
-          const ordId = await saveOrder(env.DB, { order_no: res.order_no, ticker: item.ticker, ticker_name: item.ticker_name, market: 'US', order_type: 'SELL', price: signal.current.close, qty: holdRow.qty, status: res.success ? 'FILLED' : 'FAILED', reason: 'BB_SELL_UPPER_BREAK', raw_response: JSON.stringify(res.raw) });
-          if (res.success) {
-            const pl = (signal.current.close - holdRow.avg_price) * holdRow.qty;
-            await env.DB.prepare(`INSERT INTO realized_profits (ticker,ticker_name,market,sell_order_id,buy_price,sell_price,qty,profit_loss,return_rate,sell_reason) VALUES (?,?,?,?,?,?,?,?,?,?)`)
-              .bind(item.ticker, item.ticker_name, 'US', ordId, holdRow.avg_price, signal.current.close, holdRow.qty, parseFloat(pl.toFixed(2)), parseFloat(((signal.current.close - holdRow.avg_price)/holdRow.avg_price*100).toFixed(4)), 'BB_SELL_UPPER_BREAK').run();
-            await env.DB.prepare('DELETE FROM holdings WHERE ticker=?').bind(item.ticker).run();
-            actions.push(`[US매도] ${item.ticker} ${holdRow.qty}주 @$${signal.current.close} 손익:$${pl.toFixed(2)}`);
-          } else errors.push(`[US매도실패] ${item.ticker}: ${res.message}`);
-        }
-      } catch (e) {
-        const msg = `[US:${item.ticker}] 처리오류: ${e}`;
-        errors.push(msg);
-        await updateUniverseScanResult(env.DB, item.ticker, item.exchange, 'ERROR', String(e));
+    for (const it of batch.items) {
+      try { await processSymbol({ ticker: it.ticker, ticker_name: it.ticker_name, market: 'US', exchange: it.exchange, source: 'UNIVERSE' }); }
+      catch (e) {
+        errors.push(`[US:${it.ticker}] 처리오류: ${e}`);
+        await updateUniverseScanResult(env.DB, it.ticker, it.exchange, 'ERROR', String(e));
       }
       await sleep(50);
     }
   }
-
-  // ── 보유종목 매도 신호 (장외에도 체크) ────────────────────────
-  // 장이 닫혀 있을 때도 이미 보유한 종목의 매도 신호는 다음 장 시작에 체크
-  // (실제로는 장 중에만 주문 가능하므로 장중 스캔 시 자동 처리됨)
 
   // 마지막 스캔 시각 업데이트
   await env.DB.prepare(
@@ -353,6 +434,53 @@ export async function runTradeScan(env: TradeEnv): Promise<{
     us_market_open: usOpen,
     batch_info: batchInfoParts.join(' / ') || '장 마감 (스캔 없음)',
   };
+}
+
+// ─── 보유 종목 스캔셋 (매 스캔 매도 신호 확인) ────────────────
+async function buildHoldingScanItems(db: D1Database): Promise<ScanItem[]> {
+  const items: ScanItem[] = [];
+  const seen = new Set<string>();
+
+  const holdings = await db.prepare(
+    'SELECT ticker,ticker_name,market,exchange FROM holdings WHERE qty > 0'
+  ).all<{ ticker: string; ticker_name: string; market: string; exchange: string }>();
+  for (const h of holdings.results || []) {
+    if (seen.has(h.ticker)) continue;
+    seen.add(h.ticker);
+    items.push({
+      ticker: h.ticker, ticker_name: h.ticker_name,
+      market: h.market === 'US' ? 'US' : 'KR',
+      exchange: (h.exchange as ExchangeName) || (h.market === 'US' ? 'NASD' : 'KOSPI'),
+      source: 'HOLDING',
+    });
+  }
+  return items;
+}
+
+// ─── 활성 감시 종목 스캔셋 (매 스캔 매수 후보 확인) ────────────
+async function buildWatchScanItems(db: D1Database): Promise<ScanItem[]> {
+  const items: ScanItem[] = [];
+  const seen = new Set<string>();
+
+  // exchange 는 유니버스에서 조회
+  const watch = await db.prepare(
+    'SELECT ticker,ticker_name,market FROM watch_list WHERE is_active = 1'
+  ).all<{ ticker: string; ticker_name: string; market: string }>();
+  for (const w of watch.results || []) {
+    if (seen.has(w.ticker)) continue;
+    seen.add(w.ticker);
+    const mkt = w.market === 'US' ? 'US' : 'KR';
+    let exchange: ExchangeName = mkt === 'US' ? 'NASD' : 'KOSPI';
+    const uni = await db.prepare(
+      'SELECT exchange FROM stock_universe WHERE ticker = ? LIMIT 1'
+    ).bind(w.ticker).first<{ exchange: string }>();
+    if (uni?.exchange) exchange = uni.exchange as ExchangeName;
+    items.push({
+      ticker: w.ticker, ticker_name: w.ticker_name, market: mkt,
+      exchange, source: 'WATCH',
+    });
+  }
+  return items;
 }
 
 // ─── 보유 종목 DB 동기화 ──────────────────────────────────────
@@ -386,6 +514,15 @@ async function getHoldingRow(db: D1Database, ticker: string): Promise<HoldingRow
   ).bind(ticker).first<HoldingRow>();
 }
 
+// NO_DATA/ERROR/주문실패 로그용 빈 밴드 로그 생성
+function blankLog(item: ScanItem, action: string, message: string, price = 0) {
+  return {
+    ticker: item.ticker, ticker_name: item.ticker_name, market: item.market, action,
+    current_price: price, bb_upper: 0, bb_middle: 0, bb_lower: 0,
+    prev_close: 0, prev_bb_lower: 0, above_upper: 0, message,
+  };
+}
+
 async function logTrade(db: D1Database, d: {
   ticker: string; ticker_name: string; market: string; action: string;
   current_price: number; bb_upper: number; bb_middle: number; bb_lower: number;
@@ -397,6 +534,16 @@ async function logTrade(db: D1Database, d: {
   ).bind(d.ticker, d.ticker_name, d.market, d.action, d.current_price,
          d.bb_upper, d.bb_middle, d.bb_lower, d.prev_close, d.prev_bb_lower,
          d.above_upper, d.message).run();
+}
+
+// ⑥ 시스템 수준 오류(토큰/잔고/동기화)를 DB에 기록
+async function logSystemError(db: D1Database, action: string, message: string): Promise<void> {
+  try {
+    await db.prepare(
+      `INSERT INTO trade_logs (ticker,ticker_name,market,action,current_price,bb_upper,bb_middle,bb_lower,prev_close,prev_bb_lower,above_upper,message)
+       VALUES ('SYSTEM','SYSTEM','SYS',?,0,0,0,0,0,0,0,?)`
+    ).bind(action, message).run();
+  } catch (_) { /* 로깅 실패는 무시 */ }
 }
 
 async function saveOrder(db: D1Database, d: {
