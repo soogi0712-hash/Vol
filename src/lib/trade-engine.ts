@@ -57,12 +57,68 @@ interface HoldingRow {
 }
 
 // 스캔 대상 1건
-interface ScanItem {
+export interface ScanItem {
   ticker: string;
   ticker_name: string;
   market: 'KR' | 'US';
   exchange: ExchangeName;
   source: 'HOLDING' | 'WATCH' | 'UNIVERSE';
+}
+
+// 우선 스캔셋 게이트 — 시장별 개장/거래/스캔 활성 플래그
+export interface ScanGate {
+  krOpen: boolean;
+  usOpen: boolean;
+  krTradeEnabled: boolean;
+  usTradeEnabled: boolean;
+  krScanEnabled: boolean;
+  usScanEnabled: boolean;
+}
+
+/**
+ * 우선 스캔셋 선별 (순수 함수, 테스트 대상).
+ *
+ * 게이트 규칙 — 보유와 감시를 분리 적용:
+ *   • 보유(HOLDING): 해당 시장 개장 AND trade_enabled.
+ *     scan_*_enabled 와 무관하게 매 사이클 매도 관리를 유지한다.
+ *   • 감시(WATCH):   해당 시장 개장 AND trade_enabled AND scan_*_enabled.
+ *     스캔이 꺼져 있으면 매수 후보 평가/주문을 하지 않는다.
+ *
+ * 티커 중복은 보유 우선(먼저 추가)으로 1회만 처리한다. 즉 보유·감시에
+ * 동시에 존재하면 보유 항목으로 1회 스캔되고 감시 중복은 제거된다.
+ */
+export function selectPriorityScanItems(
+  holdings: ScanItem[],
+  watch: ScanItem[],
+  gate: ScanGate,
+): ScanItem[] {
+  const marketGate = (market: 'KR' | 'US') =>
+    market === 'KR'
+      ? { open: gate.krOpen, trade: gate.krTradeEnabled, scan: gate.krScanEnabled }
+      : { open: gate.usOpen, trade: gate.usTradeEnabled, scan: gate.usScanEnabled };
+
+  const out: ScanItem[] = [];
+  const seen = new Set<string>();
+
+  // 보유: 개장 + 거래 활성 (스캔 플래그 무관)
+  for (const h of holdings) {
+    const g = marketGate(h.market);
+    if (!g.open || !g.trade) continue;
+    if (seen.has(h.ticker)) continue;
+    seen.add(h.ticker);
+    out.push(h);
+  }
+
+  // 감시: 개장 + 거래 활성 + 스캔 활성
+  for (const w of watch) {
+    const g = marketGate(w.market);
+    if (!g.open || !g.trade || !g.scan) continue;
+    if (seen.has(w.ticker)) continue;
+    seen.add(w.ticker);
+    out.push(w);
+  }
+
+  return out;
 }
 
 // ─── 장 시간 확인 ─────────────────────────────────────────────
@@ -314,12 +370,20 @@ export async function runTradeScan(env: TradeEnv): Promise<{
   }
 
   // ── ① 우선 스캔셋: 보유종목 + 활성 감시종목 (매 사이클) ──────
-  const priorityItems = await buildPriorityScanItems(env.DB);
+  // 게이트는 순수 함수(selectPriorityScanItems)에서 보유/감시를 분리 적용:
+  //   • 보유: 개장 + trade_enabled          (scan_*_enabled 무관 → 매도 관리 유지)
+  //   • 감시: 개장 + trade_enabled + scan_*_enabled  (스캔 꺼지면 매수 후보 제외)
+  const [holdingItems, watchItems] = await Promise.all([
+    buildHoldingScanItems(env.DB),
+    buildWatchScanItems(env.DB),
+  ]);
+  const priorityItems = selectPriorityScanItems(holdingItems, watchItems, {
+    krOpen, usOpen,
+    krTradeEnabled, usTradeEnabled,
+    krScanEnabled, usScanEnabled,
+  });
   let priorityScanned = 0;
   for (const item of priorityItems) {
-    const marketOpen = item.market === 'KR' ? krOpen : usOpen;
-    const tradeOn    = item.market === 'KR' ? krTradeEnabled : usTradeEnabled;
-    if (!marketOpen || !tradeOn) continue;   // 장 마감/거래 비활성 시 주문 불가 → 스킵
     priorityScanned++;
     try { await processSymbol(item); }
     catch (e) {
@@ -372,12 +436,11 @@ export async function runTradeScan(env: TradeEnv): Promise<{
   };
 }
 
-// ─── 우선 스캔셋 구성 (보유 + 활성 감시 종목) ─────────────────
-async function buildPriorityScanItems(db: D1Database): Promise<ScanItem[]> {
+// ─── 보유 종목 스캔셋 (매 스캔 매도 신호 확인) ────────────────
+async function buildHoldingScanItems(db: D1Database): Promise<ScanItem[]> {
   const items: ScanItem[] = [];
   const seen = new Set<string>();
 
-  // ② 보유 종목 — 매 스캔 매도 신호 확인
   const holdings = await db.prepare(
     'SELECT ticker,ticker_name,market,exchange FROM holdings WHERE qty > 0'
   ).all<{ ticker: string; ticker_name: string; market: string; exchange: string }>();
@@ -391,8 +454,15 @@ async function buildPriorityScanItems(db: D1Database): Promise<ScanItem[]> {
       source: 'HOLDING',
     });
   }
+  return items;
+}
 
-  // ③ 활성 감시 종목 — 매 스캔 매수 후보 확인. exchange는 유니버스에서 조회
+// ─── 활성 감시 종목 스캔셋 (매 스캔 매수 후보 확인) ────────────
+async function buildWatchScanItems(db: D1Database): Promise<ScanItem[]> {
+  const items: ScanItem[] = [];
+  const seen = new Set<string>();
+
+  // exchange 는 유니버스에서 조회
   const watch = await db.prepare(
     'SELECT ticker,ticker_name,market FROM watch_list WHERE is_active = 1'
   ).all<{ ticker: string; ticker_name: string; market: string }>();
@@ -410,7 +480,6 @@ async function buildPriorityScanItems(db: D1Database): Promise<ScanItem[]> {
       exchange, source: 'WATCH',
     });
   }
-
   return items;
 }
 
