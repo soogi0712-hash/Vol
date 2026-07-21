@@ -14,7 +14,7 @@ export const INDICATOR_TABLE = 'indicator_snapshots';
 
 // INSERT 컬럼 순서 (마이그레이션의 컬럼과 일치)
 export const SNAPSHOT_COLUMNS = [
-  'symbol', 'market', 'candle_ts', 'close',
+  'symbol', 'market', 'candle_ts', 'close', 'history_count',
   'ema20', 'ema30', 'ema60', 'ema120',
   'macd', 'macd_signal', 'macd_histogram',
   'macd_golden_cross', 'macd_dead_cross', 'macd_histogram_positive',
@@ -47,6 +47,7 @@ export function snapshotToRow(
     market,
     candle_ts: s.candleTimestamp,
     close: s.close,
+    history_count: s.historyCount,
     ema20: s.ema20, ema30: s.ema30, ema60: s.ema60, ema120: s.ema120,
     macd: s.macd, macd_signal: s.macdSignal, macd_histogram: s.macdHistogram,
     macd_golden_cross: b(s.macdGoldenCross),

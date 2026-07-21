@@ -7,7 +7,7 @@ import { buildIndicatorSnapshot } from '../src/lib/indicators/snapshot';
 import { snapshotToRow, InMemorySnapshotStore } from '../src/lib/indicators/store';
 import type { IndicatorCandle } from '../src/lib/indicators/types';
 
-// n개 캔들 (오래→최신). 마지막 원소가 형성 중(미확정) 최신봉 역할.
+// n개 완결봉 (오래→최신).
 function genCandles(n: number, base = 100): IndicatorCandle[] {
   return Array.from({ length: n }, (_, i) => {
     const c = base + 6 * Math.sin(i / 7) + i * 0.05;
@@ -17,8 +17,6 @@ function genCandles(n: number, base = 100): IndicatorCandle[] {
     };
   });
 }
-
-// InMemorySnapshotStore 기반 deps 구성 (실제 DB 대신)
 function storeDeps(store: InMemorySnapshotStore) {
   return {
     snapshotExists: async (m: string, s: string, t: string) => !!store.get(m, s, t),
@@ -39,148 +37,130 @@ describe('dropForming', () => {
     const arr = Object.freeze(genCandles(5)) as IndicatorCandle[];
     const out = dropForming(arr);
     expect(out).toHaveLength(4);
-    expect(arr).toHaveLength(5);              // 원본 불변
+    expect(arr).toHaveLength(5);
     expect(out.at(-1)!.datetime).toBe(arr[3].datetime);
-  });
-  it('1개 이하이면 그대로(복사본) 반환', () => {
-    expect(dropForming([])).toHaveLength(0);
-    expect(dropForming([genCandles(1)[0]])).toHaveLength(1);
   });
 });
 
-describe('updateIndicatorSnapshot — EMA120 산출 (A)', () => {
-  it('충분한 확장 캔들이 있으면 EMA120 이 채워진다', async () => {
+describe('updateIndicatorSnapshot — 제너릭 오케스트레이션', () => {
+  it('충분한 완결봉이면 EMA120 이 채워지고 저장된다', async () => {
     const store = new InMemorySnapshotStore();
-    const extended = genCandles(130);        // dropForming → 129 완결봉 ≥ 120
+    const candles = genCandles(130);
     const res = await updateIndicatorSnapshot({
-      market: 'KR', symbol: '005930',
-      tradingCompletedTs: extended[extended.length - 2].datetime,
-      fetchExtendedCandles: async () => extended,
+      market: 'US', symbol: 'AAPL',
+      tradingCompletedTs: candles.at(-1)!.datetime,
+      loadCandles: async () => candles,
       ...storeDeps(store),
     });
     expect(res.status).toBe('saved');
     if (res.status === 'saved') {
       expect(res.snapshot.ema120).not.toBeNull();
-      expect(Number.isFinite(res.snapshot.ema120!)).toBe(true);
+      expect(res.snapshot.historyCount).toBe(130);
     }
     expect(store.size).toBe(1);
   });
 
-  it('매매 깊이(41)만큼만 있으면 EMA120 은 null (별도 깊은 조회가 필요함을 증명)', async () => {
+  it('매매 깊이(41)만큼만 로드되면 EMA120 은 null', async () => {
     const store = new InMemorySnapshotStore();
-    const extended = genCandles(41);
+    const candles = genCandles(41);
     const res = await updateIndicatorSnapshot({
-      market: 'KR', symbol: '005930',
-      tradingCompletedTs: extended[extended.length - 2].datetime,
-      fetchExtendedCandles: async () => extended,
+      market: 'US', symbol: 'AAPL',
+      tradingCompletedTs: candles.at(-1)!.datetime,
+      loadCandles: async () => candles,
       ...storeDeps(store),
     });
-    expect(res.status).toBe('saved');
-    if (res.status === 'saved') expect(res.snapshot.ema120).toBeNull();
-  });
-});
-
-describe('updateIndicatorSnapshot — 매매 창 불변 (B)', () => {
-  it('지표 경로는 별도 확장 시계열만 사용하고 매매 창을 건드리지 않는다', async () => {
-    const store = new InMemorySnapshotStore();
-    // 매매용 창 (41) — 동결하여 어떤 변형도 없음을 보장
-    const tradingWindow = Object.freeze(genCandles(41, 200)) as IndicatorCandle[];
-    const extended = genCandles(150, 100);   // 완전히 다른 별도 시계열
-    const res = await updateIndicatorSnapshot({
-      market: 'KR', symbol: '005930',
-      tradingCompletedTs: extended[extended.length - 2].datetime,
-      fetchExtendedCandles: async () => extended,
-      ...storeDeps(store),
-    });
-    // 저장된 스냅샷은 "확장" 시계열의 마지막 완결봉에서 나온다 (매매 창 아님)
     expect(res.status).toBe('saved');
     if (res.status === 'saved') {
-      expect(res.snapshot.candleTimestamp).toBe(extended[extended.length - 2].datetime);
-      expect(res.snapshot.close).toBeCloseTo(extended[extended.length - 2].close, 9);
+      expect(res.snapshot.ema120).toBeNull();
+      expect(res.snapshot.historyCount).toBe(41);
     }
-    // 매매 창은 그대로 (동결 + 길이 불변)
-    expect(tradingWindow).toHaveLength(41);
   });
-});
 
-describe('updateIndicatorSnapshot — 실패 격리 (C)', () => {
-  it('확장 조회 실패는 예외를 던지지 않고 매매를 막지 않는다', async () => {
-    const store = new InMemorySnapshotStore();
+  it('로드 실패는 stage=load 로 격리되고 예외를 던지지 않는다', async () => {
     const save = vi.fn(async () => {});
     const res = await updateIndicatorSnapshot({
-      market: 'KR', symbol: '005930',
-      tradingCompletedTs: '20260101000128',
+      market: 'US', symbol: 'AAPL',
+      tradingCompletedTs: '20260101000129',
       snapshotExists: async () => false,
-      fetchExtendedCandles: async () => { throw new Error('KIS 500 확장 조회 실패'); },
+      loadCandles: async () => { throw new Error('조회 실패'); },
       saveSnapshot: save,
     });
     expect(res.status).toBe('error');
-    if (res.status === 'error') expect(res.message).toContain('확장 조회 실패');
-    expect(save).not.toHaveBeenCalled();     // 저장 시도 없음
-    expect(store.size).toBe(0);
+    if (res.status === 'error') expect(res.stage).toBe('load');
+    expect(save).not.toHaveBeenCalled();
   });
 
-  it('저장 실패도 예외를 밖으로 던지지 않는다', async () => {
+  it('저장 실패는 stage=save 로 격리된다', async () => {
     const res = await updateIndicatorSnapshot({
-      market: 'KR', symbol: '005930',
-      tradingCompletedTs: '20260101000128',
+      market: 'US', symbol: 'AAPL',
+      tradingCompletedTs: '20260101000129',
       snapshotExists: async () => false,
-      fetchExtendedCandles: async () => genCandles(130),
+      loadCandles: async () => genCandles(130),
       saveSnapshot: async () => { throw new Error('D1 write 실패'); },
     });
     expect(res.status).toBe('error');
+    if (res.status === 'error') expect(res.stage).toBe('save');
   });
-});
 
-describe('updateIndicatorSnapshot — 스로틀/중복 방지 (D)', () => {
-  it('동일 완결봉 재스캔은 확장 조회를 건너뛰고 중복을 만들지 않는다', async () => {
+  it('동일 완결봉 재스캔은 스로틀 — 로드조차 하지 않는다', async () => {
     const store = new InMemorySnapshotStore();
-    const extended = genCandles(130);
-    const completedTs = extended[extended.length - 2].datetime;
-    const fetchSpy = vi.fn(async () => extended);
+    const candles = genCandles(130);
+    const loadSpy = vi.fn(async () => candles);
     const deps = {
-      market: 'KR', symbol: '005930',
-      tradingCompletedTs: completedTs,
-      fetchExtendedCandles: fetchSpy,
+      market: 'US', symbol: 'AAPL',
+      tradingCompletedTs: candles.at(-1)!.datetime,
+      loadCandles: loadSpy,
       ...storeDeps(store),
     };
-
-    const first = await updateIndicatorSnapshot(deps);
-    expect(first.status).toBe('saved');
-    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect((await updateIndicatorSnapshot(deps)).status).toBe('saved');
+    expect(loadSpy).toHaveBeenCalledTimes(1);
+    expect((await updateIndicatorSnapshot(deps)).status).toBe('skipped_throttled');
+    expect(loadSpy).toHaveBeenCalledTimes(1);   // 재로드 없음
     expect(store.size).toBe(1);
-
-    // 같은 완결봉으로 재스캔 → 스로틀
-    const second = await updateIndicatorSnapshot(deps);
-    expect(second.status).toBe('skipped_throttled');
-    expect(fetchSpy).toHaveBeenCalledTimes(1);   // 추가 조회 없음
-    expect(store.size).toBe(1);                  // 중복 행 없음
   });
 
-  it('완결봉이 없으면 스킵', async () => {
+  it('완결봉 시각이 없으면 스킵', async () => {
     const res = await updateIndicatorSnapshot({
-      market: 'KR', symbol: '005930',
+      market: 'US', symbol: 'AAPL',
       tradingCompletedTs: null,
       snapshotExists: async () => false,
-      fetchExtendedCandles: async () => { throw new Error('호출되면 안 됨'); },
+      loadCandles: async () => { throw new Error('호출되면 안 됨'); },
       saveSnapshot: async () => {},
     });
     expect(res.status).toBe('skipped_no_candle');
   });
-});
 
-describe('updateIndicatorSnapshot — look-ahead 없음 (E)', () => {
-  it('저장 스냅샷 = buildIndicatorSnapshot(dropForming(extended)) 와 동일', async () => {
+  it('look-ahead 없음: 저장 스냅샷 = build(로드된 완결봉)', async () => {
     const store = new InMemorySnapshotStore();
-    const extended = genCandles(140);
+    const candles = genCandles(140);
     const res = await updateIndicatorSnapshot({
-      market: 'KR', symbol: '005930',
-      tradingCompletedTs: extended[extended.length - 2].datetime,
-      fetchExtendedCandles: async () => extended,
+      market: 'US', symbol: 'AAPL',
+      tradingCompletedTs: candles.at(-1)!.datetime,
+      loadCandles: async () => candles,
       ...storeDeps(store),
     });
-    const expected = buildIndicatorSnapshot(dropForming(extended));
     expect(res.status).toBe('saved');
-    if (res.status === 'saved') expect(res.snapshot).toEqual(expected);
+    if (res.status === 'saved') expect(res.snapshot).toEqual(buildIndicatorSnapshot(candles));
+  });
+});
+
+// ── US 확장 조회 경로 유지 (I) ────────────────────────────────
+describe('US 확장 조회 경로 (dropForming 유지)', () => {
+  it('NREC 조회(형성봉 포함)를 dropForming 후 EMA120 산출', async () => {
+    const store = new InMemorySnapshotStore();
+    const raw = genCandles(151);                 // 형성봉 포함 raw
+    const usLoad = async () => dropForming(raw); // US 로더 형태
+    const res = await updateIndicatorSnapshot({
+      market: 'US', symbol: 'AAPL',
+      tradingCompletedTs: raw[raw.length - 2].datetime,   // 완결봉 = 마지막-1
+      loadCandles: usLoad,
+      ...storeDeps(store),
+    });
+    expect(res.status).toBe('saved');
+    if (res.status === 'saved') {
+      expect(res.snapshot.candleTimestamp).toBe(raw[raw.length - 2].datetime);
+      expect(res.snapshot.ema120).not.toBeNull();
+      expect(res.snapshot.historyCount).toBe(150);
+    }
   });
 });

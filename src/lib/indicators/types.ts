@@ -76,6 +76,9 @@ export interface IndicatorSnapshot {
   candleTimestamp: string;
   close: number;
 
+  // 이력 상태 — 계산에 사용한 완결봉 수. EMA120 은 >=120 일 때만 채워진다.
+  historyCount: number;
+
   // 이동평균 (지수)
   ema20: number | null;
   ema30: number | null;

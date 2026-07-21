@@ -17,6 +17,7 @@ CREATE TABLE IF NOT EXISTS indicator_snapshots (
   market        TEXT    NOT NULL,                 -- KR | US
   candle_ts     TEXT    NOT NULL,                 -- 확정봉 시각 (YYYYMMDDHHMMSS)
   close         REAL    NOT NULL,
+  history_count INTEGER NOT NULL DEFAULT 0,       -- 계산에 사용한 완결봉 수 (이력 상태 표시용)
 
   -- 지수이동평균 (데이터 부족 시 NULL)
   ema20         REAL,

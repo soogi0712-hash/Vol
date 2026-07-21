@@ -14,8 +14,13 @@ export { buildIndicatorSnapshot, computeSnapshotSeries, type SnapshotOptions } f
 export {
   updateIndicatorSnapshot, dropForming,
   INDICATOR_DEFAULT_DEPTH, INDICATOR_MIN_DEPTH,
-  type IndicatorUpdateDeps, type IndicatorUpdateResult,
+  type IndicatorUpdateDeps, type IndicatorUpdateResult, type IndicatorUpdateStage,
 } from './update';
+export {
+  CANDLE_HISTORY_TABLE, CANDLE_HISTORY_COLUMNS, CANDLE_HISTORY_UPSERT_SQL,
+  buildCandleHistoryUpsertSQL, candleHistoryBindings, accumulateAndLoadKRCandles,
+  InMemoryCandleHistory, type KRCandleAccumulateDeps,
+} from './candle-history';
 export {
   INDICATOR_TABLE, SNAPSHOT_COLUMNS, SNAPSHOT_KEY_COLUMNS,
   INDICATOR_UPSERT_SQL, buildUpsertSQL, snapshotToRow, rowToBindings,

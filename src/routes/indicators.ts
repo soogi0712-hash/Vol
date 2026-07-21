@@ -35,8 +35,19 @@ indicators.get('/latest', async (c) => {
        LIMIT ?`;
     params.push(limit);
 
-    const rows = await c.env.DB.prepare(sql).bind(...params).all();
-    return c.json({ success: true, data: rows.results || [] });
+    const rows = await c.env.DB.prepare(sql).bind(...params).all<Record<string, unknown>>();
+    // 이력 상태를 명시적으로 부가 (available/required/insufficient)
+    const EMA120_REQUIRED = 120;
+    const data = (rows.results || []).map((r) => {
+      const available = Number(r.history_count || 0);
+      return {
+        ...r,
+        history_available: available,
+        history_required: EMA120_REQUIRED,
+        insufficient_history: available < EMA120_REQUIRED,
+      };
+    });
+    return c.json({ success: true, data });
   } catch (e) {
     return c.json({ success: false, message: String(e) }, 500);
   }

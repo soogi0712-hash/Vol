@@ -38,9 +38,10 @@ import {
 } from './stock-universe';
 // 기술적 지표 (관찰/저장 전용) — 매매 판단과 완전히 분리된 모듈
 import {
-  updateIndicatorSnapshot, snapshotToRow, rowToBindings, INDICATOR_UPSERT_SQL,
+  updateIndicatorSnapshot, dropForming, snapshotToRow, rowToBindings, INDICATOR_UPSERT_SQL,
   INDICATOR_DEFAULT_DEPTH, INDICATOR_MIN_DEPTH,
-  type IndicatorSnapshot,
+  accumulateAndLoadKRCandles, CANDLE_HISTORY_UPSERT_SQL, candleHistoryBindings,
+  type IndicatorSnapshot, type IndicatorCandle,
 } from './indicators';
 
 export interface TradeEnv {
@@ -306,27 +307,36 @@ export async function runTradeScan(env: TradeEnv): Promise<{
       return;
     }
 
-    // ── 지표 스냅샷 (관찰/저장 전용, 별도 확장 조회 + 스로틀) ──
+    // ── 지표 스냅샷 (관찰/저장 전용) ─────────────────────────
     // 매매용 raw/candles/closes 와 getBBSignal 입력에는 전혀 관여하지 않는다.
-    // EMA120 까지 산출하려면 완결봉 120개가 필요하므로, 매매용(CANDLE_CNT)과
-    // 별개로 INDICATOR_CANDLE_CNT 깊이의 "관찰 전용" 캔들을 조회한다.
-    // 스로틀: 매매 확정봉과 동일한 완결봉의 스냅샷이 이미 있으면 확장 조회를
-    // 건너뛴다 → 분당 스캔이 반복돼도 15분봉당 확장 조회는 1회.
+    // KR: 국내 15분봉은 추가 KIS 요청으로 장기 이력을 얻을 수 없으므로, 매매가
+    //     이미 가져온 확정봉(candles)을 candle_history 에 누적한 뒤 최근 N개를
+    //     D1 에서 읽어 계산한다 → KR 추가 KIS 요청 0.
+    // US: NREC 최대 200 확장 조회 후 형성봉 제거 (기존 유지).
+    // 스로틀: 동일 완결봉 스냅샷이 이미 있으면 로드/재계산을 건너뛴다.
     // 실패는 완전히 격리된다(예외 미전파) — 매매는 이미 조회한 원본 캔들로 계속.
     const indResult = await updateIndicatorSnapshot({
       market: item.market,
       symbol: item.ticker,
       tradingCompletedTs: candles.at(-1)?.datetime ?? null,
       snapshotExists: (m, s, t) => indicatorSnapshotExists(env.DB, m, s, t),
-      fetchExtendedCandles: () => isKR
-        ? getKR15MinCandles(kisConfig, token, item.ticker, INDICATOR_CANDLE_CNT)
-        : getUS15MinCandles(kisConfig, token, item.ticker, INDICATOR_CANDLE_CNT, exCode),
+      loadCandles: isKR
+        ? () => accumulateAndLoadKRCandles({
+            market: item.market, symbol: item.ticker,
+            confirmedCandles: candles,   // 매매 확정봉 재사용 (형성봉 제외됨)
+            upsert: (m, s, cs) => upsertCandleHistory(env.DB, m, s, cs),
+            readLatest: (m, s, limit) => readCandleHistory(env.DB, m, s, limit),
+            limit: INDICATOR_CANDLE_CNT,
+          })
+        : async () => dropForming(
+            await getUS15MinCandles(kisConfig, token, item.ticker, INDICATOR_CANDLE_CNT, exCode),
+          ),
       saveSnapshot: (s, m, snap) => saveIndicatorSnapshot(env.DB, s, m as 'KR' | 'US', snap),
     });
     if (indResult.status === 'error') {
       await logTrade(env.DB, blankLog(
         item, 'INDICATOR_ERROR',
-        `[INDICATOR_ERROR] ${item.ticker}: ${indResult.message}`,
+        `[INDICATOR_ERROR] ${item.market}/${item.ticker} @${candles.at(-1)?.datetime ?? '-'} [${indResult.stage}] ${indResult.message}`,
         closes.at(-1) ?? 0,
       ));
     }
@@ -605,7 +615,7 @@ async function saveIndicatorSnapshot(
   await db.prepare(INDICATOR_UPSERT_SQL).bind(...rowToBindings(row)).run();
 }
 
-// 지표 스냅샷 스로틀용 존재 확인 — 동일 완결봉이면 확장 조회를 건너뛴다.
+// 지표 스냅샷 스로틀용 존재 확인 — 동일 완결봉이면 로드/재계산을 건너뛴다.
 async function indicatorSnapshotExists(
   db: D1Database, market: string, symbol: string, candleTs: string,
 ): Promise<boolean> {
@@ -613,6 +623,31 @@ async function indicatorSnapshotExists(
     `SELECT 1 AS x FROM indicator_snapshots WHERE market=? AND symbol=? AND candle_ts=? LIMIT 1`
   ).bind(market, symbol, candleTs).first<{ x: number }>();
   return !!row;
+}
+
+// 확정 캔들 이력 UPSERT (관찰 전용) — 형성봉은 호출 측이 이미 제거함.
+async function upsertCandleHistory(
+  db: D1Database, market: string, symbol: string, candles: readonly IndicatorCandle[],
+): Promise<void> {
+  if (!candles.length) return;
+  const stmt = db.prepare(CANDLE_HISTORY_UPSERT_SQL);
+  await db.batch(candles.map(c => stmt.bind(...candleHistoryBindings(market, symbol, c))));
+}
+
+// 확정 캔들 이력에서 최근 limit 개를 oldest→newest 로 읽는다.
+async function readCandleHistory(
+  db: D1Database, market: string, symbol: string, limit: number,
+): Promise<IndicatorCandle[]> {
+  const rows = await db.prepare(
+    `SELECT candle_ts, open, high, low, close, volume FROM candle_history
+     WHERE market=? AND symbol=? ORDER BY candle_ts DESC LIMIT ?`
+  ).bind(market, symbol, limit).all<{
+    candle_ts: string; open: number; high: number; low: number; close: number; volume: number;
+  }>();
+  // DESC 로 읽은 최근 N개를 oldest→newest 로 재정렬
+  return (rows.results || [])
+    .map(r => ({ datetime: r.candle_ts, open: r.open, high: r.high, low: r.low, close: r.close, volume: r.volume }))
+    .reverse();
 }
 
 function sleep(ms: number): Promise<void> {

@@ -80,6 +80,7 @@ export function buildIndicatorSnapshot(
   return {
     candleTimestamp: last.datetime,
     close,
+    historyCount: candles.length,   // 계산에 사용한 완결봉 수 (이력 상태)
 
     ema20, ema30, ema60, ema120,
 
