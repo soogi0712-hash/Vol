@@ -36,6 +36,13 @@ import {
   getNextBatch, updateUniverseScanResult, loadUniverseToDB,
   type ExchangeName,
 } from './stock-universe';
+// 기술적 지표 (관찰/저장 전용) — 매매 판단과 완전히 분리된 모듈
+import {
+  updateIndicatorSnapshot, dropForming, snapshotToRow, rowToBindings, INDICATOR_UPSERT_SQL,
+  INDICATOR_DEFAULT_DEPTH, INDICATOR_MIN_DEPTH, SNAPSHOT_COMPLETE_HISTORY,
+  accumulateKRHistory, CANDLE_HISTORY_UPSERT_SQL, candleHistoryBindings,
+  type IndicatorSnapshot, type IndicatorCandle,
+} from './indicators';
 
 export interface TradeEnv {
   DB: D1Database;
@@ -182,7 +189,8 @@ export async function runTradeScan(env: TradeEnv): Promise<{
     `SELECT key, value FROM system_config
      WHERE key IN (
        'auto_trade_enabled','kr_trade_enabled','us_trade_enabled',
-       'scan_batch_size','scan_kr_enabled','scan_us_enabled'
+       'scan_batch_size','scan_kr_enabled','scan_us_enabled',
+       'indicator_candle_cnt'
      )`
   ).all<{ key: string; value: string }>();
   const cfgMap: Record<string, string> = {};
@@ -238,6 +246,12 @@ export async function runTradeScan(env: TradeEnv): Promise<{
   const BB_STDDEV  = 2;
   // 확정봉 1개 제거 후에도 충분한 봉 수 확보를 위해 1개 더 조회
   const CANDLE_CNT = 41;
+  // 지표(관찰 전용) 확장 조회 깊이 — 매매용 CANDLE_CNT 와 완전히 별개.
+  // EMA120(완결봉 120개) 산출을 위해 raw 최소 121개, 기본 150개(설정 가능).
+  const INDICATOR_CANDLE_CNT = Math.min(200, Math.max(
+    INDICATOR_MIN_DEPTH,
+    parseInt(cfgMap['indicator_candle_cnt'] || String(INDICATOR_DEFAULT_DEPTH)) || INDICATOR_DEFAULT_DEPTH,
+  ));
 
   const krTradeEnabled = cfgMap['kr_trade_enabled'] === '1';
   const usTradeEnabled = cfgMap['us_trade_enabled'] === '1';
@@ -291,6 +305,54 @@ export async function runTradeScan(env: TradeEnv): Promise<{
       await updateUniverseScanResult(env.DB, item.ticker, item.exchange, 'NO_DATA', qv.reason);
       await logTrade(env.DB, blankLog(item, 'NO_DATA', `[NO_DATA] ${qv.reason} (${qv.detail})`, closes.at(-1) ?? 0));
       return;
+    }
+
+    // ── 지표 스냅샷 (관찰/저장 전용) ─────────────────────────
+    // 매매용 raw/candles/closes 와 getBBSignal 입력에는 전혀 관여하지 않는다.
+    // KR: 국내 15분봉은 추가 KIS 요청으로 장기 이력을 얻을 수 없으므로, 매매가
+    //     이미 가져온 확정봉(candles)을 candle_history 에 누적한다.
+    //     ★ 누적은 스냅샷 스로틀과 분리되어 매 스캔 실행된다 (스냅샷이 이미 있어도 계속).
+    const indTs = candles.at(-1)?.datetime ?? null;
+    if (isKR) {
+      const acc = await accumulateKRHistory({
+        market: item.market, symbol: item.ticker,
+        confirmedCandles: candles,   // 매매 확정봉 재사용 (형성봉 제외됨)
+        upsert: (m, s, cs) => upsertCandleHistory(env.DB, m, s, cs),
+      });
+      if (acc.status === 'error') {
+        await logTrade(env.DB, blankLog(
+          item, 'INDICATOR_ERROR',
+          `[INDICATOR_ERROR] ${item.market}/${item.ticker} @${indTs ?? '-'} [history_upsert] ${acc.message}`,
+          closes.at(-1) ?? 0,
+        ));
+      }
+    }
+
+    // 스냅샷 계산/저장 (관찰 전용).
+    // KR: candle_history 에서 최근 N개를 읽어 계산 (추가 KIS 요청 0).
+    // US: NREC 최대 200 확장 조회 후 형성봉 제거 (기존 유지).
+    // 스로틀: 이미 "충분히 누적된"(>=120, KR) 스냅샷만 건너뛴다 → 이력 부족 스냅샷은
+    //   이후 이력이 쌓이면 self-heal 재계산. US=0 → 스냅샷 있으면 항상 스로틀(재조회 방지).
+    // 실패는 완전히 격리된다(예외 미전파) — 매매는 이미 조회한 원본 캔들로 계속.
+    const indResult = await updateIndicatorSnapshot({
+      market: item.market,
+      symbol: item.ticker,
+      tradingCompletedTs: indTs,
+      existingHistoryCount: (m, s, t) => getSnapshotHistoryCount(env.DB, m, s, t),
+      throttleMinHistoryCount: isKR ? SNAPSHOT_COMPLETE_HISTORY : 0,
+      loadCandles: isKR
+        ? () => readCandleHistory(env.DB, item.market, item.ticker, INDICATOR_CANDLE_CNT)
+        : async () => dropForming(
+            await getUS15MinCandles(kisConfig, token, item.ticker, INDICATOR_CANDLE_CNT, exCode),
+          ),
+      saveSnapshot: (s, m, snap) => saveIndicatorSnapshot(env.DB, s, m as 'KR' | 'US', snap),
+    });
+    if (indResult.status === 'error') {
+      await logTrade(env.DB, blankLog(
+        item, 'INDICATOR_ERROR',
+        `[INDICATOR_ERROR] ${item.market}/${item.ticker} @${indTs ?? '-'} [${indResult.stage}] ${indResult.message}`,
+        closes.at(-1) ?? 0,
+      ));
     }
 
     // ── 신호 판단 (원본 전략, 4-인자 호출 그대로) ────────────
@@ -556,6 +618,51 @@ async function saveOrder(db: D1Database, d: {
   ).bind(d.order_no, d.ticker, d.ticker_name, d.market, d.order_type,
          d.price, d.qty, d.status, d.reason, d.raw_response).run();
   return r.meta?.last_row_id as number;
+}
+
+// ⑦ 지표 스냅샷 저장 (관찰/저장 전용) — (market,symbol,candle_ts) UPSERT.
+// 반복 스캔은 갱신, 다른 봉 시각은 새 행으로 이력 보존. 매매 로직과 무관.
+async function saveIndicatorSnapshot(
+  db: D1Database, symbol: string, market: 'KR' | 'US', snap: IndicatorSnapshot,
+): Promise<void> {
+  const row = snapshotToRow(symbol, market, snap);
+  await db.prepare(INDICATOR_UPSERT_SQL).bind(...rowToBindings(row)).run();
+}
+
+// 지표 스냅샷 스로틀용 — 동일 완결봉 스냅샷의 history_count 조회 (없으면 null).
+// "충분히 누적된" 스냅샷만 스로틀하기 위해 존재 여부가 아니라 누적 캔들 수를 본다.
+async function getSnapshotHistoryCount(
+  db: D1Database, market: string, symbol: string, candleTs: string,
+): Promise<number | null> {
+  const row = await db.prepare(
+    `SELECT history_count AS hc FROM indicator_snapshots WHERE market=? AND symbol=? AND candle_ts=? LIMIT 1`
+  ).bind(market, symbol, candleTs).first<{ hc: number }>();
+  return row ? Number(row.hc) : null;
+}
+
+// 확정 캔들 이력 UPSERT (관찰 전용) — 형성봉은 호출 측이 이미 제거함.
+async function upsertCandleHistory(
+  db: D1Database, market: string, symbol: string, candles: readonly IndicatorCandle[],
+): Promise<void> {
+  if (!candles.length) return;
+  const stmt = db.prepare(CANDLE_HISTORY_UPSERT_SQL);
+  await db.batch(candles.map(c => stmt.bind(...candleHistoryBindings(market, symbol, c))));
+}
+
+// 확정 캔들 이력에서 최근 limit 개를 oldest→newest 로 읽는다.
+async function readCandleHistory(
+  db: D1Database, market: string, symbol: string, limit: number,
+): Promise<IndicatorCandle[]> {
+  const rows = await db.prepare(
+    `SELECT candle_ts, open, high, low, close, volume FROM candle_history
+     WHERE market=? AND symbol=? ORDER BY candle_ts DESC LIMIT ?`
+  ).bind(market, symbol, limit).all<{
+    candle_ts: string; open: number; high: number; low: number; close: number; volume: number;
+  }>();
+  // DESC 로 읽은 최근 N개를 oldest→newest 로 재정렬
+  return (rows.results || [])
+    .map(r => ({ datetime: r.candle_ts, open: r.open, high: r.high, low: r.low, close: r.close, volume: r.volume }))
+    .reverse();
 }
 
 function sleep(ms: number): Promise<void> {

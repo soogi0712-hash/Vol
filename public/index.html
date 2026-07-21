@@ -140,6 +140,7 @@
     <button class="tab-btn" onclick="switchTab('profits',this)"><i class="fas fa-coins mr-1"></i>실현손익</button>
     <button class="tab-btn" onclick="switchTab('backtest',this)"><i class="fas fa-flask mr-1"></i>백테스트</button>
     <button class="tab-btn" onclick="switchTab('aireport',this)"><i class="fas fa-robot mr-1"></i>AI 전략 리포트</button>
+    <button class="tab-btn" onclick="switchTab('indicators',this)"><i class="fas fa-chart-line mr-1"></i>지표 모니터</button>
   </div>
 
   <!-- ===== TAB: 전체시장 스캔 ===== -->
@@ -722,6 +723,27 @@
 
   </div><!-- end tab-aireport -->
 
+  <!-- ===== TAB: 지표 모니터 (관찰 전용) ===== -->
+  <div id="tab-indicators" class="tab-content hidden bg-white rounded-b-xl shadow p-4">
+    <div class="flex items-center justify-between mb-4">
+      <h2 class="text-base font-bold text-gray-800"><i class="fas fa-chart-line text-blue-600 mr-2"></i>기술적 지표 모니터 <span class="text-xs font-normal text-gray-400 ml-1">(관찰 전용 — 매매 판단에 미사용)</span></h2>
+      <button onclick="loadIndicators()" class="btn-gray text-xs py-1.5 px-3"><i class="fas fa-refresh mr-1"></i>새로고침</button>
+    </div>
+    <div class="overflow-x-auto">
+      <table class="tbl">
+        <thead><tr>
+          <th>종목</th><th>시장</th><th>현재가</th><th>이력</th>
+          <th>EMA20</th><th>EMA30</th><th>EMA60</th><th>EMA120</th>
+          <th>MACD</th><th>Signal</th><th>Hist</th><th>크로스</th>
+          <th>패턴</th><th>거래량비</th><th>ATR</th><th>ADX</th><th>밴드폭</th><th>EMA30눌림</th>
+        </tr></thead>
+        <tbody id="indicators-body">
+          <tr><td colspan="18" class="text-center text-gray-400 py-6">지표 스냅샷 없음</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
   <div class="h-8"></div>
 </div><!-- end max-w-7xl -->
 
@@ -745,6 +767,7 @@ function switchTab(name, btn) {
   if (name === 'profits')   loadProfits();
   if (name === 'backtest')  loadBacktestHistory();
   if (name === 'aireport')  loadAIReport();
+  if (name === 'indicators') loadIndicators();
 }
 
 // ── Toast ────────────────────────────────────────────────────
@@ -1517,6 +1540,80 @@ function switchSubTab(name, btn) {
   if (name === 'perf90')  loadPerfReport(90);
   if (name === 'compare') loadStrategyCompare();
   if (name === 'suggest') loadSuggestions();
+}
+
+// ── 지표 모니터 로드 (관찰 전용) ─────────────────────────────
+function indFmt(v, dec=2) {
+  if (v === null || v === undefined || v === '') return '<span class="text-gray-300">-</span>';
+  return Number(v).toLocaleString('ko-KR', { minimumFractionDigits:dec, maximumFractionDigits:dec });
+}
+function indCross(row) {
+  if (row.macd_golden_cross) return '<span class="text-red-600 font-semibold">골든</span>';
+  if (row.macd_dead_cross)   return '<span class="text-blue-600 font-semibold">데드</span>';
+  if (row.macd_histogram_positive) return '<span class="text-red-500">+Hist</span>';
+  return '<span class="text-gray-400">-</span>';
+}
+// 이력 상태: 사용한 완결봉 수 / EMA120 요구치(120). 부족하면 붉게 + "부족" 표시.
+const EMA120_REQUIRED = 120;
+function indHistory(row) {
+  const cnt = Number(row.history_count || 0);
+  if (cnt >= EMA120_REQUIRED) {
+    return `<span class="text-gray-600">${cnt} / ${EMA120_REQUIRED}</span>`;
+  }
+  return `<span class="text-orange-600" title="이력 부족 — EMA120 계산 불가">${cnt} / ${EMA120_REQUIRED} <span class="text-[10px] bg-orange-100 rounded px-1">부족</span></span>`;
+}
+// EMA 값: null 이면 이력 부족 안내('-'), 아니면 숫자
+function indEma(row, field) {
+  if (row[field] === null || row[field] === undefined) {
+    const cnt = Number(row.history_count || 0);
+    return `<span class="text-gray-300" title="이력 ${cnt}개 — 데이터 부족">-</span>`;
+  }
+  return indFmt(row[field]);
+}
+function indPatterns(row) {
+  const map = {
+    doji:'도지', long_legged_doji:'롱레그도지', dragonfly_doji:'잠자리', gravestone_doji:'비석',
+    hammer:'해머', inverted_hammer:'역해머', shooting_star:'유성',
+    bullish_engulfing:'상승장악', bearish_engulfing:'하락장악',
+    bullish_harami:'상승잉태', bearish_harami:'하락잉태',
+  };
+  const hits = Object.keys(map).filter(k => row[k]).map(k => map[k]);
+  if (!hits.length) return '<span class="text-gray-300">-</span>';
+  return hits.map(h => `<span class="inline-block bg-gray-100 text-gray-700 rounded px-1 text-[10px] mr-0.5">${h}</span>`).join('');
+}
+async function loadIndicators() {
+  try {
+    const res  = await fetch('/api/indicators/latest?limit=300');
+    const json = await res.json();
+    const tbody = document.getElementById('indicators-body');
+    const data  = json.data || [];
+    if (data.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="17" class="text-center text-gray-400 py-6">지표 스냅샷 없음</td></tr>';
+      return;
+    }
+    tbody.innerHTML = data.map(r => `<tr>
+      <td class="font-mono text-xs">${r.symbol}</td>
+      <td>${marketBadge(r.market)}</td>
+      <td>${indFmt(r.close, 2)}</td>
+      <td>${indHistory(r)}</td>
+      <td>${indEma(r, 'ema20')}</td>
+      <td>${indEma(r, 'ema30')}</td>
+      <td>${indEma(r, 'ema60')}</td>
+      <td>${indEma(r, 'ema120')}</td>
+      <td>${indFmt(r.macd, 3)}</td>
+      <td>${indFmt(r.macd_signal, 3)}</td>
+      <td>${indFmt(r.macd_histogram, 3)}</td>
+      <td>${indCross(r)}</td>
+      <td class="text-left">${indPatterns(r)}</td>
+      <td>${r.volume_ratio == null ? '<span class="text-gray-300">-</span>' : (Number(r.volume_ratio).toFixed(2) + (r.volume_surge ? ' <span class="text-red-500">급증</span>' : ''))}</td>
+      <td>${indFmt(r.atr14)}</td>
+      <td>${indFmt(r.adx14)}</td>
+      <td>${indFmt(r.bollinger_bandwidth, 4)}</td>
+      <td>${r.ema30_pullback_candidate ? '<span class="text-red-600 font-semibold">후보</span>' : '<span class="text-gray-300">-</span>'}</td>
+    </tr>`).join('');
+  } catch(e) {
+    showToast('지표 모니터 오류: ' + e, 'error');
+  }
 }
 
 // ── AI 리포트 메인 로드 ──────────────────────────────────────
