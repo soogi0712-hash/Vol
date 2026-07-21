@@ -5,6 +5,7 @@ import watchlistRoute from './routes/watchlist'
 import tradingRoute from './routes/trading'
 import testRoute from './routes/api-test'
 import reportRoute from './routes/report'
+import indicatorsRoute from './routes/indicators'
 import { runTradeScan, isKRMarketOpen } from './lib/trade-engine'
 import { runFullDailyReport, getKSTDateStr } from './lib/report-engine'
 
@@ -27,6 +28,7 @@ app.route('/api/watchlist', watchlistRoute)
 app.route('/api/trading', tradingRoute)
 app.route('/api/test', testRoute)
 app.route('/api/report', reportRoute)
+app.route('/api/indicators', indicatorsRoute)
 
 // 시스템 설정 조회
 app.get('/api/config', async (c) => {

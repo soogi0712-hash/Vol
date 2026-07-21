@@ -36,6 +36,11 @@ import {
   getNextBatch, updateUniverseScanResult, loadUniverseToDB,
   type ExchangeName,
 } from './stock-universe';
+// 기술적 지표 (관찰/저장 전용) — 매매 판단과 완전히 분리된 모듈
+import {
+  buildIndicatorSnapshot, snapshotToRow, rowToBindings, INDICATOR_UPSERT_SQL,
+  type IndicatorSnapshot,
+} from './indicators';
 
 export interface TradeEnv {
   DB: D1Database;
@@ -291,6 +296,21 @@ export async function runTradeScan(env: TradeEnv): Promise<{
       await updateUniverseScanResult(env.DB, item.ticker, item.exchange, 'NO_DATA', qv.reason);
       await logTrade(env.DB, blankLog(item, 'NO_DATA', `[NO_DATA] ${qv.reason} (${qv.detail})`, closes.at(-1) ?? 0));
       return;
+    }
+
+    // ── 지표 스냅샷 (관찰/저장 전용) ─────────────────────────
+    // 확정봉 데이터로 지표 스냅샷을 계산·저장한다. 매매 신호 발생 여부와
+    // 무관하게 저장하며, getBBSignal 입력/출력·주문·수량에 전혀 관여하지 않는다.
+    // 실패는 종목 단위로 격리하고 구조화 로그를 남긴 뒤 스캔을 계속한다.
+    try {
+      const snap = buildIndicatorSnapshot(candles);
+      if (snap) await saveIndicatorSnapshot(env.DB, item.ticker, item.market, snap);
+    } catch (indErr) {
+      await logTrade(env.DB, blankLog(
+        item, 'INDICATOR_ERROR',
+        `[INDICATOR_ERROR] ${item.ticker}: ${indErr instanceof Error ? indErr.message : String(indErr)}`,
+        closes.at(-1) ?? 0,
+      ));
     }
 
     // ── 신호 판단 (원본 전략, 4-인자 호출 그대로) ────────────
@@ -556,6 +576,15 @@ async function saveOrder(db: D1Database, d: {
   ).bind(d.order_no, d.ticker, d.ticker_name, d.market, d.order_type,
          d.price, d.qty, d.status, d.reason, d.raw_response).run();
   return r.meta?.last_row_id as number;
+}
+
+// ⑦ 지표 스냅샷 저장 (관찰/저장 전용) — (market,symbol,candle_ts) UPSERT.
+// 반복 스캔은 갱신, 다른 봉 시각은 새 행으로 이력 보존. 매매 로직과 무관.
+async function saveIndicatorSnapshot(
+  db: D1Database, symbol: string, market: 'KR' | 'US', snap: IndicatorSnapshot,
+): Promise<void> {
+  const row = snapshotToRow(symbol, market, snap);
+  await db.prepare(INDICATOR_UPSERT_SQL).bind(...rowToBindings(row)).run();
 }
 
 function sleep(ms: number): Promise<void> {
