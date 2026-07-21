@@ -17,9 +17,13 @@ function genCandles(n: number, base = 100): IndicatorCandle[] {
     };
   });
 }
-function storeDeps(store: InMemorySnapshotStore) {
+function storeDeps(store: InMemorySnapshotStore, throttleMinHistoryCount = 120) {
   return {
-    snapshotExists: async (m: string, s: string, t: string) => !!store.get(m, s, t),
+    throttleMinHistoryCount,
+    existingHistoryCount: async (m: string, s: string, t: string) => {
+      const r = store.get(m, s, t);
+      return r ? Number(r.history_count) : null;
+    },
     saveSnapshot: async (s: string, m: string, snap: any) => { store.upsert(snapshotToRow(s, m, snap)); },
   };
 }
@@ -81,7 +85,8 @@ describe('updateIndicatorSnapshot — 제너릭 오케스트레이션', () => {
     const res = await updateIndicatorSnapshot({
       market: 'US', symbol: 'AAPL',
       tradingCompletedTs: '20260101000129',
-      snapshotExists: async () => false,
+      throttleMinHistoryCount: 120,
+      existingHistoryCount: async () => null,
       loadCandles: async () => { throw new Error('조회 실패'); },
       saveSnapshot: save,
     });
@@ -94,7 +99,8 @@ describe('updateIndicatorSnapshot — 제너릭 오케스트레이션', () => {
     const res = await updateIndicatorSnapshot({
       market: 'US', symbol: 'AAPL',
       tradingCompletedTs: '20260101000129',
-      snapshotExists: async () => false,
+      throttleMinHistoryCount: 120,
+      existingHistoryCount: async () => null,
       loadCandles: async () => genCandles(130),
       saveSnapshot: async () => { throw new Error('D1 write 실패'); },
     });
@@ -123,7 +129,8 @@ describe('updateIndicatorSnapshot — 제너릭 오케스트레이션', () => {
     const res = await updateIndicatorSnapshot({
       market: 'US', symbol: 'AAPL',
       tradingCompletedTs: null,
-      snapshotExists: async () => false,
+      throttleMinHistoryCount: 120,
+      existingHistoryCount: async () => null,
       loadCandles: async () => { throw new Error('호출되면 안 됨'); },
       saveSnapshot: async () => {},
     });

@@ -39,8 +39,8 @@ import {
 // 기술적 지표 (관찰/저장 전용) — 매매 판단과 완전히 분리된 모듈
 import {
   updateIndicatorSnapshot, dropForming, snapshotToRow, rowToBindings, INDICATOR_UPSERT_SQL,
-  INDICATOR_DEFAULT_DEPTH, INDICATOR_MIN_DEPTH,
-  accumulateAndLoadKRCandles, CANDLE_HISTORY_UPSERT_SQL, candleHistoryBindings,
+  INDICATOR_DEFAULT_DEPTH, INDICATOR_MIN_DEPTH, SNAPSHOT_COMPLETE_HISTORY,
+  accumulateKRHistory, CANDLE_HISTORY_UPSERT_SQL, candleHistoryBindings,
   type IndicatorSnapshot, type IndicatorCandle,
 } from './indicators';
 
@@ -310,24 +310,38 @@ export async function runTradeScan(env: TradeEnv): Promise<{
     // ── 지표 스냅샷 (관찰/저장 전용) ─────────────────────────
     // 매매용 raw/candles/closes 와 getBBSignal 입력에는 전혀 관여하지 않는다.
     // KR: 국내 15분봉은 추가 KIS 요청으로 장기 이력을 얻을 수 없으므로, 매매가
-    //     이미 가져온 확정봉(candles)을 candle_history 에 누적한 뒤 최근 N개를
-    //     D1 에서 읽어 계산한다 → KR 추가 KIS 요청 0.
+    //     이미 가져온 확정봉(candles)을 candle_history 에 누적한다.
+    //     ★ 누적은 스냅샷 스로틀과 분리되어 매 스캔 실행된다 (스냅샷이 이미 있어도 계속).
+    const indTs = candles.at(-1)?.datetime ?? null;
+    if (isKR) {
+      const acc = await accumulateKRHistory({
+        market: item.market, symbol: item.ticker,
+        confirmedCandles: candles,   // 매매 확정봉 재사용 (형성봉 제외됨)
+        upsert: (m, s, cs) => upsertCandleHistory(env.DB, m, s, cs),
+      });
+      if (acc.status === 'error') {
+        await logTrade(env.DB, blankLog(
+          item, 'INDICATOR_ERROR',
+          `[INDICATOR_ERROR] ${item.market}/${item.ticker} @${indTs ?? '-'} [history_upsert] ${acc.message}`,
+          closes.at(-1) ?? 0,
+        ));
+      }
+    }
+
+    // 스냅샷 계산/저장 (관찰 전용).
+    // KR: candle_history 에서 최근 N개를 읽어 계산 (추가 KIS 요청 0).
     // US: NREC 최대 200 확장 조회 후 형성봉 제거 (기존 유지).
-    // 스로틀: 동일 완결봉 스냅샷이 이미 있으면 로드/재계산을 건너뛴다.
+    // 스로틀: 이미 "충분히 누적된"(>=120, KR) 스냅샷만 건너뛴다 → 이력 부족 스냅샷은
+    //   이후 이력이 쌓이면 self-heal 재계산. US=0 → 스냅샷 있으면 항상 스로틀(재조회 방지).
     // 실패는 완전히 격리된다(예외 미전파) — 매매는 이미 조회한 원본 캔들로 계속.
     const indResult = await updateIndicatorSnapshot({
       market: item.market,
       symbol: item.ticker,
-      tradingCompletedTs: candles.at(-1)?.datetime ?? null,
-      snapshotExists: (m, s, t) => indicatorSnapshotExists(env.DB, m, s, t),
+      tradingCompletedTs: indTs,
+      existingHistoryCount: (m, s, t) => getSnapshotHistoryCount(env.DB, m, s, t),
+      throttleMinHistoryCount: isKR ? SNAPSHOT_COMPLETE_HISTORY : 0,
       loadCandles: isKR
-        ? () => accumulateAndLoadKRCandles({
-            market: item.market, symbol: item.ticker,
-            confirmedCandles: candles,   // 매매 확정봉 재사용 (형성봉 제외됨)
-            upsert: (m, s, cs) => upsertCandleHistory(env.DB, m, s, cs),
-            readLatest: (m, s, limit) => readCandleHistory(env.DB, m, s, limit),
-            limit: INDICATOR_CANDLE_CNT,
-          })
+        ? () => readCandleHistory(env.DB, item.market, item.ticker, INDICATOR_CANDLE_CNT)
         : async () => dropForming(
             await getUS15MinCandles(kisConfig, token, item.ticker, INDICATOR_CANDLE_CNT, exCode),
           ),
@@ -336,7 +350,7 @@ export async function runTradeScan(env: TradeEnv): Promise<{
     if (indResult.status === 'error') {
       await logTrade(env.DB, blankLog(
         item, 'INDICATOR_ERROR',
-        `[INDICATOR_ERROR] ${item.market}/${item.ticker} @${candles.at(-1)?.datetime ?? '-'} [${indResult.stage}] ${indResult.message}`,
+        `[INDICATOR_ERROR] ${item.market}/${item.ticker} @${indTs ?? '-'} [${indResult.stage}] ${indResult.message}`,
         closes.at(-1) ?? 0,
       ));
     }
@@ -615,14 +629,15 @@ async function saveIndicatorSnapshot(
   await db.prepare(INDICATOR_UPSERT_SQL).bind(...rowToBindings(row)).run();
 }
 
-// 지표 스냅샷 스로틀용 존재 확인 — 동일 완결봉이면 로드/재계산을 건너뛴다.
-async function indicatorSnapshotExists(
+// 지표 스냅샷 스로틀용 — 동일 완결봉 스냅샷의 history_count 조회 (없으면 null).
+// "충분히 누적된" 스냅샷만 스로틀하기 위해 존재 여부가 아니라 누적 캔들 수를 본다.
+async function getSnapshotHistoryCount(
   db: D1Database, market: string, symbol: string, candleTs: string,
-): Promise<boolean> {
+): Promise<number | null> {
   const row = await db.prepare(
-    `SELECT 1 AS x FROM indicator_snapshots WHERE market=? AND symbol=? AND candle_ts=? LIMIT 1`
-  ).bind(market, symbol, candleTs).first<{ x: number }>();
-  return !!row;
+    `SELECT history_count AS hc FROM indicator_snapshots WHERE market=? AND symbol=? AND candle_ts=? LIMIT 1`
+  ).bind(market, symbol, candleTs).first<{ hc: number }>();
+  return row ? Number(row.hc) : null;
 }
 
 // 확정 캔들 이력 UPSERT (관찰 전용) — 형성봉은 호출 측이 이미 제거함.

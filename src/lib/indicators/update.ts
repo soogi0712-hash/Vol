@@ -22,6 +22,10 @@ import type { IndicatorCandle, IndicatorSnapshot } from './types';
 export const INDICATOR_DEFAULT_DEPTH = 150;
 export const INDICATOR_MIN_DEPTH = 121;
 
+// 스냅샷이 "충분히 누적됨"으로 간주되는 완결봉 수 (EMA120 요구치).
+// 이 수 미만으로 저장된 스냅샷은 스로틀하지 않고 재계산해 self-heal 한다.
+export const SNAPSHOT_COMPLETE_HISTORY = 120;
+
 /** 형성 중(미확정) 최신봉 1개를 제거해 완결봉만 남긴다 (오래→최신 유지). */
 export function dropForming<T>(candles: readonly T[]): T[] {
   return candles.length > 1 ? candles.slice(0, -1) : candles.slice();
@@ -34,8 +38,17 @@ export interface IndicatorUpdateDeps {
   symbol: string;
   /** 매매 확정봉의 시각 — 스로틀 키. null 이면 스킵. */
   tradingCompletedTs: string | null;
-  /** (market,symbol,candle_ts) 스냅샷 존재 여부 */
-  snapshotExists: (market: string, symbol: string, candleTs: string) => Promise<boolean>;
+  /**
+   * 기존 스냅샷의 history_count 를 반환한다 (없으면 null).
+   * 스로틀은 "충분히 누적된" 스냅샷만 건너뛰도록 이 값을 사용한다.
+   */
+  existingHistoryCount: (market: string, symbol: string, candleTs: string) => Promise<number | null>;
+  /**
+   * 이 값 이상으로 누적된 스냅샷이 이미 있으면 재계산을 건너뛴다(스로틀).
+   * KR=120(EMA120 요구치) → 이력 부족 스냅샷은 이후 self-heal 재계산.
+   * US=0 → 스냅샷이 있으면 항상 스로틀(불필요한 재조회 방지).
+   */
+  throttleMinHistoryCount: number;
   /** 완결봉(oldest→newest) 로드 — 시장별 소스 주입 */
   loadCandles: () => Promise<IndicatorCandle[]>;
   /** 스냅샷 저장 (UPSERT) */
@@ -60,9 +73,12 @@ export async function updateIndicatorSnapshot(
 ): Promise<IndicatorUpdateResult> {
   if (!deps.tradingCompletedTs) return { status: 'skipped_no_candle' };
 
-  // 스로틀: 같은 완결봉이면 로드조차 하지 않는다 (KR: 추가 KIS 요청 없음)
+  // 스로틀: 같은 완결봉의 스냅샷이 "충분히 누적된" 상태로 이미 있을 때만 건너뛴다.
+  // 이력 부족(history_count < throttleMinHistoryCount)으로 저장된 스냅샷은
+  // 스로틀하지 않고 재계산 → 이후 이력이 쌓이면 self-heal 된다.
   try {
-    if (await deps.snapshotExists(deps.market, deps.symbol, deps.tradingCompletedTs)) {
+    const existing = await deps.existingHistoryCount(deps.market, deps.symbol, deps.tradingCompletedTs);
+    if (existing !== null && existing >= deps.throttleMinHistoryCount) {
       return { status: 'skipped_throttled' };
     }
   } catch (e) {

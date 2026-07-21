@@ -36,34 +36,28 @@ export function candleHistoryBindings(
   return [market, symbol, c.datetime, c.open, c.high, c.low, c.close, c.volume];
 }
 
-export interface KRCandleAccumulateDeps {
+export interface KRAccumulateDeps {
   market: string;
   symbol: string;
   /** 매매 확정봉 (형성봉 제외됨). 이력에 누적 저장할 대상. */
   confirmedCandles: readonly IndicatorCandle[];
   /** 이력 UPSERT */
   upsert: (market: string, symbol: string, candles: readonly IndicatorCandle[]) => Promise<void>;
-  /** 최근 limit 개를 oldest→newest 로 조회 */
-  readLatest: (market: string, symbol: string, limit: number) => Promise<IndicatorCandle[]>;
-  limit: number;
 }
 
+export type KRAccumulateResult = { status: 'ok' } | { status: 'error'; message: string };
+
 /**
- * KR 지표용 캔들 로더 — 확정봉을 이력에 누적한 뒤 최근 limit 개를 읽어 반환한다.
- * 추가 KIS 요청을 하지 않는다. 단계별로 실패 원인을 태깅해 던진다(호출 측 격리).
+ * KR 확정봉을 candle_history 에 누적한다 (읽기/계산과 분리).
+ * ── 스냅샷 스로틀과 무관하게 매 스캔 호출된다 → 스냅샷이 이미 있어도 누적은 계속.
+ * 절대 예외를 던지지 않는다. 실패는 status='error' 로 보고하고 호출 측이 로깅·계속.
  */
-export async function accumulateAndLoadKRCandles(
-  deps: KRCandleAccumulateDeps,
-): Promise<IndicatorCandle[]> {
+export async function accumulateKRHistory(deps: KRAccumulateDeps): Promise<KRAccumulateResult> {
   try {
     await deps.upsert(deps.market, deps.symbol, deps.confirmedCandles);
+    return { status: 'ok' };
   } catch (e) {
-    throw new Error(`candle_history upsert: ${e instanceof Error ? e.message : String(e)}`);
-  }
-  try {
-    return await deps.readLatest(deps.market, deps.symbol, deps.limit);
-  } catch (e) {
-    throw new Error(`candle_history read: ${e instanceof Error ? e.message : String(e)}`);
+    return { status: 'error', message: `candle_history upsert: ${e instanceof Error ? e.message : String(e)}` };
   }
 }
 
