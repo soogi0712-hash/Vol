@@ -78,3 +78,9 @@ CREATE INDEX IF NOT EXISTS idx_indicator_snap_ts
   ON indicator_snapshots (candle_ts DESC);
 CREATE INDEX IF NOT EXISTS idx_indicator_snap_symbol_only
   ON indicator_snapshots (symbol);
+
+-- 지표(관찰 전용) 확장 조회 깊이 — 매매용 캔들 수(CANDLE_CNT)와 완전히 별개.
+-- EMA120 산출을 위해 완결봉 120개(raw 최소 121개)가 필요하므로 기본 150.
+-- 값은 121~200 범위로 클램프된다 (KIS 해외 NREC 최대 200).
+INSERT OR IGNORE INTO system_config (key, value, description)
+VALUES ('indicator_candle_cnt', '150', '지표 스냅샷용 확장 캔들 조회 깊이 (관찰 전용, 매매와 무관)');

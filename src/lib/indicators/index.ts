@@ -12,6 +12,11 @@ export { computeADX } from './adx';
 export { computeBollingerBandwidth } from './bollinger-bandwidth';
 export { buildIndicatorSnapshot, computeSnapshotSeries, type SnapshotOptions } from './snapshot';
 export {
+  updateIndicatorSnapshot, dropForming,
+  INDICATOR_DEFAULT_DEPTH, INDICATOR_MIN_DEPTH,
+  type IndicatorUpdateDeps, type IndicatorUpdateResult,
+} from './update';
+export {
   INDICATOR_TABLE, SNAPSHOT_COLUMNS, SNAPSHOT_KEY_COLUMNS,
   INDICATOR_UPSERT_SQL, buildUpsertSQL, snapshotToRow, rowToBindings,
   snapshotKey, InMemorySnapshotStore,

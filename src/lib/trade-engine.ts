@@ -38,7 +38,8 @@ import {
 } from './stock-universe';
 // 기술적 지표 (관찰/저장 전용) — 매매 판단과 완전히 분리된 모듈
 import {
-  buildIndicatorSnapshot, snapshotToRow, rowToBindings, INDICATOR_UPSERT_SQL,
+  updateIndicatorSnapshot, snapshotToRow, rowToBindings, INDICATOR_UPSERT_SQL,
+  INDICATOR_DEFAULT_DEPTH, INDICATOR_MIN_DEPTH,
   type IndicatorSnapshot,
 } from './indicators';
 
@@ -187,7 +188,8 @@ export async function runTradeScan(env: TradeEnv): Promise<{
     `SELECT key, value FROM system_config
      WHERE key IN (
        'auto_trade_enabled','kr_trade_enabled','us_trade_enabled',
-       'scan_batch_size','scan_kr_enabled','scan_us_enabled'
+       'scan_batch_size','scan_kr_enabled','scan_us_enabled',
+       'indicator_candle_cnt'
      )`
   ).all<{ key: string; value: string }>();
   const cfgMap: Record<string, string> = {};
@@ -243,6 +245,12 @@ export async function runTradeScan(env: TradeEnv): Promise<{
   const BB_STDDEV  = 2;
   // 확정봉 1개 제거 후에도 충분한 봉 수 확보를 위해 1개 더 조회
   const CANDLE_CNT = 41;
+  // 지표(관찰 전용) 확장 조회 깊이 — 매매용 CANDLE_CNT 와 완전히 별개.
+  // EMA120(완결봉 120개) 산출을 위해 raw 최소 121개, 기본 150개(설정 가능).
+  const INDICATOR_CANDLE_CNT = Math.min(200, Math.max(
+    INDICATOR_MIN_DEPTH,
+    parseInt(cfgMap['indicator_candle_cnt'] || String(INDICATOR_DEFAULT_DEPTH)) || INDICATOR_DEFAULT_DEPTH,
+  ));
 
   const krTradeEnabled = cfgMap['kr_trade_enabled'] === '1';
   const usTradeEnabled = cfgMap['us_trade_enabled'] === '1';
@@ -298,17 +306,27 @@ export async function runTradeScan(env: TradeEnv): Promise<{
       return;
     }
 
-    // ── 지표 스냅샷 (관찰/저장 전용) ─────────────────────────
-    // 확정봉 데이터로 지표 스냅샷을 계산·저장한다. 매매 신호 발생 여부와
-    // 무관하게 저장하며, getBBSignal 입력/출력·주문·수량에 전혀 관여하지 않는다.
-    // 실패는 종목 단위로 격리하고 구조화 로그를 남긴 뒤 스캔을 계속한다.
-    try {
-      const snap = buildIndicatorSnapshot(candles);
-      if (snap) await saveIndicatorSnapshot(env.DB, item.ticker, item.market, snap);
-    } catch (indErr) {
+    // ── 지표 스냅샷 (관찰/저장 전용, 별도 확장 조회 + 스로틀) ──
+    // 매매용 raw/candles/closes 와 getBBSignal 입력에는 전혀 관여하지 않는다.
+    // EMA120 까지 산출하려면 완결봉 120개가 필요하므로, 매매용(CANDLE_CNT)과
+    // 별개로 INDICATOR_CANDLE_CNT 깊이의 "관찰 전용" 캔들을 조회한다.
+    // 스로틀: 매매 확정봉과 동일한 완결봉의 스냅샷이 이미 있으면 확장 조회를
+    // 건너뛴다 → 분당 스캔이 반복돼도 15분봉당 확장 조회는 1회.
+    // 실패는 완전히 격리된다(예외 미전파) — 매매는 이미 조회한 원본 캔들로 계속.
+    const indResult = await updateIndicatorSnapshot({
+      market: item.market,
+      symbol: item.ticker,
+      tradingCompletedTs: candles.at(-1)?.datetime ?? null,
+      snapshotExists: (m, s, t) => indicatorSnapshotExists(env.DB, m, s, t),
+      fetchExtendedCandles: () => isKR
+        ? getKR15MinCandles(kisConfig, token, item.ticker, INDICATOR_CANDLE_CNT)
+        : getUS15MinCandles(kisConfig, token, item.ticker, INDICATOR_CANDLE_CNT, exCode),
+      saveSnapshot: (s, m, snap) => saveIndicatorSnapshot(env.DB, s, m as 'KR' | 'US', snap),
+    });
+    if (indResult.status === 'error') {
       await logTrade(env.DB, blankLog(
         item, 'INDICATOR_ERROR',
-        `[INDICATOR_ERROR] ${item.ticker}: ${indErr instanceof Error ? indErr.message : String(indErr)}`,
+        `[INDICATOR_ERROR] ${item.ticker}: ${indResult.message}`,
         closes.at(-1) ?? 0,
       ));
     }
@@ -585,6 +603,16 @@ async function saveIndicatorSnapshot(
 ): Promise<void> {
   const row = snapshotToRow(symbol, market, snap);
   await db.prepare(INDICATOR_UPSERT_SQL).bind(...rowToBindings(row)).run();
+}
+
+// 지표 스냅샷 스로틀용 존재 확인 — 동일 완결봉이면 확장 조회를 건너뛴다.
+async function indicatorSnapshotExists(
+  db: D1Database, market: string, symbol: string, candleTs: string,
+): Promise<boolean> {
+  const row = await db.prepare(
+    `SELECT 1 AS x FROM indicator_snapshots WHERE market=? AND symbol=? AND candle_ts=? LIMIT 1`
+  ).bind(market, symbol, candleTs).first<{ x: number }>();
+  return !!row;
 }
 
 function sleep(ms: number): Promise<void> {
