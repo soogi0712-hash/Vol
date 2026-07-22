@@ -1,24 +1,47 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "bollinger-trader",
+
+  // ── Worker-native 엔트리 ──────────────────────────────────────
+  // @hono/vite-build/cloudflare-workers 가 src/index.tsx 의 default export
+  // { fetch, scheduled } 를 감싸 dist/index.js 로 번들한다 (scheduled 보존).
+  "main": "dist/index.js",
   "compatibility_date": "2026-04-26",
-  "pages_build_output_dir": "./dist",
   "compatibility_flags": ["nodejs_compat"],
 
+  // ── 정적 자산 (대시보드) ──────────────────────────────────────
+  // public/ 의 index.html, static/* 를 Workers Static Assets 로 서빙한다.
+  // 매칭 자산은 Worker fetch 이전에 서빙되고, 미매칭(/api/*)은 Worker 로 전달.
+  // 워커 번들(dist/index.js)은 public/ 밖이라 자산으로 노출되지 않는다.
+  "assets": {
+    "directory": "./public",
+    "not_found_handling": "none"
+  },
+
+  "observability": { "enabled": true },
+
+  // ── D1 바인딩 (이름은 정확히 DB) ──────────────────────────────
+  // KV는 옵셔널(KV?: KVNamespace) — 없으면 토큰 캐시 없이 동작하므로 미바인딩.
+  // database_id 는 프로덕션 D1 생성 후 배포 시점에 주입한다(소스 미커밋).
   "d1_databases": [
     {
       "binding": "DB",
       "database_name": "bollinger-trader-production",
-      "database_id": "placeholder-will-be-updated-after-create"
+      "database_id": ""
     }
   ],
 
-  // KV 바인딩: gsk hosted deploy 파이프라인은 KV를 지원하지 않아 제거
-  // 코드에서 KV는 옵셔널 (KV?: KVNamespace) — 없으면 토큰 캐시 없이 동작
-  // "kv_namespaces": [{ "binding": "KV", ... }],
-
+  // ── Cron 트리거 (UTC) — KR/US 분리, 분당 실행 ─────────────────
+  // KR:  UTC 00:00–06:59 월–금  = KST 09:00–15:59 (장 09:00–15:30, 리포트 06:35 UTC 포함)
+  // US:  UTC 09:00–23:59 월–금  + 토 00:00–00:59 (금요일 세션 꼬리)
+  //      US 세션 꼬리(화–금 00:00–00:59 UTC)는 KR 트리거 범위에 포함되며
+  //      runTradeScan 의 isUSMarketOpen 내부 판정으로 US 도 스캔된다(중복 실행 방지).
+  // 세 표현식은 시/요일이 서로소 → 같은 분에 중복 발화하지 않는다.
   "triggers": {
-    "crons": ["* 0-6 * * 1-5"]
+    "crons": [
+      "* 0-6 * * 1-5",
+      "* 9-23 * * 1-5",
+      "* 0 * * 6"
+    ]
   }
-  // cron: 매분 실행, 월~금 UTC 00:00~06:30 = KST 09:00~15:30
 }
