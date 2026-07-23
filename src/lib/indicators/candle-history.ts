@@ -12,10 +12,10 @@ import type { IndicatorCandle } from './types';
 export const CANDLE_HISTORY_TABLE = 'candle_history';
 
 export const CANDLE_HISTORY_COLUMNS = [
-  'market', 'symbol', 'candle_ts', 'open', 'high', 'low', 'close', 'volume',
+  'market', 'symbol', 'timeframe', 'candle_ts', 'open', 'high', 'low', 'close', 'volume',
 ] as const;
 
-/** (market,symbol,candle_ts) 기준 UPSERT SQL. */
+/** (market,symbol,timeframe,candle_ts) 기준 UPSERT SQL. */
 export function buildCandleHistoryUpsertSQL(): string {
   const cols = CANDLE_HISTORY_COLUMNS.join(', ');
   const ph = CANDLE_HISTORY_COLUMNS.map(() => '?').join(', ');
@@ -23,7 +23,7 @@ export function buildCandleHistoryUpsertSQL(): string {
     .map(c => `${c}=excluded.${c}`).join(', ');
   return (
     `INSERT INTO ${CANDLE_HISTORY_TABLE} (${cols}) VALUES (${ph}) ` +
-    `ON CONFLICT(market, symbol, candle_ts) DO UPDATE SET ${upd}, updated_at=CURRENT_TIMESTAMP`
+    `ON CONFLICT(market, symbol, timeframe, candle_ts) DO UPDATE SET ${upd}, updated_at=CURRENT_TIMESTAMP`
   );
 }
 
@@ -31,9 +31,9 @@ export const CANDLE_HISTORY_UPSERT_SQL = buildCandleHistoryUpsertSQL();
 
 /** 한 캔들의 바인딩 값 (CANDLE_HISTORY_COLUMNS 순서). */
 export function candleHistoryBindings(
-  market: string, symbol: string, c: IndicatorCandle,
+  market: string, symbol: string, timeframe: string, c: IndicatorCandle,
 ): (string | number)[] {
-  return [market, symbol, c.datetime, c.open, c.high, c.low, c.close, c.volume];
+  return [market, symbol, timeframe, c.datetime, c.open, c.high, c.low, c.close, c.volume];
 }
 
 export interface KRAccumulateDeps {
@@ -65,29 +65,29 @@ export async function accumulateKRHistory(deps: KRAccumulateDeps): Promise<KRAcc
  * 인메모리 캔들 이력 — 실제 D1 UPSERT/조회와 동일한 키/정렬 의미를 재현(테스트용).
  */
 export class InMemoryCandleHistory {
-  private m = new Map<string, IndicatorCandle & { market: string; symbol: string }>();
-  private key(market: string, symbol: string, ts: string): string {
-    return `${market}|${symbol}|${ts}`;
+  private m = new Map<string, IndicatorCandle & { market: string; symbol: string; timeframe: string }>();
+  private key(market: string, symbol: string, timeframe: string, ts: string): string {
+    return `${market}|${symbol}|${timeframe}|${ts}`;
   }
 
-  async upsert(market: string, symbol: string, candles: readonly IndicatorCandle[]): Promise<void> {
+  async upsert(market: string, symbol: string, candles: readonly IndicatorCandle[], timeframe = '15m'): Promise<void> {
     for (const c of candles) {
-      this.m.set(this.key(market, symbol, c.datetime), { market, symbol, ...c });
+      this.m.set(this.key(market, symbol, timeframe, c.datetime), { market, symbol, timeframe, ...c });
     }
   }
 
   /** 최근 limit 개를 oldest→newest 로 반환 */
-  async readLatest(market: string, symbol: string, limit: number): Promise<IndicatorCandle[]> {
+  async readLatest(market: string, symbol: string, limit: number, timeframe = '15m'): Promise<IndicatorCandle[]> {
     const rows = [...this.m.values()]
-      .filter(r => r.market === market && r.symbol === symbol)
+      .filter(r => r.market === market && r.symbol === symbol && r.timeframe === timeframe)
       .sort((a, b) => a.datetime.localeCompare(b.datetime));
     return rows.slice(-limit).map(r => ({
       datetime: r.datetime, open: r.open, high: r.high, low: r.low, close: r.close, volume: r.volume,
     }));
   }
 
-  count(market: string, symbol: string): number {
-    return [...this.m.values()].filter(r => r.market === market && r.symbol === symbol).length;
+  count(market: string, symbol: string, timeframe = '15m'): number {
+    return [...this.m.values()].filter(r => r.market === market && r.symbol === symbol && r.timeframe === timeframe).length;
   }
 
   get size(): number {

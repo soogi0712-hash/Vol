@@ -660,23 +660,23 @@ async function getSnapshotHistoryCount(
   return row ? Number(row.hc) : null;
 }
 
-// 확정 캔들 이력 UPSERT (관찰 전용) — 형성봉은 호출 측이 이미 제거함.
+// 확정 캔들 이력 UPSERT (관찰 전용) — 형성봉은 호출 측이 이미 제거함. timeframe 명시.
 async function upsertCandleHistory(
-  db: D1Database, market: string, symbol: string, candles: readonly IndicatorCandle[],
+  db: D1Database, market: string, symbol: string, candles: readonly IndicatorCandle[], timeframe = '15m',
 ): Promise<void> {
   if (!candles.length) return;
   const stmt = db.prepare(CANDLE_HISTORY_UPSERT_SQL);
-  await db.batch(candles.map(c => stmt.bind(...candleHistoryBindings(market, symbol, c))));
+  await db.batch(candles.map(c => stmt.bind(...candleHistoryBindings(market, symbol, timeframe, c))));
 }
 
-// 확정 캔들 이력에서 최근 limit 개를 oldest→newest 로 읽는다.
+// 확정 캔들 이력에서 최근 limit 개를 oldest→newest 로 읽는다 (timeframe 필터).
 async function readCandleHistory(
-  db: D1Database, market: string, symbol: string, limit: number,
+  db: D1Database, market: string, symbol: string, limit: number, timeframe = '15m',
 ): Promise<IndicatorCandle[]> {
   const rows = await db.prepare(
     `SELECT candle_ts, open, high, low, close, volume FROM candle_history
-     WHERE market=? AND symbol=? ORDER BY candle_ts DESC LIMIT ?`
-  ).bind(market, symbol, limit).all<{
+     WHERE market=? AND symbol=? AND timeframe=? ORDER BY candle_ts DESC LIMIT ?`
+  ).bind(market, symbol, timeframe, limit).all<{
     candle_ts: string; open: number; high: number; low: number; close: number; volume: number;
   }>();
   // DESC 로 읽은 최근 N개를 oldest→newest 로 재정렬

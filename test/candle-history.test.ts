@@ -208,16 +208,16 @@ describe('J. look-ahead 없음 (KR)', () => {
 
 // ── SQL/바인딩 스모크 ────────────────────────────────────────
 describe('candle_history SQL/바인딩', () => {
-  it('UPSERT SQL 은 (market,symbol,candle_ts) 충돌에 OHLCV 갱신', () => {
+  it('UPSERT SQL 은 (market,symbol,timeframe,candle_ts) 충돌에 OHLCV 갱신', () => {
     const sql = buildCandleHistoryUpsertSQL();
-    expect(sql).toContain('ON CONFLICT(market, symbol, candle_ts) DO UPDATE');
+    expect(sql).toContain('ON CONFLICT(market, symbol, timeframe, candle_ts) DO UPDATE');
     expect(sql).toContain('close=excluded.close');
     expect(sql).toContain('updated_at=CURRENT_TIMESTAMP');
   });
-  it('바인딩은 컬럼 순서와 일치', () => {
+  it('바인딩은 컬럼 순서와 일치 (timeframe 포함)', () => {
     const c = genCandles(1)[0];
-    expect(candleHistoryBindings('KR', '005930', c)).toEqual([
-      'KR', '005930', c.datetime, c.open, c.high, c.low, c.close, c.volume,
+    expect(candleHistoryBindings('KR', '005930', '15m', c)).toEqual([
+      'KR', '005930', '15m', c.datetime, c.open, c.high, c.low, c.close, c.volume,
     ]);
   });
 });

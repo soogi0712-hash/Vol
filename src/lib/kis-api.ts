@@ -144,6 +144,44 @@ export async function getKR15MinCandles(
     .slice(-count);
 }
 
+// ─── 국내주식 1분봉 한 페이지 (Phase 1: 역방향 페이징용) ──────
+// FHKST03010200 는 endHHMMSS 기준 과거 최대 30개 1분봉을 반환한다.
+// ★ 고정 '153000' 제거: 호출측이 유효(비-미래) 시각(HHMMSS)을 전달해야 한다.
+//   미래 시각을 넣으면 전 봉이 현재가로 반환되는 KIS 동작을 피한다.
+export async function fetchKR1MinPage(
+  cfg: KISConfig, token: string, ticker: string, endHHMMSS: string,
+): Promise<Candle[]> {
+  const params = new URLSearchParams({
+    fid_etc_cls_code: '',
+    fid_cond_mrkt_div_code: 'J',
+    fid_input_iscd: ticker,
+    fid_input_hour_1: endHHMMSS,
+    fid_pw_data_incu_yn: 'N',
+  });
+  const res = await fetch(
+    `${KIS_BASE}/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice?${params}`,
+    { headers: kis_headers(cfg, token, 'FHKST03010200') },
+  );
+  if (!res.ok) throw new Error(`KR 1min Error ${res.status}: ${await res.text()}`);
+  const data = await res.json() as {
+    rt_cd: string; msg1: string;
+    output2: Array<{
+      stck_bsop_date: string; stck_cntg_hour: string;
+      stck_oprc: string; stck_hgpr: string; stck_lwpr: string; stck_prpr: string; cntg_vol: string;
+    }>;
+  };
+  if (data.rt_cd !== '0') throw new Error(`KIS KR 1min [${ticker}]: ${data.msg1}`);
+  return (data.output2 || [])
+    .map(d => ({
+      ticker, market: 'KR' as const,
+      datetime: d.stck_bsop_date + d.stck_cntg_hour.padStart(6, '0'),
+      open: parseFloat(d.stck_oprc), high: parseFloat(d.stck_hgpr),
+      low: parseFloat(d.stck_lwpr), close: parseFloat(d.stck_prpr),
+      volume: parseFloat(d.cntg_vol),
+    }))
+    .filter(c => Number.isFinite(c.close));
+}
+
 // ─── 국내주식 현재가 ─────────────────────────────────────────
 export async function getKRPrice(cfg: KISConfig, token: string, ticker: string): Promise<number> {
   const params = new URLSearchParams({ fid_cond_mrkt_div_code: 'J', fid_input_iscd: ticker });
