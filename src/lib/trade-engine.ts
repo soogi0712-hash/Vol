@@ -190,7 +190,7 @@ export async function runTradeScan(env: TradeEnv): Promise<{
      WHERE key IN (
        'auto_trade_enabled','kr_trade_enabled','us_trade_enabled',
        'scan_batch_size','scan_kr_enabled','scan_us_enabled',
-       'indicator_candle_cnt'
+       'indicator_candle_cnt','observe_only_enabled'
      )`
   ).all<{ key: string; value: string }>();
   const cfgMap: Record<string, string> = {};
@@ -257,6 +257,9 @@ export async function runTradeScan(env: TradeEnv): Promise<{
   const usTradeEnabled = cfgMap['us_trade_enabled'] === '1';
   const krScanEnabled  = cfgMap['scan_kr_enabled'] === '1';
   const usScanEnabled  = cfgMap['scan_us_enabled'] === '1';
+  // 관찰 전용 모드 — auto_trade_enabled=1 로 스캔은 하되 실주문만 차단한다.
+  // 매수/매도 결정·수량·사이징은 원본 그대로 계산되며, 최종 주문 호출만 스킵한다.
+  const observeOnly    = cfgMap['observe_only_enabled'] === '1';
 
   let scanned = 0;
   const batchInfoParts: string[] = [];
@@ -395,6 +398,15 @@ export async function runTradeScan(env: TradeEnv): Promise<{
         await logTrade(env.DB, blankLog(item, 'BUY_SKIP', `[BUY_SKIP] 잔고부족 (필요 ${need.toFixed(0)} > 가용 ${bal.toFixed(0)})`, price));
         return;
       }
+      // ── 관찰 전용: 실주문 경계에서 차단 (buyKR/buyUS 미호출) ──
+      // 결정/수량/사이징은 위에서 원본 그대로 계산됨. 여기서 주문만 스킵하고,
+      // 시뮬레이션 액션을 기록한다. 보유/체결주문/실현손익은 만들지 않는다.
+      if (observeOnly) {
+        await logTrade(env.DB, blankLog(item, 'OBSERVE_ONLY_BUY',
+          `[OBSERVE_ONLY_BUY] ${item.market} ${item.ticker} signal=BUY qty=${qty} price=${price} reason=BB_BUY (${signal.reason})`, price));
+        actions.push(`[관찰:${item.market}매수] ${item.ticker} ${item.ticker_name} ${qty}주 @${price} (실주문 없음)`);
+        return;
+      }
       const res = isKR
         ? await buyKR(kisConfig, token, item.ticker, qty)
         : await buyUS(kisConfig, token, item.ticker, qty, exCode);
@@ -411,6 +423,14 @@ export async function runTradeScan(env: TradeEnv): Promise<{
 
     // ── 매도 (원본: 상단돌파 후 하락) ────────────────────────
     if (signal.action === 'SELL' && holdRow && holdRow.qty > 0) {
+      // ── 관찰 전용: 실주문 경계에서 차단 (sellKR/sellUS 미호출) ──
+      // 보유 삭제·실현손익·체결주문을 만들지 않는다. 시뮬레이션 액션만 기록.
+      if (observeOnly) {
+        await logTrade(env.DB, blankLog(item, 'OBSERVE_ONLY_SELL',
+          `[OBSERVE_ONLY_SELL] ${item.market} ${item.ticker} signal=SELL qty=${holdRow.qty} price=${signal.current.close} reason=BB_SELL_UPPER_BREAK (${signal.reason})`, signal.current.close));
+        actions.push(`[관찰:${item.market}매도] ${item.ticker} ${holdRow.qty}주 @${signal.current.close} (실주문 없음)`);
+        return;
+      }
       const res = isKR
         ? await sellKR(kisConfig, token, item.ticker, holdRow.qty)
         : await sellUS(kisConfig, token, item.ticker, holdRow.qty, toExchangeCode(holdRow.exchange || item.exchange));
