@@ -264,6 +264,7 @@ export async function runTradeScan(env: TradeEnv): Promise<{
   let scanned = 0;
   const batchInfoParts: string[] = [];
   const seen = new Set<string>();  // ④ 티커 중복 스캔 제거
+  let diagLogCount = 0;            // 진단용: 최초 5개 종목의 캔들 검증 상세 로그
 
   /**
    * 한 종목을 스캔하고 (원본 전략 그대로) 매수/매도 주문을 실행한다.
@@ -307,6 +308,21 @@ export async function runTradeScan(env: TradeEnv): Promise<{
     // 국내 확정봉은 최대 29개다. 시장별 최소 봉 수를 적용한다 (전략/BB/RSI 불변).
     const minCandles = isKR ? 29 : 30;
     const qv = validateCandleData(closes, minCandles, 20, 0.001);
+    // 진단 로그(임시): 최초 5개 종목의 검증 상세. validateCandleData 와 동일한
+    // 방식으로 std/BB폭을 재계산해 출력만 한다(계산/전략 수정 없음). tail 확인용.
+    if (diagLogCount < 5) {
+      diagLogCount++;
+      const recentDiag = closes.slice(-20);
+      const meanDiag = recentDiag.reduce((s, v) => s + v, 0) / (recentDiag.length || 1);
+      const stdDiag = Math.sqrt(recentDiag.reduce((s, v) => s + (v - meanDiag) ** 2, 0) / (recentDiag.length || 1));
+      const bbWidthDiag = 4 * stdDiag;
+      const lastClose = closes.at(-1) ?? 0;
+      console.log(
+        `[CANDLE_DIAG] ticker=${item.ticker} market=${item.market} raw=${raw.length} candles=${candles.length} closes=${closes.length}` +
+        ` minCandles=${minCandles} valid=${qv.valid} reason=${qv.reason} detail=${qv.detail ?? '-'}` +
+        ` std=${stdDiag.toFixed(6)} bbWidth=${bbWidthDiag.toFixed(6)} lastClose=${lastClose} recentLen=${recentDiag.length}`,
+      );
+    }
     if (!qv.valid) {
       await updateUniverseScanResult(env.DB, item.ticker, item.exchange, 'NO_DATA', qv.reason);
       await logTrade(env.DB, blankLog(item, 'NO_DATA', `[NO_DATA] ${qv.reason} (${qv.detail})`, closes.at(-1) ?? 0));
