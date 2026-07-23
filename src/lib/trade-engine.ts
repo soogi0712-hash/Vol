@@ -303,7 +303,10 @@ export async function runTradeScan(env: TradeEnv): Promise<{
     const closes  = candles.map(c => c.close);
 
     // ── 데이터 품질 검증 ─────────────────────────────────────
-    const qv = validateCandleData(closes, 30, 20, 0.001);
+    // KIS 국내 15분봉은 요청 수와 무관하게 최대 30개만 반환 → confirmedCandles 후
+    // 국내 확정봉은 최대 29개다. 시장별 최소 봉 수를 적용한다 (전략/BB/RSI 불변).
+    const minCandles = isKR ? 29 : 30;
+    const qv = validateCandleData(closes, minCandles, 20, 0.001);
     if (!qv.valid) {
       await updateUniverseScanResult(env.DB, item.ticker, item.exchange, 'NO_DATA', qv.reason);
       await logTrade(env.DB, blankLog(item, 'NO_DATA', `[NO_DATA] ${qv.reason} (${qv.detail})`, closes.at(-1) ?? 0));
