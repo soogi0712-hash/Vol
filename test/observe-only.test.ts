@@ -131,9 +131,10 @@ describe('관찰 전용 (auto_trade=1, observe_only=1): 스캔·기록 O, 실주
     expect(db._writes.orders).toHaveLength(0);                 // 가짜 체결주문 없음
     expect(db._writes.trade_logs.some(b => b[3] === 'OBSERVE_ONLY_BUY')).toBe(true);
     expect(res.actions.some((a: string) => a.includes('관찰'))).toBe(true);
-    // 지표/캔들 기록은 정상 수행
-    expect(db._writes.candle_batch).toBeGreaterThan(0);        // candle_history 기록됨
-    expect(db._writes.indicator_upsert.length).toBeGreaterThan(0); // indicator_snapshots 기록됨
+    // Phase 1: 배치 스캔은 candle_history 에 쓰지 않는다 (오염 방지 — diag 경로만 기록)
+    expect(db._writes.candle_batch).toBe(0);
+    // 지표 스냅샷은 기존 이력에서 계산되어 기록됨
+    expect(db._writes.indicator_upsert.length).toBeGreaterThan(0);
   });
 
   it('SELL 신호(보유) → sellKR 미호출, 실현손익/보유삭제 없음', async () => {
@@ -162,6 +163,17 @@ describe('관찰 전용 (auto_trade=1, observe_only=1): 스캔·기록 O, 실주
     await runTradeScan(env(db));
     expect(spies.sellUS).toHaveBeenCalledTimes(0);
     expect(db._writes.realized_profits).toHaveLength(0);
+  });
+});
+
+describe('Phase 1: 배치 스캔은 candle_history 에 쓰지 않는다', () => {
+  it('KR 스캔(관찰/라이브 무관) candle_batch=0 (diag 경로만 15m 저장)', async () => {
+    for (const observe of ['1', '0']) {
+      vi.setSystemTime(KR_OPEN); state.signal = sig('NONE');
+      const db = makeDB({ ...baseCfg, us_trade_enabled: '0', scan_us_enabled: '0', observe_only_enabled: observe });
+      await runTradeScan(env(db));
+      expect(db._writes.candle_batch).toBe(0);
+    }
   });
 });
 

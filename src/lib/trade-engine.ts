@@ -148,6 +148,10 @@ export function isUSMarketOpen(): boolean {
   return hhmm >= 400 && hhmm < 2000;
 }
 
+// Phase 1: 배치 스캔의 KR candle_history 쓰기 스위치 (오염 방지 위해 비활성).
+// Phase 3에서 collectKR15Min 로 소스를 교체한 뒤 true 로 전환한다.
+const KR_CANDLE_WRITE_ENABLED = false;
+
 // 거래소 코드 → KIS ExchangeCode 변환
 function toExchangeCode(exchange: string): ExchangeCode {
   const map: Record<string, ExchangeCode> = {
@@ -316,7 +320,11 @@ export async function runTradeScan(env: TradeEnv): Promise<{
     //     이미 가져온 확정봉(candles)을 candle_history 에 누적한다.
     //     ★ 누적은 스냅샷 스로틀과 분리되어 매 스캔 실행된다 (스냅샷이 이미 있어도 계속).
     const indTs = candles.at(-1)?.datetime ?? null;
-    if (isKR) {
+    // Phase 1 오염 방지: 기존 KR 조회 경로(getKR15MinCandles)는 잘못된 데이터를
+    // 반환하므로, 배치 스캔이 candle_history 에 쓰지 못하게 완전히 비활성화한다.
+    // 신규 15m 저장은 오직 진단 경로(/api/diag/kr-candles)만 수행한다.
+    // Phase 3에서 올바른 컬렉터(collectKR15Min)로 교체한 뒤 재활성화한다.
+    if (isKR && KR_CANDLE_WRITE_ENABLED) {
       const acc = await accumulateKRHistory({
         market: item.market, symbol: item.ticker,
         confirmedCandles: candles,   // 매매 확정봉 재사용 (형성봉 제외됨)

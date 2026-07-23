@@ -10,14 +10,31 @@ type Bindings = {
   DB: D1Database; KV: KVNamespace;
   KIS_APP_KEY: string; KIS_APP_SECRET: string;
   KIS_ACCOUNT_NO: string; KIS_ACCOUNT_SUFFIX: string;
+  DIAG_SECRET?: string;   // 진단 경로 보호용 시크릿 (wrangler secret put DIAG_SECRET)
 };
 
 const diag = new Hono<{ Bindings: Bindings }>();
 
+// ── 인증 가드: 모든 /api/diag/* 요청에 적용 ──────────────────
+// DIAG_SECRET 미설정 시(=보호 불가) 또는 헤더 불일치 시 403. 시크릿 값은 로그 미출력.
+diag.use('*', async (c, next) => {
+  const secret = c.env.DIAG_SECRET;
+  const provided = c.req.header('X-Diag-Secret');
+  if (!secret || !provided || provided !== secret) {
+    return c.json({ success: false, message: 'forbidden' }, 403);
+  }
+  await next();
+});
+
 // GET /api/diag/kr-candles/:ticker  — 지정 1개 종목만
 diag.get('/kr-candles/:ticker', async (c) => {
-  const ticker = c.req.param('ticker').toUpperCase();
-  const maxPages = Math.min(parseInt(c.req.query('maxPages') || '15'), 15);
+  const ticker = c.req.param('ticker');
+  // 국내 종목코드 형식: 6자리 숫자만 허용
+  if (!/^\d{6}$/.test(ticker)) {
+    return c.json({ success: false, message: 'ticker 는 6자리 숫자여야 합니다' }, 400);
+  }
+  // 1회 호출 페이지 상한 (1~15)
+  const maxPages = Math.max(1, Math.min(parseInt(c.req.query('maxPages') || '15', 10) || 15, 15));
   if (!c.env.KIS_APP_KEY) return c.json({ success: false, message: 'API 키 미설정' }, 400);
 
   try {
