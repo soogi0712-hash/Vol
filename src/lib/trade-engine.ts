@@ -264,6 +264,7 @@ export async function runTradeScan(env: TradeEnv): Promise<{
   let scanned = 0;
   const batchInfoParts: string[] = [];
   const seen = new Set<string>();  // ④ 티커 중복 스캔 제거
+  let diagLogCount = 0;            // 진단용: 최초 5개 종목의 캔들 검증 결과 로그
 
   /**
    * 한 종목을 스캔하고 (원본 전략 그대로) 매수/매도 주문을 실행한다.
@@ -304,6 +305,11 @@ export async function runTradeScan(env: TradeEnv): Promise<{
 
     // ── 데이터 품질 검증 ─────────────────────────────────────
     const qv = validateCandleData(closes, 30, 20, 0.001);
+    // 진단 로그(임시): 최초 5개 종목의 실제 reason/detail 출력 (wrangler tail 확인용)
+    if (diagLogCount < 5) {
+      diagLogCount++;
+      console.log(`[NODATA_DIAG] ticker=${item.ticker} market=${item.market} raw=${raw.length} candles=${candles.length} valid=${qv.valid} reason=${qv.reason} detail=${qv.detail ?? '-'}`);
+    }
     if (!qv.valid) {
       await updateUniverseScanResult(env.DB, item.ticker, item.exchange, 'NO_DATA', qv.reason);
       await logTrade(env.DB, blankLog(item, 'NO_DATA', `[NO_DATA] ${qv.reason} (${qv.detail})`, closes.at(-1) ?? 0));
