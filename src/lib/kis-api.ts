@@ -105,6 +105,9 @@ export async function getAccessToken(cfg: KISConfig, kv?: KVNamespace): Promise<
 // ══════════════════════════════════════════════════════════════
 
 // ─── 국내주식 15분봉 ─────────────────────────────────────────
+// 진단용(임시): KR 15분봉 최초 1개 종목만 응답 요약을 로그로 남긴다.
+let krDiagLogged = false;
+
 export async function getKR15MinCandles(
   cfg: KISConfig, token: string, ticker: string, count = 40
 ): Promise<Candle[]> {
@@ -131,7 +134,8 @@ export async function getKR15MinCandles(
   };
   if (data.rt_cd !== '0') throw new Error(`KIS KR 15min [${ticker}]: ${data.msg1}`);
 
-  return (data.output2 || [])
+  const output2 = data.output2 || [];
+  const mapped = output2
     .map(d => ({
       ticker, market: 'KR' as const,
       datetime: d.stck_bsop_date + d.stck_cntg_hour.padStart(6, '0'),
@@ -142,6 +146,17 @@ export async function getKR15MinCandles(
     .filter(c => c.close > 0)
     .sort((a, b) => a.datetime.localeCompare(b.datetime))
     .slice(-count);
+
+  // 진단 로그(임시): 최초 1개 종목만. 토큰/헤더/앱키/원본응답 전체는 절대 출력하지 않고
+  // 날짜·시간·종가 필드와 파싱 결과 요약만 출력한다 (KR 15분봉 FLAT_CANDLE 원인 추적).
+  if (!krDiagLogged) {
+    krDiagLogged = true;
+    console.log(`[KR15_DIAG] ticker=${ticker} rt_cd=${data.rt_cd} output2Len=${output2.length} mappedLen=${mapped.length} uniqTs=${new Set(mapped.map(c => c.datetime)).size} uniqClose=${new Set(mapped.map(c => c.close)).size}`);
+    console.log(`[KR15_DIAG] rawFirst5=${JSON.stringify(output2.slice(0, 5).map(d => ({ date: d.stck_bsop_date, time: d.stck_cntg_hour, close: d.stck_prpr })))}`);
+    console.log(`[KR15_DIAG] parsedFirst5=${JSON.stringify(mapped.slice(0, 5).map(c => ({ ts: c.datetime, close: c.close })))}`);
+    console.log(`[KR15_DIAG] parsedLast5=${JSON.stringify(mapped.slice(-5).map(c => ({ ts: c.datetime, close: c.close })))}`);
+  }
+  return mapped;
 }
 
 // ─── 국내주식 현재가 ─────────────────────────────────────────
