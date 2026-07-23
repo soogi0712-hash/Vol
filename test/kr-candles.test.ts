@@ -148,4 +148,29 @@ describe('collectKR15Min', () => {
     expect(r2.stored.inserted).toBe(0);        // 신규 없음
     expect(store.map.size).toBe(4);            // 중복 캔들 없음
   });
+
+  it('정지조건 미도달 시 maxPages 에서 강제 종료(무제한 호출 방지)', async () => {
+    // 매 페이지 새 봉 30개(09:00 미도달·중복·빈페이지 없음) → 오직 maxPages 로만 멈춤
+    let call = 0;
+    const fetchPage = async () => {
+      // p번째: 15:00 기준 30분씩 뒤로. 항상 09:00(540분) 초과, 항상 신규.
+      const base = 15 * 60;                    // 900분 = 15:00
+      const bars: Candle[] = [];
+      for (let i = 0; i < 30; i++) {
+        const total = base - 30 * call - i;    // 내림차순
+        const hh = Math.floor(total / 60), mm = total % 60;
+        const ts = `20260105${String(hh).padStart(2, '0')}${String(mm).padStart(2, '0')}00`;
+        bars.push(c1(ts, 100, 101, 99, 100 + call * 30 + i));
+      }
+      call++;
+      return bars;
+    };
+    const store = makeStore();
+    const r = await collectKR15Min({
+      ticker: '005930', nowMs: now, maxPages: 4, fetchPage, ...store,
+    });
+    expect(r.stopReason).toBe('max_pages');
+    expect(r.totalKisCalls).toBe(4);           // maxPages 에서 정확히 멈춤
+    expect(call).toBe(4);                       // fetchPage 도 4회만 호출
+  });
 });
