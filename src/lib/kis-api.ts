@@ -33,6 +33,16 @@ export interface KISConfig {
 
 export type ExchangeCode = 'NASD' | 'NYSE' | 'AMEX';
 
+/**
+ * 해외 시세(quotation) 엔드포인트의 EXCD 파라미터는 주문용 코드(NASD/NYSE/AMEX)가 아니라
+ * 시세용 코드(NAS/NYS/AMS)를 요구한다. 주문 코드를 그대로 넣으면 rt_cd=0(정상)이지만
+ * output2 가 빈 배열로 반환된다(데이터 매칭 실패). 아래에서 시세 코드로 변환한다.
+ */
+const QUOTATION_EXCD: Record<ExchangeCode, string> = { NASD: 'NAS', NYSE: 'NYS', AMEX: 'AMS' };
+export function toQuotationExcd(exchange: ExchangeCode): string {
+  return QUOTATION_EXCD[exchange] ?? 'NAS';
+}
+
 export interface Candle {
   ticker: string;
   market: 'KR' | 'US';
@@ -281,22 +291,23 @@ export async function sellKR(
 // ══════════════════════════════════════════════════════════════
 
 // ─── 해외주식 15분봉 ─────────────────────────────────────────
-// TR_ID: HHDFS76950200
-// EXCD: NASD(나스닥) / NYSE(뉴욕) / AMEX(아멕스)
-// PINC=1 → 장전+정규+장후 포함
+// TR_ID: HHDFS76950200  경로: /uapi/overseas-price/v1/quotations/inquire-time-itemchartprice
+// EXCD(시세 코드): NAS(나스닥) / NYS(뉴욕) / AMS(아멕스)  ※ 주문 코드 NASD/NYSE/AMEX 아님
+// NMIN=15(분갭) · PINC=1(전일 포함 → 40개 확보) · NEXT/FILL/KEYB="" · NREC≤120(요청 건수)
 // ※ 시세조회는 overseas-stock이 아닌 overseas-price 경로 사용
 export async function getUS15MinCandles(
   cfg: KISConfig, token: string, ticker: string,
   count = 40, exchange: ExchangeCode = 'NASD'
 ): Promise<Candle[]> {
+  const excd = toQuotationExcd(exchange);   // NASD→NAS 등 시세 코드로 변환
   const params = new URLSearchParams({
     AUTH: '',
-    EXCD: exchange,
+    EXCD: excd,
     SYMB: ticker,
     NMIN: '15',
-    PINC: '1',       // 1=장전/장후 포함
+    PINC: '1',       // 1=전일 포함(당일 봉이 부족해도 과거 봉으로 40개 확보)
     NEXT: '',
-    NREC: String(Math.min(count, 200)),
+    NREC: String(Math.min(count, 120)),   // 요청 건수 최대 120
     FILL: '',
     KEYB: '',
   });
@@ -314,8 +325,9 @@ export async function getUS15MinCandles(
       open: string; high: string; low: string; last: string; evol: string;
     }>;
   };
-  console.log("US15MIN RESPONSE", JSON.stringify(data));
-  if (data.rt_cd !== '0') throw new Error(`KIS US 15min [${ticker}/${exchange}]: ${data.msg1}`);
+  // 배포 후 output2 개수 확인용(원본 전체 덤프 아님, 민감정보 없음)
+  console.log("US15MIN", ticker, excd, "rt_cd", data.rt_cd, "output2", (data.output2 || []).length);
+  if (data.rt_cd !== '0') throw new Error(`KIS US 15min [${ticker}/${excd}]: ${data.msg1}`);
 
   return (data.output2 || [])
     .map(d => ({
@@ -337,7 +349,7 @@ export async function getUSPrice(
   cfg: KISConfig, token: string, ticker: string,
   exchange: ExchangeCode = 'NASD'
 ): Promise<number> {
-  const params = new URLSearchParams({ AUTH: '', EXCD: exchange, SYMB: ticker });
+  const params = new URLSearchParams({ AUTH: '', EXCD: toQuotationExcd(exchange), SYMB: ticker });
   const res = await fetch(
     `${KIS_BASE}/uapi/overseas-price/v1/quotations/inquire-price?${params}`,
     { headers: kis_headers(cfg, token, 'HHDFS00000300') }
