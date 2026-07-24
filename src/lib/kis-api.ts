@@ -314,6 +314,7 @@ export async function getUS15MinCandles(
       open: string; high: string; low: string; last: string; evol: string;
     }>;
   };
+  console.log("US15MIN RESPONSE", JSON.stringify(data));
   if (data.rt_cd !== '0') throw new Error(`KIS US 15min [${ticker}/${exchange}]: ${data.msg1}`);
 
   return (data.output2 || [])
