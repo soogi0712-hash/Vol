@@ -9,6 +9,14 @@
   "compatibility_date": "2026-04-26",
   "compatibility_flags": ["nodejs_compat"],
 
+  // ── 배포 전 자동 빌드 ─────────────────────────────────────────
+  // dist/ 는 .gitignore 대상이라 git pull 로는 갱신되지 않는다. 이 command 가
+  // 있으면 `wrangler deploy`(및 dev) 실행 시 wrangler 가 먼저 vite build 를 돌려
+  // src → dist/index.js 를 항상 재생성한다. 오래된 dist 를 배포하는 사고를 막는다.
+  "build": {
+    "command": "npm run build"
+  },
+
   // ── 정적 자산 (대시보드) ──────────────────────────────────────
   // public/ 의 index.html, static/* 를 Workers Static Assets 로 서빙한다.
   // 매칭 자산은 Worker fetch 이전에 서빙되고, 미매칭(/api/*)은 Worker 로 전달.
