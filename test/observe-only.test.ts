@@ -3,7 +3,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 // ── 주문/시세/전략/유니버스 모킹 (hoisted 스파이) ────────────────
 const spies = vi.hoisted(() => ({
   buyKR: vi.fn(), sellKR: vi.fn(), buyUS: vi.fn(), sellUS: vi.fn(),
-  getKR15: vi.fn(), getUS15: vi.fn(),
+  getKR15: vi.fn(), getUS15: vi.fn(), fetchKR1Min: vi.fn(),
 }));
 // getBBSignal 반환을 테스트별로 제어 (전략 수학은 strategy-unchanged.test.ts 가 검증)
 const state = vi.hoisted(() => ({ signal: undefined as any }));
@@ -16,6 +16,7 @@ vi.mock('../src/lib/kis-api', () => ({
   getUSHoldings: vi.fn(async () => []),
   getKR15MinCandles: spies.getKR15,
   getUS15MinCandles: spies.getUS15,
+  fetchKR1MinPage: spies.fetchKR1Min,   // Phase 3 KR 수집 소스
   buyKR: spies.buyKR, sellKR: spies.sellKR, buyUS: spies.buyUS, sellUS: spies.sellUS,
 }));
 vi.mock('../src/lib/bollinger', () => ({
@@ -106,6 +107,12 @@ beforeEach(() => {
   const c = Array.from({ length: 41 }, (_, i) => ({ ticker: 'x', market: 'KR', datetime: `2026010${String(100000 + i).slice(1)}`, open: 100, high: 101, low: 99, close: 100 + i * 0.05, volume: 1000 }));
   spies.getKR15.mockResolvedValue(c);
   spies.getUS15.mockResolvedValue(c.map(x => ({ ...x, market: 'US' })));
+  // Phase 3 KR 수집: 09:00~09:29 1분봉 30개 → 완성 15분봉 2개(0900,0915) 저장 후 reached_0900 종료.
+  const kr1min = Array.from({ length: 30 }, (_, i) => ({
+    ticker: '005930', market: 'KR', datetime: `20260105${'09'}${String(i).padStart(2, '0')}00`,
+    open: 100, high: 101, low: 99, close: 100 + i * 0.1, volume: 100,
+  }));
+  spies.fetchKR1Min.mockResolvedValue(kr1min);
 });
 
 describe('auto_trade_enabled=0 → 조기 반환 (기존 동작 보존)', () => {
@@ -131,8 +138,9 @@ describe('관찰 전용 (auto_trade=1, observe_only=1): 스캔·기록 O, 실주
     expect(db._writes.orders).toHaveLength(0);                 // 가짜 체결주문 없음
     expect(db._writes.trade_logs.some(b => b[3] === 'OBSERVE_ONLY_BUY')).toBe(true);
     expect(res.actions.some((a: string) => a.includes('관찰'))).toBe(true);
-    // Phase 1: 배치 스캔은 candle_history 에 쓰지 않는다 (오염 방지 — diag 경로만 기록)
-    expect(db._writes.candle_batch).toBe(0);
+    // Phase 3: 관찰 전용이어도 KR 수집은 동작 → 완성 15분봉이 candle_history 에 누적된다.
+    // (주문만 차단, 데이터 수집은 계속 — 이력이 쌓여야 30봉 게이트를 넘을 수 있으므로)
+    expect(db._writes.candle_batch).toBeGreaterThan(0);
     // 지표 스냅샷은 기존 이력에서 계산되어 기록됨
     expect(db._writes.indicator_upsert.length).toBeGreaterThan(0);
   });
@@ -166,14 +174,23 @@ describe('관찰 전용 (auto_trade=1, observe_only=1): 스캔·기록 O, 실주
   });
 });
 
-describe('Phase 1: 배치 스캔은 candle_history 에 쓰지 않는다', () => {
-  it('KR 스캔(관찰/라이브 무관) candle_batch=0 (diag 경로만 15m 저장)', async () => {
+describe('Phase 3: KR 스캔은 candle_history(15m)에 완성봉을 누적한다', () => {
+  it('관찰/라이브·신호 무관하게 KR 수집은 15m 완성봉을 저장 (candle_batch>0)', async () => {
     for (const observe of ['1', '0']) {
       vi.setSystemTime(KR_OPEN); state.signal = sig('NONE');
       const db = makeDB({ ...baseCfg, us_trade_enabled: '0', scan_us_enabled: '0', observe_only_enabled: observe });
       await runTradeScan(env(db));
-      expect(db._writes.candle_batch).toBe(0);
+      expect(db._writes.candle_batch).toBeGreaterThan(0);
     }
+  });
+
+  it("kr_candle_source='legacy' 이면 수집/저장하지 않는다 (candle_batch=0)", async () => {
+    vi.setSystemTime(KR_OPEN); state.signal = sig('NONE');
+    const db = makeDB({ ...baseCfg, us_trade_enabled: '0', scan_us_enabled: '0', observe_only_enabled: '1', kr_candle_source: 'legacy' });
+    await runTradeScan(env(db));
+    expect(db._writes.candle_batch).toBe(0);
+    expect(spies.getKR15).toHaveBeenCalled();       // legacy 는 기존 경로 사용
+    expect(spies.fetchKR1Min).not.toHaveBeenCalled();
   });
 });
 
