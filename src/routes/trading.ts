@@ -4,7 +4,7 @@ import { runTradeScan, syncHoldings, isKRMarketOpen, isUSMarketOpen } from '../l
 import {
   getAccessToken, getKR15MinCandles, getUS15MinCandles,
   getKRHoldings, getUSHoldings, getKROrderableCash, getUSOrderableCash,
-  type ExchangeCode,
+  type ExchangeCode, type Candle,
 } from '../lib/kis-api';
 import { calcBB, calcRSI, getBBSignal } from '../lib/bollinger';
 import { runKISBacktest } from '../lib/backtest';
@@ -365,9 +365,33 @@ trading.get('/preview/:market/:ticker', async (c) => {
       accountNo: c.env.KIS_ACCOUNT_NO, accountSuffix: c.env.KIS_ACCOUNT_SUFFIX || '01',
     };
     const token   = await getAccessToken(cfg, c.env.KV);
-    const candles = market === 'KR'
-      ? await getKR15MinCandles(cfg, token, ticker, 40)
-      : await getUS15MinCandles(cfg, token, ticker, 40, exchange || 'NASD');
+    // Phase 3: KR 은 엔진과 동일하게 candle_history 의 "15분봉"을 사용한다.
+    //   기존 getKR15MinCandles 는 당일 1분봉이라 preview 의 recent_bands 가 1분 간격으로
+    //   보였다(엔진 매매 근거와 불일치). 여기서 candle_history(timeframe='15m')를 읽어
+    //   엔진과 같은 15분봉·같은 신호를 보여준다. US 는 단건 15분봉 조회 그대로.
+    let candles: Candle[];
+    let source: string;
+    let timeframe = '15m';
+    if (market === 'KR') {
+      const rows = await c.env.DB.prepare(
+        `SELECT candle_ts, open, high, low, close, volume FROM candle_history
+         WHERE market='KR' AND symbol=? AND timeframe='15m' ORDER BY candle_ts DESC LIMIT 40`,
+      ).bind(ticker).all<{ candle_ts: string; open: number; high: number; low: number; close: number; volume: number }>();
+      candles = (rows.results || []).map(r => ({
+        ticker, market: 'KR' as const, datetime: r.candle_ts,
+        open: r.open, high: r.high, low: r.low, close: r.close, volume: r.volume,
+      })).reverse();   // DESC 조회 → oldest→newest
+      source = 'candle_history:15m';
+      if (candles.length === 0) {
+        // 이력 미축적(신규 종목 부트스트랩 전) 시 참고용으로 기존 1분봉 경로 폴백
+        candles = await getKR15MinCandles(cfg, token, ticker, 40);
+        source = 'kis:1m (이력 미축적 폴백)';
+        timeframe = '1m';
+      }
+    } else {
+      candles = await getUS15MinCandles(cfg, token, ticker, 40, exchange || 'NASD');
+      source = 'kis:15m';
+    }
 
     const closes = candles.map(c => c.close);
     const dts    = candles.map(c => c.datetime);
@@ -400,6 +424,8 @@ trading.get('/preview/:market/:ticker', async (c) => {
       bb_lower_recovery:  signal.bb_lower_recovery,
       recent_bands: bands.slice(-5),
       candle_count: candles.length,
+      candle_source: source,      // Phase 3 확인용: 'candle_history:15m' 이어야 정상
+      timeframe,                  // KR/US 모두 '15m' 이어야 정상
     });
   } catch (e) {
     return c.json({ success: false, message: String(e) }, 500);
