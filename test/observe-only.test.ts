@@ -4,14 +4,15 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 const spies = vi.hoisted(() => ({
   buyKR: vi.fn(), sellKR: vi.fn(), buyUS: vi.fn(), sellUS: vi.fn(),
   getKR15: vi.fn(), getUS15: vi.fn(), fetchKR1Min: vi.fn(),
+  getKROrderableCash: vi.fn(), getUSOrderableCash: vi.fn(),
 }));
 // getBBSignal 반환을 테스트별로 제어 (전략 수학은 strategy-unchanged.test.ts 가 검증)
 const state = vi.hoisted(() => ({ signal: undefined as any }));
 
 vi.mock('../src/lib/kis-api', () => ({
   getAccessToken: vi.fn(async () => 'tok'),
-  getKROrderableCash: vi.fn(async () => 1e9),
-  getUSOrderableCash: vi.fn(async () => 1e9),
+  getKROrderableCash: spies.getKROrderableCash,
+  getUSOrderableCash: spies.getUSOrderableCash,
   getKRHoldings: vi.fn(async () => []),
   getUSHoldings: vi.fn(async () => []),
   getKR15MinCandles: spies.getKR15,
@@ -85,7 +86,8 @@ function makeDB(config: Record<string, string>, holdingsByTicker: Record<string,
 }
 
 const KR_OPEN = new Date('2026-01-05T05:00:00Z'); // Mon 14:00 KST (KR open, US closed)
-const US_OPEN = new Date('2026-01-05T15:00:00Z'); // Mon 10:00 EST (US open, KR closed)
+const US_OPEN = new Date('2026-01-05T15:00:00Z'); // Mon 15:00 UTC (US 정규장, KR closed)
+const MARKET_CLOSED = new Date('2026-01-05T10:00:00Z'); // Mon: KR 19:00 KST 마감 · US 10:00 UTC 개장 전
 
 const sig = (action: string) => ({
   action, current: { close: 100, upper: 110, middle: 105, lower: 100 },
@@ -100,6 +102,8 @@ const baseCfg = {
 beforeEach(() => {
   vi.useFakeTimers({ toFake: ['Date'] });   // Date 만 고정 (setTimeout 은 실제 → sleep 정상)
   Object.values(spies).forEach(s => s.mockReset());
+  spies.getKROrderableCash.mockResolvedValue(1e9);
+  spies.getUSOrderableCash.mockResolvedValue(1e9);
   spies.buyKR.mockResolvedValue({ order_no: 'o', success: true, message: 'ok', raw: {} });
   spies.sellKR.mockResolvedValue({ order_no: 'o', success: true, message: 'ok', raw: {} });
   spies.buyUS.mockResolvedValue({ order_no: 'o', success: true, message: 'ok', raw: {} });
@@ -115,14 +119,32 @@ beforeEach(() => {
   spies.fetchKR1Min.mockResolvedValue(kr1min);
 });
 
-describe('auto_trade_enabled=0 → 조기 반환 (기존 동작 보존)', () => {
-  it('스캔·시세조회·주문 모두 없음', async () => {
-    vi.setSystemTime(KR_OPEN);
-    const db = makeDB({ ...baseCfg, auto_trade_enabled: '0', observe_only_enabled: '1' });
+describe('수집/주문 분리: auto_trade_enabled=0 (정규장)', () => {
+  it('KR 정규장이면 수집·신호는 수행하되 실주문은 없음', async () => {
+    vi.setSystemTime(KR_OPEN); state.signal = sig('BUY');
+    const db = makeDB({ ...baseCfg, auto_trade_enabled: '0', us_trade_enabled: '0', scan_us_enabled: '0', observe_only_enabled: '0' });
+    await runTradeScan(env(db));
+    expect(spies.buyKR).not.toHaveBeenCalled();                    // 주문 차단(auto_trade OFF)
+    expect(db._writes.orders).toHaveLength(0);
+    expect(db._writes.candle_batch).toBeGreaterThan(0);            // 수집은 수행(candle_history 15m)
+    expect(db._writes.indicator_upsert.length).toBeGreaterThan(0); // 신호/스냅샷 계산 수행
+    expect(db._writes.trade_logs.some(b => b[3] === 'OBSERVE_ONLY_BUY')).toBe(true);
+  });
+
+  it('주문가능현금 조회는 주문이 꺼져 있으면 생략된다(불필요 API 차단)', async () => {
+    vi.setSystemTime(KR_OPEN); state.signal = sig('NONE');
+    const db = makeDB({ ...baseCfg, auto_trade_enabled: '0', us_trade_enabled: '0', scan_us_enabled: '0' });
+    await runTradeScan(env(db));
+    expect(spies.getKROrderableCash).not.toHaveBeenCalled();
+  });
+
+  it('장 마감이면 조기 반환 — 수집·시세·스냅샷 모두 없음', async () => {
+    vi.setSystemTime(MARKET_CLOSED);
+    const db = makeDB({ ...baseCfg, auto_trade_enabled: '0' });
     const res = await runTradeScan(env(db));
-    expect(res.actions).toContain('자동매매 비활성화');
-    expect(spies.getKR15).not.toHaveBeenCalled();
-    expect(spies.buyKR).not.toHaveBeenCalled();
+    expect(res.actions.some((a: string) => a.includes('장 마감'))).toBe(true);
+    expect(spies.fetchKR1Min).not.toHaveBeenCalled();
+    expect(spies.getUS15).not.toHaveBeenCalled();
     expect(db._writes.candle_batch).toBe(0);
     expect(db._writes.indicator_upsert).toHaveLength(0);
   });

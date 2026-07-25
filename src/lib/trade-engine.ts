@@ -141,13 +141,27 @@ export function isKRMarketOpen(): boolean {
 }
 
 export function isUSMarketOpen(): boolean {
-  // UTC-5 고정 (서머타임 미적용 → 넓게 허용)
+  // UTC-5 고정 (서머타임 미적용 → 넓게 허용). 프리/애프터 포함 상태 표시용.
   const now  = new Date();
   const est  = new Date(now.getTime() - 5 * 3600 * 1000);
   const day  = est.getUTCDay();
   if (day === 0 || day === 6) return false;
   const hhmm = est.getUTCHours() * 100 + est.getUTCMinutes();
   return hhmm >= 400 && hhmm < 2000;
+}
+
+/**
+ * 미국 정규장(대략 09:30~16:00 ET)만. 수집/스캔 게이트 전용 — 프리/애프터마켓을
+ * 제외해 불필요한 API 호출을 막는다. DST 무관하도록 UTC 13:30~21:00 로 근사한다
+ * (EDT 여름 13:30~20:00 UTC, EST 겨울 14:30~21:00 UTC 의 합집합). 정규장은 항상
+ * 같은 UTC 날짜라 자정을 넘지 않는다 → UTC 요일로 주말 판정 가능.
+ */
+export function isUSRegularOpen(): boolean {
+  const now  = new Date();
+  const day  = now.getUTCDay();
+  if (day === 0 || day === 6) return false;
+  const hhmm = now.getUTCHours() * 100 + now.getUTCMinutes();
+  return hhmm >= 1330 && hhmm < 2100;
 }
 
 // Phase 1: 배치 스캔의 KR candle_history 쓰기 스위치 (오염 방지 위해 비활성).
@@ -187,8 +201,8 @@ export async function runTradeScan(env: TradeEnv): Promise<{
 }> {
   const actions: string[] = [];
   const errors:  string[] = [];
-  const krOpen = isKRMarketOpen();
-  const usOpen = isUSMarketOpen();
+  const krOpen = isKRMarketOpen();      // KR 정규장 09:00~15:30
+  const usOpen = isUSRegularOpen();     // US 정규장만(프리/애프터 제외) — 수집/스캔 게이트
 
   // 자동매매 ON 확인
   const cfgRows = await env.DB.prepare(
@@ -203,8 +217,20 @@ export async function runTradeScan(env: TradeEnv): Promise<{
   const cfgMap: Record<string, string> = {};
   (cfgRows.results || []).forEach(r => { cfgMap[r.key] = r.value; });
 
-  if (cfgMap['auto_trade_enabled'] !== '1') {
-    return { scanned: 0, actions: ['자동매매 비활성화'], errors: [], kr_market_open: krOpen, us_market_open: usOpen, batch_info: '' };
+  // ── 수집/신호 vs 주문 분리 ───────────────────────────────────
+  // 수집(candle_history)·신호 계산은 auto_trade_enabled 와 무관하게 정규장이면 항상 수행.
+  // 실주문은 ordersEnabled(=자동매매 ON 이면서 관찰전용 OFF)일 때만 실행한다.
+  const autoTradeEnabled = cfgMap['auto_trade_enabled'] === '1';
+  const observeOnly      = cfgMap['observe_only_enabled'] === '1';
+  const ordersEnabled    = autoTradeEnabled && !observeOnly;
+
+  // 정규장이 아니면(KR·US 모두 마감) 수집·신호 모두 불필요 → 조기 반환(불필요 API 호출 차단).
+  if (!krOpen && !usOpen) {
+    return {
+      scanned: 0,
+      actions: [autoTradeEnabled ? '장 마감 — 수집/스캔 없음' : '자동매매 OFF · 장 마감 — 수집/스캔 없음'],
+      errors: [], kr_market_open: krOpen, us_market_open: usOpen, batch_info: '',
+    };
   }
 
   // 종목 유니버스 미로드 시 자동 초기화
@@ -240,12 +266,14 @@ export async function runTradeScan(env: TradeEnv): Promise<{
   // 시세 rate limiter: 실전 20/s 상한의 1/3 수준(≈8/s)으로 보수적 운용. 스캔 전체 공유.
   const krLimiter = makeKisRateLimiter({ minIntervalMs: 120, maxRetries: 3, baseBackoffMs: 300 });
 
-  // 주문가능 현금
+  // 주문가능 현금 — 매수 사이징에만 필요. 주문이 꺼져 있으면(auto_trade OFF / observe) 조회 생략.
   const cash = { kr: 0, us: 0 };
-  try { cash.kr = await getKROrderableCash(kisConfig, token); }
-  catch (e) { errors.push(`KR 잔고 오류: ${e}`); await logSystemError(env.DB, 'API_ERROR', `KR 잔고 오류: ${e}`); }
-  try { cash.us = await getUSOrderableCash(kisConfig, token); }
-  catch (e) { errors.push(`US 잔고 오류: ${e}`); await logSystemError(env.DB, 'API_ERROR', `US 잔고 오류: ${e}`); }
+  if (ordersEnabled) {
+    try { cash.kr = await getKROrderableCash(kisConfig, token); }
+    catch (e) { errors.push(`KR 잔고 오류: ${e}`); await logSystemError(env.DB, 'API_ERROR', `KR 잔고 오류: ${e}`); }
+    try { cash.us = await getUSOrderableCash(kisConfig, token); }
+    catch (e) { errors.push(`US 잔고 오류: ${e}`); await logSystemError(env.DB, 'API_ERROR', `US 잔고 오류: ${e}`); }
+  }
 
   // 보유종목 DB 동기화
   try {
@@ -275,9 +303,8 @@ export async function runTradeScan(env: TradeEnv): Promise<{
   const usTradeEnabled = cfgMap['us_trade_enabled'] === '1';
   const krScanEnabled  = cfgMap['scan_kr_enabled'] === '1';
   const usScanEnabled  = cfgMap['scan_us_enabled'] === '1';
-  // 관찰 전용 모드 — auto_trade_enabled=1 로 스캔은 하되 실주문만 차단한다.
-  // 매수/매도 결정·수량·사이징은 원본 그대로 계산되며, 최종 주문 호출만 스킵한다.
-  const observeOnly    = cfgMap['observe_only_enabled'] === '1';
+  // (autoTradeEnabled / observeOnly / ordersEnabled 는 위에서 정의됨)
+  // 실주문 경계에서 !ordersEnabled 이면 주문을 스킵하고 신호만 기록한다.
 
   let scanned = 0;
   const batchInfoParts: string[] = [];
@@ -426,23 +453,24 @@ export async function runTradeScan(env: TradeEnv): Promise<{
       if (!tradeOn) return;
       const price = signal.current.close;
       const qty   = Math.floor((isKR ? 100000 : 500) / price);
-      const need  = price * qty * 1.002;
-      const bal   = isKR ? cash.kr : cash.us;
       if (qty < 1) {
         await logTrade(env.DB, blankLog(item, 'BUY_SKIP', `[BUY_SKIP] 수량 부족 (금액/${price} < 1주)`, price));
         return;
       }
-      if (bal < need) {
-        await logTrade(env.DB, blankLog(item, 'BUY_SKIP', `[BUY_SKIP] 잔고부족 (필요 ${need.toFixed(0)} > 가용 ${bal.toFixed(0)})`, price));
-        return;
-      }
-      // ── 관찰 전용: 실주문 경계에서 차단 (buyKR/buyUS 미호출) ──
-      // 결정/수량/사이징은 위에서 원본 그대로 계산됨. 여기서 주문만 스킵하고,
-      // 시뮬레이션 액션을 기록한다. 보유/체결주문/실현손익은 만들지 않는다.
-      if (observeOnly) {
+      // ── 주문 차단 경계 (auto_trade OFF 또는 관찰전용): buyKR/buyUS 미호출 ──
+      // 신호 계산만 수행하는 모드 → 잔고 검사 없이(주문가능현금 미조회) 신호만 기록한다.
+      // 결정/수량/사이징은 위에서 원본 그대로 계산됨. 보유/체결주문/실현손익은 만들지 않는다.
+      if (!ordersEnabled) {
         await logTrade(env.DB, blankLog(item, 'OBSERVE_ONLY_BUY',
           `[OBSERVE_ONLY_BUY] ${item.market} ${item.ticker} signal=BUY qty=${qty} price=${price} reason=BB_BUY (${signal.reason})`, price));
         actions.push(`[관찰:${item.market}매수] ${item.ticker} ${item.ticker_name} ${qty}주 @${price} (실주문 없음)`);
+        return;
+      }
+      // ── 실주문 경로: 여기서만 잔고 검사(주문가능현금은 위에서 조회됨) ──
+      const need = price * qty * 1.002;
+      const bal  = isKR ? cash.kr : cash.us;
+      if (bal < need) {
+        await logTrade(env.DB, blankLog(item, 'BUY_SKIP', `[BUY_SKIP] 잔고부족 (필요 ${need.toFixed(0)} > 가용 ${bal.toFixed(0)})`, price));
         return;
       }
       const res = isKR
@@ -461,9 +489,9 @@ export async function runTradeScan(env: TradeEnv): Promise<{
 
     // ── 매도 (원본: 상단돌파 후 하락) ────────────────────────
     if (signal.action === 'SELL' && holdRow && holdRow.qty > 0) {
-      // ── 관찰 전용: 실주문 경계에서 차단 (sellKR/sellUS 미호출) ──
+      // ── 주문 차단 경계 (auto_trade OFF 또는 관찰전용): sellKR/sellUS 미호출 ──
       // 보유 삭제·실현손익·체결주문을 만들지 않는다. 시뮬레이션 액션만 기록.
-      if (observeOnly) {
+      if (!ordersEnabled) {
         await logTrade(env.DB, blankLog(item, 'OBSERVE_ONLY_SELL',
           `[OBSERVE_ONLY_SELL] ${item.market} ${item.ticker} signal=SELL qty=${holdRow.qty} price=${signal.current.close} reason=BB_SELL_UPPER_BREAK (${signal.reason})`, signal.current.close));
         actions.push(`[관찰:${item.market}매도] ${item.ticker} ${holdRow.qty}주 @${signal.current.close} (실주문 없음)`);
@@ -514,8 +542,10 @@ export async function runTradeScan(env: TradeEnv): Promise<{
   }
   if (priorityScanned) batchInfoParts.push(`우선셋[${priorityScanned}]`);
 
-  // ── ② 유니버스 배치 스캔 (기존 유지) ────────────────────────
-  if (krTradeEnabled && krScanEnabled && krOpen) {
+  // ── ② 유니버스 배치 스캔 ─────────────────────────────────────
+  // 수집은 auto_trade / trade_enabled 와 분리 — 스캔 활성 + 정규장이면 수행한다.
+  // (실주문은 processSymbol 내부 경계에서 ordersEnabled + 시장별 trade_enabled 로 통제)
+  if (krScanEnabled && krOpen) {
     const batch = await getNextBatch(env.DB, BATCH_SIZE, 'KR');
     batchInfoParts.push(`KR[${batch.offset}/${batch.total}]`);
     for (const it of batch.items) {
@@ -528,7 +558,7 @@ export async function runTradeScan(env: TradeEnv): Promise<{
     }
   }
 
-  if (usTradeEnabled && usScanEnabled && usOpen) {
+  if (usScanEnabled && usOpen) {
     const batch = await getNextBatch(env.DB, BATCH_SIZE, 'US');
     batchInfoParts.push(`US[${batch.offset}/${batch.total}]`);
     for (const it of batch.items) {
