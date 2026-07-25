@@ -149,6 +149,29 @@ describe('collectKR15Min', () => {
     expect(store.map.size).toBe(4);            // 중복 캔들 없음
   });
 
+  it('증분: 시간 공백이 2페이지보다 커도 reached_stored 까지 메운다(불연속 방지)', async () => {
+    // 09:00~11:59 (180개) 를 미리 저장(부트스트랩 대용)한 뒤, 하루가 진행돼
+    // 15:29 까지 데이터가 생겼고 종목이 오래 방치됐다고 가정. 증분 1회로 공백을 메운다.
+    const full = oneMinRange(0, 390);   // 09:00~15:29
+    const store = makeStore();
+    // 09:00~11:59(=startMin 0~179) 완성분만 미리 넣어 latest 를 11:xx 로 만든다
+    for (const b of aggregateTo15Min(full.slice(0, 180), kstMs(2026, 0, 5, 15, 40)).completed) {
+      store.map.set(b.datetime, b);
+    }
+    const latestBefore = [...store.map.keys()].sort().at(-1)!;
+    const page = makeFetchPage(full);
+    const r = await collectKR15Min({
+      ticker: '005930', nowMs: kstMs(2026, 0, 5, 15, 40),
+      fetchPage: page.fn, ...store,        // incrementalPages 기본 = maxPages(15)
+    });
+    expect(r.mode).toBe('incremental');
+    expect(r.stopReason).toBe('reached_stored');   // max_pages 아님 → 공백 없이 latest 까지 도달
+    expect(r.totalKisCalls).toBeGreaterThan(2);     // 2페이지로는 못 메우는 공백을 메웠다
+    // 저장 결과가 latest 이후로 연속인지: 새로 채운 최소 ts 가 latest 바로 다음 버킷 이하
+    const newMin = [...store.map.keys()].sort().find(ts => ts > latestBefore)!;
+    expect(newMin <= '20260105121500').toBe(true);  // 12:00/12:15 등 공백 시작 지점부터 이어짐
+  });
+
   it('정지조건 미도달 시 maxPages 에서 강제 종료(무제한 호출 방지)', async () => {
     // 매 페이지 새 봉 30개(09:00 미도달·중복·빈페이지 없음) → 오직 maxPages 로만 멈춤
     let call = 0;

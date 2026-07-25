@@ -135,7 +135,8 @@ export interface CollectDeps {
   upsert15m: (bars: Candle[]) => Promise<{ inserted: number; updated: number }>;
   /** 페이지 상한 (Phase 1 안전장치, 기본 15) */
   maxPages?: number;
-  /** 증분 모드에서 최대 페이지 (기본 2) */
+  /** 증분 모드 최대 페이지 (기본 = maxPages). reached_stored 로 조기 종료되므로
+   *  정상 시엔 1~2페이지만 쓰고, 공백이 크면 그만큼 더 페이징해 메운다. */
   incrementalPages?: number;
 }
 
@@ -157,7 +158,9 @@ export interface KRCollectDiag {
 /** 1분봉을 역방향 페이징으로 모아 15분봉 집계·저장하고 진단 리포트를 반환한다. */
 export async function collectKR15Min(deps: CollectDeps): Promise<KRCollectDiag> {
   const maxPages = deps.maxPages ?? 15;
-  const incrementalPages = deps.incrementalPages ?? 2;
+  // 증분 상한을 크게(기본=maxPages) 두어, 순환 스캔으로 종목이 오래 방치돼 생긴
+  // 시간 공백도 reached_stored 에 도달할 때까지 메운다(정상 시엔 1~2페이지에서 조기 종료).
+  const incrementalPages = deps.incrementalPages ?? maxPages;
   const latest = await deps.latestStoredTs();
   const mode: 'bootstrap' | 'incremental' = latest ? 'incremental' : 'bootstrap';
 

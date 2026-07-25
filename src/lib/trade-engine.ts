@@ -234,7 +234,9 @@ export async function runTradeScan(env: TradeEnv): Promise<{
   // 'legacy': 기존 getKR15MinCandles(당일 1분봉·단건) — 롤백용. 오염 방지 위해 저장 안 함.
   const krCandleSource = (cfgMap['kr_candle_source'] || 'history') === 'legacy' ? 'legacy' : 'history';
   const krBootstrapPages   = Math.max(1, Math.min(parseInt(cfgMap['kr_bootstrap_pages'] || '15', 10) || 15, 15));
-  const krIncrementalPages = Math.max(1, Math.min(parseInt(cfgMap['kr_incremental_pages'] || '2', 10) || 2, 15));
+  // 증분 상한 기본 15(=부트스트랩과 동일). reached_stored 로 조기 종료되므로 정상 비용은
+  // 1~2페이지지만, 순환 스캔 공백이 커도 연속 봉을 유지하도록 최대 15페이지까지 메운다.
+  const krIncrementalPages = Math.max(1, Math.min(parseInt(cfgMap['kr_incremental_pages'] || '15', 10) || 15, 15));
   // 시세 rate limiter: 실전 20/s 상한의 1/3 수준(≈8/s)으로 보수적 운용. 스캔 전체 공유.
   const krLimiter = makeKisRateLimiter({ minIntervalMs: 120, maxRetries: 3, baseBackoffMs: 300 });
 
