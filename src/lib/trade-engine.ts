@@ -27,7 +27,7 @@ import type { KISConfig, ExchangeCode, Candle } from './kis-api';
 import {
   getAccessToken,
   getKR15MinCandles, getUS15MinCandles,
-  getKROrderableCash, getUSOrderableCash,
+  getKROrderableCash, getUSOrderableCash, getUSOrderableQty,
   getKRHoldings, getUSHoldings,
   buyKR, sellKR, buyUS, sellUS,
 } from './kis-api';
@@ -450,7 +450,7 @@ export async function runTradeScan(env: TradeEnv): Promise<{
     // ── 매수 (원본 사이징: KR 10만원 / US $500) ──────────────
     if (signal.action === 'BUY') {
       const price = signal.current.close;
-      const qty   = Math.floor((isKR ? 100000 : 500) / price);
+      let   qty   = Math.floor((isKR ? 100000 : 500) / price);
       const tradeOn = isKR ? krTradeEnabled : usTradeEnabled;
       // ── 주문 흐름 추적 로그 (wrangler tail 에서 중단 지점 확인) ──
       console.log(`ORDERFLOW BUY ${item.market}/${item.ticker} tradeOn=${tradeOn}(${isKR ? 'kr' : 'us'}_trade_enabled) ordersEnabled=${ordersEnabled}(auto_trade=${autoTradeEnabled},observe=${observeOnly}) qty=${qty} price=${price}`);
@@ -476,29 +476,47 @@ export async function runTradeScan(env: TradeEnv): Promise<{
         actions.push(`[관찰:${item.market}매수] ${item.ticker} ${item.ticker_name} ${qty}주 @${price} (실주문 없음)`);
         return;
       }
-      // ④ 실주문 경로: 여기서만 잔고 검사(주문가능현금은 위에서 조회됨)
-      const need = price * qty * 1.002;
-      const bal  = isKR ? cash.kr : cash.us;
-      if (bal < need) {
-        console.log(`ORDERFLOW STOP@balance ${item.ticker} bal=${bal.toFixed(0)} < need=${need.toFixed(0)}`);
-        await logTrade(env.DB, blankLog(item, 'BUY_SKIP', `[BUY_SKIP] 잔고부족 (필요 ${need.toFixed(0)} > 가용 ${bal.toFixed(0)})`, price));
-        return;
+      // ④ 잔고/주문가능 게이트
+      if (isKR) {
+        // KR: 원화 주문가능금액으로 사전 게이트 (기존 유지)
+        const need = price * qty * 1.002;
+        if (cash.kr < need) {
+          console.log(`ORDERFLOW STOP@balance ${item.market}/${item.ticker} bal=${cash.kr.toFixed(0)} < need=${need.toFixed(0)}`);
+          await logTrade(env.DB, blankLog(item, 'BUY_SKIP', `[BUY_SKIP] 잔고부족 (필요 ${need.toFixed(0)} > 가용 ${cash.kr.toFixed(0)})`, price));
+          return;
+        }
+      } else {
+        // US: 외화 주문가능금액(cash.us)이 0이어도 원화주문/통합증거금으로 체결 가능하므로
+        //     cash.us 로 사전 차단하지 않는다. 종목별 주문가능수량을 조회해 로그·수량캡에만 쓰고,
+        //     최종 판단은 buyUS() 의 KIS 응답으로 한다. 조회 실패/0 이어도 주문은 진행한다.
+        try {
+          const q = await getUSOrderableQty(kisConfig, token, item.ticker, exCode, price);
+          console.log(`ORDERFLOW US orderable ${item.ticker} orderableQty=${q.orderableQty} (frcr_cash=${cash.us})`);
+          if (q.orderableQty >= 1 && q.orderableQty < qty) qty = q.orderableQty;   // 반영된 수량으로 캡(0/미확인 시 캡 안 함)
+        } catch (e) {
+          console.log(`ORDERFLOW US orderable query fail ${item.ticker}: ${String(e)} — KIS 주문 응답으로 최종 판단`);
+        }
+        if (qty < 1) {
+          console.log(`ORDERFLOW STOP@qty<1(after cap) ${item.ticker}`);
+          await logTrade(env.DB, blankLog(item, 'BUY_SKIP', `[BUY_SKIP] 주문가능수량 0 (${item.ticker})`, price));
+          return;
+        }
       }
       // ⑤ 실제 주문 API 호출
-      console.log(`ORDERFLOW CALL buy${isKR ? 'KR' : 'US'} ${item.ticker} qty=${qty} @${price}`);
+      console.log(`ORDERFLOW CALL buy${isKR ? 'KR' : 'US'} ticker=${item.ticker} qty=${qty} price=${price}`);
       const res = isKR
         ? await buyKR(kisConfig, token, item.ticker, qty)
         : await buyUS(kisConfig, token, item.ticker, qty, exCode);
-      console.log(`ORDERFLOW RESULT ${item.ticker} success=${res.success} order_no=${res.order_no ?? '-'} msg=${res.message ?? '-'}`);
-      // ⑥ orders INSERT
+      console.log(`ORDERFLOW RESULT ${item.ticker} success=${res.success} code=${res.code ?? '-'} msg=${res.message ?? '-'}`);
+      // ⑥ orders INSERT — 성공·실패 모두 기록(추적 가능). 실패는 KIS 원문 코드/메시지 포함.
       await saveOrder(env.DB, { order_no: res.order_no, ticker: item.ticker, ticker_name: item.ticker_name, market: item.market, order_type: 'BUY', price, qty, status: res.success ? 'FILLED' : 'FAILED', reason: 'BB_BUY', raw_response: JSON.stringify(res.raw) });
       console.log(`ORDERFLOW orders INSERT ${item.ticker} status=${res.success ? 'FILLED' : 'FAILED'}`);
       if (res.success) {
-        if (isKR) cash.kr -= need; else cash.us -= need;
+        if (isKR) cash.kr -= price * qty * 1.002;
         actions.push(`[${item.market}매수] ${item.ticker} ${item.ticker_name} ${qty}주 @${price}`);
       } else {
-        await logTrade(env.DB, blankLog(item, 'BUY_FAIL', `[BUY_FAIL] ${res.message}`, price));   // ⑥ 주문 실패 DB 기록
-        errors.push(`[${item.market}매수실패] ${item.ticker}: ${res.message}`);
+        await logTrade(env.DB, blankLog(item, 'BUY_FAIL', `[BUY_FAIL] ${item.market} ${item.ticker} code=${res.code ?? '-'} msg=${res.message}`, price));   // KIS 원문 코드/메시지 기록
+        errors.push(`[${item.market}매수실패] ${item.ticker}: [${res.code ?? '-'}] ${res.message}`);
       }
       return;
     }

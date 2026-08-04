@@ -4,7 +4,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 const spies = vi.hoisted(() => ({
   buyKR: vi.fn(), sellKR: vi.fn(), buyUS: vi.fn(), sellUS: vi.fn(),
   getKR15: vi.fn(), getUS15: vi.fn(), fetchKR1Min: vi.fn(),
-  getKROrderableCash: vi.fn(), getUSOrderableCash: vi.fn(),
+  getKROrderableCash: vi.fn(), getUSOrderableCash: vi.fn(), getUSOrderableQty: vi.fn(),
 }));
 // getBBSignal 반환을 테스트별로 제어 (전략 수학은 strategy-unchanged.test.ts 가 검증)
 const state = vi.hoisted(() => ({ signal: undefined as any }));
@@ -13,6 +13,7 @@ vi.mock('../src/lib/kis-api', () => ({
   getAccessToken: vi.fn(async () => 'tok'),
   getKROrderableCash: spies.getKROrderableCash,
   getUSOrderableCash: spies.getUSOrderableCash,
+  getUSOrderableQty: spies.getUSOrderableQty,
   getKRHoldings: vi.fn(async () => []),
   getUSHoldings: vi.fn(async () => []),
   getKR15MinCandles: spies.getKR15,
@@ -104,6 +105,7 @@ beforeEach(() => {
   Object.values(spies).forEach(s => s.mockReset());
   spies.getKROrderableCash.mockResolvedValue(1e9);
   spies.getUSOrderableCash.mockResolvedValue(1e9);
+  spies.getUSOrderableQty.mockResolvedValue({ orderableQty: 100, raw: {} });
   spies.buyKR.mockResolvedValue({ order_no: 'o', success: true, message: 'ok', raw: {} });
   spies.sellKR.mockResolvedValue({ order_no: 'o', success: true, message: 'ok', raw: {} });
   spies.buyUS.mockResolvedValue({ order_no: 'o', success: true, message: 'ok', raw: {} });
@@ -233,6 +235,40 @@ describe('라이브 (auto_trade=1, observe_only=0): 기존 주문 동작 그대�
     expect(spies.sellKR).toHaveBeenCalledTimes(1);
     expect(db._writes.realized_profits.length).toBeGreaterThan(0);
     expect(db._writes.holdings_deletes.length).toBeGreaterThan(0);
+  });
+});
+
+describe('US 매수: 외화 주문가능금액 0 이어도 원화주문/통합증거금 계좌는 주문', () => {
+  it('us_orderable_cash=0 이어도 buyUS 호출 + orders FILLED (frcr 0 으로 사전차단 안 함)', async () => {
+    vi.setSystemTime(US_OPEN); state.signal = sig('BUY');
+    spies.getUSOrderableCash.mockResolvedValue(0);                 // 외화 주문가능 0
+    spies.getUSOrderableQty.mockResolvedValue({ orderableQty: 10, raw: {} });  // 통합증거금 반영 수량
+    const db = makeDB({ ...baseCfg, kr_trade_enabled: '0', scan_kr_enabled: '0', observe_only_enabled: '0' });
+    await runTradeScan(env(db));
+    expect(spies.buyUS).toHaveBeenCalledTimes(1);                  // 사전 차단되지 않고 실제 주문
+    expect(db._writes.orders.some(b => b[7] === 'FILLED')).toBe(true);
+  });
+
+  it('종목별 주문가능수량 조회 실패해도 buyUS 진행(최종 판단은 KIS 응답)', async () => {
+    vi.setSystemTime(US_OPEN); state.signal = sig('BUY');
+    spies.getUSOrderableCash.mockResolvedValue(0);
+    spies.getUSOrderableQty.mockRejectedValue(new Error('psamount fail'));
+    const db = makeDB({ ...baseCfg, kr_trade_enabled: '0', scan_kr_enabled: '0', observe_only_enabled: '0' });
+    await runTradeScan(env(db));
+    expect(spies.buyUS).toHaveBeenCalledTimes(1);
+  });
+
+  it('KIS 거절 → orders FAILED + BUY_FAIL(코드·메시지) 기록', async () => {
+    vi.setSystemTime(US_OPEN); state.signal = sig('BUY');
+    spies.getUSOrderableCash.mockResolvedValue(0);
+    spies.buyUS.mockResolvedValue({ order_no: '', success: false, message: '주문가능금액 부족', code: '40580000', raw: { rt_cd: '1', msg_cd: '40580000', msg1: '주문가능금액 부족' } });
+    const db = makeDB({ ...baseCfg, kr_trade_enabled: '0', scan_kr_enabled: '0', observe_only_enabled: '0' });
+    await runTradeScan(env(db));
+    expect(spies.buyUS).toHaveBeenCalledTimes(1);
+    expect(db._writes.orders.some(b => b[7] === 'FAILED')).toBe(true);   // 실패도 orders 에 기록
+    const failLog = db._writes.trade_logs.find(b => b[3] === 'BUY_FAIL');
+    expect(failLog).toBeTruthy();
+    expect(String(failLog!.join(' '))).toContain('40580000');           // KIS 원문 코드
   });
 });
 

@@ -58,6 +58,7 @@ export interface OrderResult {
   order_no: string;
   success: boolean;
   message: string;
+  code?: string;      // KIS 응답코드 (msg_cd, 없으면 rt_cd) — 실패 추적용
   raw: unknown;
 }
 
@@ -408,6 +409,35 @@ export async function getUSOrderableCash(cfg: KISConfig, token: string): Promise
   return parseFloat(d.output?.frcr_ord_psbl_amt1 || '0');
 }
 
+// ─── 해외주식 종목별 주문가능수량 (통합증거금/원화주문 반영) ────
+// TR_ID: TTTS3007R  종목·거래소·주문단가를 넣어 실제 주문가능수량을 조회한다.
+// frcr(외화) 금액이 0이어도 원화주문/통합증거금이면 max_ord_psbl_qty 는 양수일 수 있다.
+export async function getUSOrderableQty(
+  cfg: KISConfig, token: string, ticker: string, exchange: ExchangeCode, price: number,
+): Promise<{ orderableQty: number; raw: unknown }> {
+  const params = new URLSearchParams({
+    CANO: cfg.accountNo,
+    ACNT_PRDT_CD: cfg.accountSuffix,
+    OVRS_EXCG_CD: exchange,                 // 주문용 거래소 코드(NASD/NYSE/AMEX)
+    OVRS_ORD_UNPR: String(price > 0 ? price : 0),
+    ITEM_CD: ticker,
+    TR_CRCY_CD: 'USD',
+  });
+  const res = await fetch(
+    `${KIS_BASE}/uapi/overseas-stock/v1/trading/inquire-psamount?${params}`,
+    { headers: kis_headers(cfg, token, 'TTTS3007R') }
+  );
+  if (!res.ok) throw new Error(`US OrderableQty HTTP ${res.status}`);
+  const d = await res.json() as {
+    rt_cd: string; msg1: string;
+    output: { ord_psbl_qty?: string; max_ord_psbl_qty?: string };
+  };
+  if (d.rt_cd !== '0') throw new Error(`KIS US OrderableQty: ${d.msg1}`);
+  const o = d.output || {};
+  const qty = parseInt(o.max_ord_psbl_qty || o.ord_psbl_qty || '0', 10) || 0;
+  return { orderableQty: qty, raw: d };
+}
+
 // ─── 해외주식 잔고 조회 ───────────────────────────────────────
 // TR_ID: TTTS3012R  /uapi/overseas-stock/v1/trading/inquire-balance
 // 동일 계좌번호 사용
@@ -690,9 +720,9 @@ async function postOrderKR(
     headers: kis_headers(cfg, token, trId),
     body: JSON.stringify(body),
   });
-  const d = await res.json() as { rt_cd: string; msg1: string; output?: { ODNO?: string } };
-  if (d.rt_cd !== '0') return { order_no: '', success: false, message: d.msg1, raw: d };
-  return { order_no: d.output?.ODNO || '', success: true, message: d.msg1, raw: d };
+  const d = await res.json() as { rt_cd: string; msg_cd?: string; msg1: string; output?: { ODNO?: string } };
+  if (d.rt_cd !== '0') return { order_no: '', success: false, message: d.msg1, code: d.msg_cd ?? d.rt_cd, raw: d };
+  return { order_no: d.output?.ODNO || '', success: true, message: d.msg1, code: d.msg_cd ?? d.rt_cd, raw: d };
 }
 
 // 해외주식 주문 (overseas order)
@@ -705,7 +735,7 @@ async function postOrderUS(
     headers: kis_headers(cfg, token, trId),
     body: JSON.stringify(body),
   });
-  const d = await res.json() as { rt_cd: string; msg1: string; output?: { ODNO?: string } };
-  if (d.rt_cd !== '0') return { order_no: '', success: false, message: d.msg1, raw: d };
-  return { order_no: d.output?.ODNO || '', success: true, message: d.msg1, raw: d };
+  const d = await res.json() as { rt_cd: string; msg_cd?: string; msg1: string; output?: { ODNO?: string } };
+  if (d.rt_cd !== '0') return { order_no: '', success: false, message: d.msg1, code: d.msg_cd ?? d.rt_cd, raw: d };
+  return { order_no: d.output?.ODNO || '', success: true, message: d.msg1, code: d.msg_cd ?? d.rt_cd, raw: d };
 }
