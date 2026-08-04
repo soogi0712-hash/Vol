@@ -256,6 +256,29 @@ export async function getKRHoldings(cfg: KISConfig, token: string): Promise<Hold
   }));
 }
 
+// ─── 국내 계좌 요약 (총평가금액·예수금) ───────────────────────
+// TR_ID: TTTC8434R  output2[0] — 총평가금액(tot_evlu_amt)은 예수금 포함.
+export async function getKRAccountSummary(cfg: KISConfig, token: string): Promise<{ totalEval: number; deposit: number }> {
+  const params = new URLSearchParams({
+    CANO: cfg.accountNo, ACNT_PRDT_CD: cfg.accountSuffix,
+    AFHR_FLPR_YN: 'N', OFL_YN: '', INQR_DVSN: '02',
+    UNPR_DVSN: '01', FUND_STTL_ICLD_YN: 'N', FNCG_AMT_AUTO_RDPT_YN: 'N',
+    PRCS_DVSN: '01', CTX_AREA_FK100: '', CTX_AREA_NK100: '',
+  });
+  const res = await fetch(
+    `${KIS_BASE}/uapi/domestic-stock/v1/trading/inquire-balance?${params}`,
+    { headers: kis_headers(cfg, token, 'TTTC8434R') }
+  );
+  if (!res.ok) throw new Error(`KR Account HTTP ${res.status}`);
+  const d = await res.json() as {
+    rt_cd: string; msg1: string;
+    output2: Array<{ tot_evlu_amt: string; dnca_tot_amt: string }>;
+  };
+  if (d.rt_cd !== '0') throw new Error(`KIS KR Account: ${d.msg1}`);
+  const o = d.output2?.[0];
+  return { totalEval: parseFloat(o?.tot_evlu_amt || '0'), deposit: parseFloat(o?.dnca_tot_amt || '0') };
+}
+
 // ─── 국내주식 시장가 매수 ─────────────────────────────────────
 // TR_ID: TTTC0802U  /uapi/domestic-stock/v1/trading/order-cash
 export async function buyKR(

@@ -1,7 +1,11 @@
 // Phase 1 진단 라우트 — KR 1분봉 수집 → 15분봉 집계 → candle_history(15m) 저장
 // 관찰 전용: 이 경로는 주문 함수(buyKR/sellKR/buyUS/sellUS)를 절대 호출하지 않는다.
 import { Hono } from 'hono';
-import { getAccessToken, fetchKR1MinPage } from '../lib/kis-api';
+import {
+  getAccessToken, fetchKR1MinPage,
+  getKRAccountSummary, getKROrderableCash,
+  getUSHoldings, getUSOrderableCash,
+} from '../lib/kis-api';
 import { collectKR15Min } from '../lib/kr-candles';
 import { makeKisRateLimiter } from '../lib/kis-rate-limit';
 import { CANDLE_HISTORY_UPSERT_SQL, candleHistoryBindings } from '../lib/indicators';
@@ -24,6 +28,66 @@ diag.use('*', async (c, next) => {
     return c.json({ success: false, message: 'forbidden' }, 403);
   }
   await next();
+});
+
+// GET /api/diag/account — 계좌/잔고 조회 점검 (실주문 전 사전 확인용)
+// 민감정보 절대 미출력: APP KEY/SECRET, 토큰 원문, 전체 계좌번호는 응답·로그에 넣지 않는다.
+diag.get('/account', async (c) => {
+  if (!c.env.KIS_APP_KEY) return c.json({ success: false, message: 'API 키 미설정' }, 400);
+
+  const cfg = {
+    appKey: c.env.KIS_APP_KEY, appSecret: c.env.KIS_APP_SECRET,
+    accountNo: c.env.KIS_ACCOUNT_NO, accountSuffix: c.env.KIS_ACCOUNT_SUFFIX || '01',
+  };
+  const acc    = c.env.KIS_ACCOUNT_NO || '';
+  const suffix = c.env.KIS_ACCOUNT_SUFFIX || '01';
+  // 끝 4자리만 노출 (예: ******1234-01)
+  const masked = '*'.repeat(Math.max(0, acc.length - 4)) + acc.slice(-4) + '-' + suffix;
+
+  // 응답/에러 문자열에서 민감값 제거 (혹시라도 KIS 에러 본문에 섞일 경우 대비)
+  // 토큰은 발급 후 sensitive 에 추가된다 (appKey/appSecret/전체계좌번호/토큰 모두 마스킹).
+  const sensitive: string[] = [cfg.appKey, cfg.appSecret, acc].filter(Boolean);
+  const scrub = (s: string) => {
+    let out = s;
+    for (const secret of sensitive) out = out.split(secret).join('***');
+    return out.slice(0, 200);
+  };
+
+  let token: string;
+  try {
+    token = await getAccessToken(cfg, c.env.KV);   // 토큰은 사용만, 절대 출력 금지
+    if (token) sensitive.push(token);
+  } catch (e) {
+    return c.json({ account_masked: masked, account_suffix: suffix, token_ok: false, message: scrub(String(e)) }, 200);
+  }
+
+  // ── KR ──
+  let kr_balance_ok = false, kr_total_eval: number | null = null, kr_orderable_cash: number | null = null;
+  let kr_error: string | null = null;
+  try { kr_total_eval = (await getKRAccountSummary(cfg, token)).totalEval; kr_balance_ok = true; }
+  catch (e) { kr_error = scrub(String(e)); }
+  try { kr_orderable_cash = await getKROrderableCash(cfg, token); }
+  catch (e) { if (!kr_error) kr_error = scrub(String(e)); }
+
+  // ── US (총평가금액 = 보유 포지션 시가평가 합, USD) ──
+  let us_balance_ok = false, us_total_eval: number | null = null, us_orderable_cash: number | null = null;
+  let us_error: string | null = null;
+  try {
+    const hs = await getUSHoldings(cfg, token);
+    us_total_eval = hs.reduce((s, h) => s + h.qty * h.current_price, 0);
+    us_balance_ok = true;
+  } catch (e) { us_error = scrub(String(e)); }
+  try { us_orderable_cash = await getUSOrderableCash(cfg, token); }
+  catch (e) { if (!us_error) us_error = scrub(String(e)); }
+
+  return c.json({
+    account_masked: masked,
+    account_suffix: suffix,
+    token_ok: true,
+    kr_balance_ok, kr_total_eval, kr_orderable_cash,
+    us_balance_ok, us_total_eval, us_orderable_cash,
+    ...(kr_error || us_error ? { errors: { kr: kr_error, us: us_error } } : {}),
+  });
 });
 
 // GET /api/diag/kr-candles/:ticker  — 지정 1개 종목만
