@@ -235,3 +235,16 @@ describe('라이브 (auto_trade=1, observe_only=0): 기존 주문 동작 그대�
     expect(db._writes.holdings_deletes.length).toBeGreaterThan(0);
   });
 });
+
+describe('주문 흐름 진단: SIGNAL_BUY 이후 중단 지점', () => {
+  it('kr_trade_enabled=0 → BUY_BLOCKED 기록 (기존 무로그 return 제거), 주문 없음', async () => {
+    vi.setSystemTime(KR_OPEN); state.signal = sig('BUY');
+    // auto_trade=1·observe=0 이라 주문 조건은 충족하지만, 시장별 스위치가 꺼져 있는 경우
+    const db = makeDB({ ...baseCfg, kr_trade_enabled: '0', us_trade_enabled: '0', scan_us_enabled: '0', observe_only_enabled: '0' });
+    await runTradeScan(env(db));
+    expect(spies.buyKR).not.toHaveBeenCalled();
+    expect(db._writes.orders).toHaveLength(0);
+    expect(db._writes.trade_logs.some(b => b[3] === 'SIGNAL_BUY')).toBe(true);   // 신호는 발생
+    expect(db._writes.trade_logs.some(b => b[3] === 'BUY_BLOCKED')).toBe(true);  // 중단 지점이 기록됨
+  });
+});

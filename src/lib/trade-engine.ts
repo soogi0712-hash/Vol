@@ -449,34 +449,50 @@ export async function runTradeScan(env: TradeEnv): Promise<{
 
     // ── 매수 (원본 사이징: KR 10만원 / US $500) ──────────────
     if (signal.action === 'BUY') {
-      const tradeOn = isKR ? krTradeEnabled : usTradeEnabled;
-      if (!tradeOn) return;
       const price = signal.current.close;
       const qty   = Math.floor((isKR ? 100000 : 500) / price);
+      const tradeOn = isKR ? krTradeEnabled : usTradeEnabled;
+      // ── 주문 흐름 추적 로그 (wrangler tail 에서 중단 지점 확인) ──
+      console.log(`ORDERFLOW BUY ${item.market}/${item.ticker} tradeOn=${tradeOn}(${isKR ? 'kr' : 'us'}_trade_enabled) ordersEnabled=${ordersEnabled}(auto_trade=${autoTradeEnabled},observe=${observeOnly}) qty=${qty} price=${price}`);
+
+      // ① 시장별 거래 스위치 — 기존엔 무로그 return 이라 진단 불가했음 → 이유를 남긴다.
+      if (!tradeOn) {
+        console.log(`ORDERFLOW STOP@tradeOff ${item.market}/${item.ticker} → ${isKR ? 'kr_trade_enabled' : 'us_trade_enabled'}=0`);
+        await logTrade(env.DB, blankLog(item, 'BUY_BLOCKED',
+          `[BUY_BLOCKED] ${item.market} ${isKR ? 'kr_trade_enabled' : 'us_trade_enabled'}=0 (시장별 거래 스위치 OFF)`, price));
+        return;
+      }
+      // ② 사이징(수량) 부족
       if (qty < 1) {
+        console.log(`ORDERFLOW STOP@qty<1 ${item.ticker} price=${price}`);
         await logTrade(env.DB, blankLog(item, 'BUY_SKIP', `[BUY_SKIP] 수량 부족 (금액/${price} < 1주)`, price));
         return;
       }
-      // ── 주문 차단 경계 (auto_trade OFF 또는 관찰전용): buyKR/buyUS 미호출 ──
-      // 신호 계산만 수행하는 모드 → 잔고 검사 없이(주문가능현금 미조회) 신호만 기록한다.
-      // 결정/수량/사이징은 위에서 원본 그대로 계산됨. 보유/체결주문/실현손익은 만들지 않는다.
+      // ③ 주문 차단 경계 (auto_trade OFF 또는 관찰전용): buyKR/buyUS 미호출, 신호만 기록.
       if (!ordersEnabled) {
+        console.log(`ORDERFLOW STOP@ordersDisabled ${item.ticker} auto_trade=${autoTradeEnabled} observe=${observeOnly} → OBSERVE_ONLY_BUY`);
         await logTrade(env.DB, blankLog(item, 'OBSERVE_ONLY_BUY',
           `[OBSERVE_ONLY_BUY] ${item.market} ${item.ticker} signal=BUY qty=${qty} price=${price} reason=BB_BUY (${signal.reason})`, price));
         actions.push(`[관찰:${item.market}매수] ${item.ticker} ${item.ticker_name} ${qty}주 @${price} (실주문 없음)`);
         return;
       }
-      // ── 실주문 경로: 여기서만 잔고 검사(주문가능현금은 위에서 조회됨) ──
+      // ④ 실주문 경로: 여기서만 잔고 검사(주문가능현금은 위에서 조회됨)
       const need = price * qty * 1.002;
       const bal  = isKR ? cash.kr : cash.us;
       if (bal < need) {
+        console.log(`ORDERFLOW STOP@balance ${item.ticker} bal=${bal.toFixed(0)} < need=${need.toFixed(0)}`);
         await logTrade(env.DB, blankLog(item, 'BUY_SKIP', `[BUY_SKIP] 잔고부족 (필요 ${need.toFixed(0)} > 가용 ${bal.toFixed(0)})`, price));
         return;
       }
+      // ⑤ 실제 주문 API 호출
+      console.log(`ORDERFLOW CALL buy${isKR ? 'KR' : 'US'} ${item.ticker} qty=${qty} @${price}`);
       const res = isKR
         ? await buyKR(kisConfig, token, item.ticker, qty)
         : await buyUS(kisConfig, token, item.ticker, qty, exCode);
+      console.log(`ORDERFLOW RESULT ${item.ticker} success=${res.success} order_no=${res.order_no ?? '-'} msg=${res.message ?? '-'}`);
+      // ⑥ orders INSERT
       await saveOrder(env.DB, { order_no: res.order_no, ticker: item.ticker, ticker_name: item.ticker_name, market: item.market, order_type: 'BUY', price, qty, status: res.success ? 'FILLED' : 'FAILED', reason: 'BB_BUY', raw_response: JSON.stringify(res.raw) });
+      console.log(`ORDERFLOW orders INSERT ${item.ticker} status=${res.success ? 'FILLED' : 'FAILED'}`);
       if (res.success) {
         if (isKR) cash.kr -= need; else cash.us -= need;
         actions.push(`[${item.market}매수] ${item.ticker} ${item.ticker_name} ${qty}주 @${price}`);
