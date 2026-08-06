@@ -77,22 +77,44 @@ function lsHeaders(token: string, trCd: string): Record<string, string> {
   };
 }
 
-// LS REST 공통 POST. rsp_cd !== '00000' 또는 HTTP 4xx/5xx 이면 throw.
-async function lsPost(token: string, path: string, trCd: string, inBlock: Record<string, unknown>): Promise<any> {
+/**
+ * TR별 "정상 처리" rsp_cd 허용목록. rsp_cd 는 메시지 문자열이 아니라 이 목록으로 판정한다.
+ * 여기에 없는 코드만 실패로 간주해 throw 한다.
+ *   CSPAQ12200: 00000 정상 / 00136 "조회가 완료되었습니다."
+ *   COSOQ00201: 00000 정상 / 02679 "조회내역이 없습니다."(빈 잔고 = 정상)
+ */
+export const LS_SUCCESS_CODES: Record<string, string[]> = {
+  CSPAQ12200: ['00000', '00136'],
+  COSOQ00201: ['00000', '02679'],
+};
+/** 정상이나 데이터가 없는(빈 결과) 코드 — 잔고 0 으로 처리한다. */
+export const LS_EMPTY_CODES: Record<string, string[]> = {
+  COSOQ00201: ['02679'],
+};
+
+export interface LSResult { data: any; rspCd: string; rspMsg: string; empty: boolean; }
+
+// LS REST 공통 POST. rsp_cd 를 즉시 throw 하지 않고 블록을 파싱한다.
+// TR별 허용목록(LS_SUCCESS_CODES)에 없는 rsp_cd 또는 HTTP 4xx/5xx 만 실패로 throw.
+async function lsPost(token: string, path: string, trCd: string, inBlock: Record<string, unknown>): Promise<LSResult> {
   const res = await fetch(`${LS_BASE}${path}`, {
     method: 'POST',
     headers: lsHeaders(token, trCd),
     body: JSON.stringify(inBlock),
   });
   const text = await res.text();
-  let d: any;
-  try { d = text ? JSON.parse(text) : {}; }
+  let data: any;
+  try { data = text ? JSON.parse(text) : {}; }
   catch { throw new Error(`LS ${trCd}: 비정상 응답(HTTP ${res.status})`); }
-  const rspCd = String(d.rsp_cd ?? '');
-  if (res.status >= 400 || (rspCd && rspCd !== '00000')) {
-    throw new Error(`LS ${trCd} rsp_cd=${rspCd || res.status} msg=${d.rsp_msg ?? ''}`);
+  const rspCd = String(data.rsp_cd ?? '');
+  const rspMsg = String(data.rsp_msg ?? '');
+  const ok = LS_SUCCESS_CODES[trCd] ?? ['00000'];
+  // rsp_cd 가 비어있으면(일부 응답) 통과, 있으면 허용목록으로 판정
+  if (res.status >= 400 || (rspCd && !ok.includes(rspCd))) {
+    throw new Error(`LS ${trCd} rsp_cd=${rspCd || res.status} msg=${rspMsg}`);
   }
-  return d;
+  const empty = (LS_EMPTY_CODES[trCd] ?? []).includes(rspCd);
+  return { data, rspCd, rspMsg, empty };
 }
 
 // ─── 국내 계좌 잔고 (CSPAQ12200) ──────────────────────────────
@@ -105,17 +127,21 @@ export interface LSKRBalance {
   balEval: number;         // 잔고(보유주식) 평가금액
   deposit: number;         // 예수금
   accountNo: string | null;
+  rspCd: string;
+  raw: { OutBlock1: any; OutBlock2: any };   // 진단용(호출측이 민감필드 제거 후 로깅)
 }
 export async function getLSKRBalance(cfg: LSConfig, token: string): Promise<LSKRBalance> {
-  const d = await lsPost(token, '/stock/accno', 'CSPAQ12200', { CSPAQ12200InBlock1: { BalCreTp: '1' } });
-  const o1 = d.CSPAQ12200OutBlock1 || {};
-  const o2 = d.CSPAQ12200OutBlock2 || {};
+  const { data, rspCd } = await lsPost(token, '/stock/accno', 'CSPAQ12200', { CSPAQ12200InBlock1: { BalCreTp: '1' } });
+  const o1 = data.CSPAQ12200OutBlock1 || {};
+  const o2 = data.CSPAQ12200OutBlock2 || {};
   return {
     orderableCash: toNum(o2.MnyOrdAbleAmt),
     totalEval: toNum(o2.DpsastTotamt),
     balEval: toNum(o2.BalEvalAmt),
     deposit: toNum(o2.Dps),
     accountNo: o1.AcntNo ?? null,
+    rspCd,
+    raw: { OutBlock1: o1, OutBlock2: o2 },
   };
 }
 
@@ -124,19 +150,24 @@ export async function getLSKRBalance(cfg: LSConfig, token: string): Promise<LSKR
 // resp OutBlock2: WonEvalSumAmt(원화평가합계=총평가 원화환산) / WonDpsBalAmt(원화예수금).
 //      OutBlock1: AcntNo(계좌번호 에코)
 export interface LSUSBalance {
-  totalEvalKRW: number;    // 원화환산 총평가금액
+  totalEvalKRW: number;    // 원화환산 총평가금액 (빈 결과면 0)
   wonDeposit: number;      // 원화예수금
   accountNo: string | null;
+  rspCd: string;
+  empty: boolean;          // 02679 등 조회내역 없음(잔고 0)
 }
 export async function getLSUSBalance(cfg: LSConfig, token: string, baseDateYYYYMMDD: string): Promise<LSUSBalance> {
-  const d = await lsPost(token, '/overseas-stock/accno', 'COSOQ00201', {
+  const { data, rspCd, empty } = await lsPost(token, '/overseas-stock/accno', 'COSOQ00201', {
     COSOQ00201InBlock1: { RecCnt: 1, BaseDt: baseDateYYYYMMDD, CrcyCode: 'ALL', AstkBalTpCode: '00' },
   });
-  const o1 = d.COSOQ00201OutBlock1 || {};
-  const o2 = d.COSOQ00201OutBlock2 || {};
+  const o1 = data.COSOQ00201OutBlock1 || {};
+  const o2 = data.COSOQ00201OutBlock2 || {};
+  // 빈 결과(02679)는 잔고 0 인 정상 응답으로 처리
   return {
-    totalEvalKRW: toNum(o2.WonEvalSumAmt),
-    wonDeposit: toNum(o2.WonDpsBalAmt),
+    totalEvalKRW: empty ? 0 : toNum(o2.WonEvalSumAmt),
+    wonDeposit: empty ? 0 : toNum(o2.WonDpsBalAmt),
     accountNo: o1.AcntNo ?? null,
+    rspCd,
+    empty,
   };
 }

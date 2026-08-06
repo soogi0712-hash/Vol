@@ -17,3 +17,19 @@ export function makeScrubber(secrets: Array<string | null | undefined>, maxLen =
     return out.length > maxLen ? out.slice(0, maxLen) : out;
   };
 }
+
+// 진단 로그용: 응답 블록에서 민감 키(계좌번호/비밀번호/앱키/시크릿/토큰)를 재귀 제거.
+// 금액 필드(MnyOrdAbleAmt 등)는 남겨 실제 값 유입 여부를 확인할 수 있게 한다.
+const SENSITIVE_KEY_RE = /acnt|acct|pwd|pass|secret|token|appkey|app_key/i;
+export function sanitizeBlocks<T>(value: T): T {
+  if (Array.isArray(value)) return value.map((v) => sanitizeBlocks(v)) as unknown as T;
+  if (value && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      if (SENSITIVE_KEY_RE.test(k)) { out[k] = '***'; continue; }
+      out[k] = sanitizeBlocks(v);
+    }
+    return out as unknown as T;
+  }
+  return value;
+}

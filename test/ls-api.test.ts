@@ -38,7 +38,7 @@ describe('getLSAccessToken', () => {
 });
 
 describe('getLSKRBalance (CSPAQ12200)', () => {
-  it('/stock/accno 로 tr_cd CSPAQ12200·BalCreTp=1 전송, OutBlock2 파싱', async () => {
+  it('rsp_cd=00000 정상 + OutBlock2 금액 파싱', async () => {
     stubFetch((url, init) => {
       expect(url).toBe('https://openapi.ls-sec.co.kr:8080/stock/accno');
       expect(init.headers['tr_cd']).toBe('CSPAQ12200');
@@ -56,16 +56,30 @@ describe('getLSKRBalance (CSPAQ12200)', () => {
     expect(b.balEval).toBe(234567);
     expect(b.deposit).toBe(1000000);
     expect(b.accountNo).toBe('55512345678');
+    expect(b.rspCd).toBe('00000');
+    expect(b.raw.OutBlock2.MnyOrdAbleAmt).toBe('1000000');   // 진단용 원문 노출
   });
 
-  it('rsp_cd 가 00000 이 아니면 throw', async () => {
+  it('rsp_cd=00136 "조회가 완료되었습니다"도 성공 처리 + 금액 파싱', async () => {
+    stubFetch(() => ({ json: {
+      rsp_cd: '00136', rsp_msg: '조회가 완료되었습니다.',
+      CSPAQ12200OutBlock1: { AcntNo: '55512345678' },
+      CSPAQ12200OutBlock2: { MnyOrdAbleAmt: '1000000', DpsastTotamt: '1000000', BalEvalAmt: '0', Dps: '1000000' },
+    } }));
+    const b = await getLSKRBalance(cfg, 'T');
+    expect(b.rspCd).toBe('00136');
+    expect(b.orderableCash).toBe(1000000);
+    expect(b.totalEval).toBe(1000000);
+  });
+
+  it('허용목록에 없는 실제 오류코드는 throw', async () => {
     stubFetch(() => ({ json: { rsp_cd: 'IZAA001', rsp_msg: '조회 오류' } }));
     await expect(getLSKRBalance(cfg, 'T')).rejects.toThrow(/CSPAQ12200 rsp_cd=IZAA001/);
   });
 });
 
 describe('getLSUSBalance (COSOQ00201)', () => {
-  it('/overseas-stock/accno 로 tr_cd COSOQ00201·BaseDt·CrcyCode=ALL 전송, 원화환산 총평가 파싱', async () => {
+  it('rsp_cd=00000 정상 — 원화환산 총평가 파싱', async () => {
     stubFetch((url, init) => {
       expect(url).toBe('https://openapi.ls-sec.co.kr:8080/overseas-stock/accno');
       expect(init.headers['tr_cd']).toBe('COSOQ00201');
@@ -82,6 +96,20 @@ describe('getLSUSBalance (COSOQ00201)', () => {
     const b = await getLSUSBalance(cfg, 'T', '20260806');
     expect(b.totalEvalKRW).toBe(5000000);
     expect(b.wonDeposit).toBe(2000000);
-    expect(b.accountNo).toBe('55512345678');
+    expect(b.empty).toBe(false);
+  });
+
+  it('rsp_cd=02679 "조회내역이 없습니다" → 성공, 평가금액 0(빈 잔고)', async () => {
+    stubFetch(() => ({ json: { rsp_cd: '02679', rsp_msg: '조회내역이 없습니다.' } }));
+    const b = await getLSUSBalance(cfg, 'T', '20260806');
+    expect(b.rspCd).toBe('02679');
+    expect(b.empty).toBe(true);
+    expect(b.totalEvalKRW).toBe(0);
+    expect(b.wonDeposit).toBe(0);
+  });
+
+  it('허용목록에 없는 실제 오류코드는 throw', async () => {
+    stubFetch(() => ({ json: { rsp_cd: 'IGW00001', rsp_msg: '권한 오류' } }));
+    await expect(getLSUSBalance(cfg, 'T', '20260806')).rejects.toThrow(/COSOQ00201 rsp_cd=IGW00001/);
   });
 });

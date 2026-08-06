@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { maskAccount, makeScrubber } from '../local-runner/mask';
+import { maskAccount, makeScrubber, sanitizeBlocks } from '../local-runner/mask';
 
 describe('maskAccount', () => {
   it('끝 4자리만 노출 + suffix', () => {
@@ -28,5 +28,24 @@ describe('makeScrubber', () => {
   it('짧은/빈 비밀값(4자 미만)은 무시하여 과잉치환 방지', () => {
     const scrub = makeScrubber(['', 'ab', undefined, null as any]);
     expect(scrub('abcdef')).toBe('abcdef');
+  });
+});
+
+describe('sanitizeBlocks', () => {
+  it('계좌/비밀번호 키는 ***, 금액 필드는 보존', () => {
+    const out = sanitizeBlocks({
+      AcntNo: '55512345678', Pwd: '0000',
+      MnyOrdAbleAmt: '1000000', DpsastTotamt: '1234567', Dps: '1000000',
+    }) as any;
+    expect(out.AcntNo).toBe('***');
+    expect(out.Pwd).toBe('***');
+    expect(out.MnyOrdAbleAmt).toBe('1000000');   // 금액은 확인용으로 유지
+    expect(out.DpsastTotamt).toBe('1234567');
+    expect(out.Dps).toBe('1000000');
+  });
+  it('중첩 객체/배열도 재귀 처리', () => {
+    const out = sanitizeBlocks({ list: [{ acnt_no: 'x', val: '5' }] }) as any;
+    expect(out.list[0].acnt_no).toBe('***');
+    expect(out.list[0].val).toBe('5');
   });
 });

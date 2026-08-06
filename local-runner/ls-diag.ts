@@ -17,15 +17,15 @@ async function main() {
   try { cfg = loadConfig(); }
   catch (e) { log.error(String(e)); process.exit(1); return; }
 
-  const r = await runBalanceCheck(cfg, log);
+  const r = await runBalanceCheck(cfg, log, { diagRaw: true });
 
   log.info('----- 결과 요약 -----');
   log.info(JSON.stringify({
     broker: 'LS', observe_only: true, orders_submitted: 0,
     account_masked: r.account_masked, account_suffix: r.account_suffix,
     token_ok: r.token_ok,
-    kr_balance_ok: r.kr_balance_ok, kr_total_eval: r.kr_total_eval, kr_orderable_cash: r.kr_orderable_cash,
-    us_balance_ok: r.us_balance_ok, us_total_eval_krw: r.us_total_eval_krw,
+    kr_balance_ok: r.kr_balance_ok, kr_rsp_cd: r.kr_rsp_cd, kr_total_eval: r.kr_total_eval, kr_orderable_cash: r.kr_orderable_cash,
+    us_balance_ok: r.us_balance_ok, us_rsp_cd: r.us_rsp_cd, us_total_eval_krw: r.us_total_eval_krw,
     errors: r.errors,
   }, null, 2));
   log.info(`로그 파일: ${log.file}`);
