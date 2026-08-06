@@ -209,6 +209,8 @@ export interface Readiness {
   gscStale: boolean;          // GSC 300초 초과 → 신호/신규매수 중단
   gscAgeSec: number | null;
   gshAgeSec: number | null;
+  warmup: boolean;            // 확정봉<20 (BB/RSI/Signal 은 계속 계산, 신규매수만 대기)
+  warmupRemaining: number;    // READY 까지 남은 확정봉 수(가짜로 채우지 않음)
   reasons: string[];
 }
 
@@ -220,6 +222,8 @@ export function evaluateReadiness(s: ReadinessState, nowMs: number): Readiness {
   const gscFresh = gscAgeMs != null && gscAgeMs <= GSC_FRESH_MS;
   const gshFresh = gshAgeMs != null && gshAgeMs <= GSH_FRESH_MS;
   const enough = s.confirmedCount >= MIN_RT_CANDLES;
+  const warmup = !enough;                                        // 확정봉<20 → Warm-up
+  const warmupRemaining = Math.max(0, MIN_RT_CANDLES - s.confirmedCount);   // 남은 개수(가짜 없음)
 
   const reasons: string[] = [];
   if (!s.websocketConnected) reasons.push('WS 미연결');
@@ -228,7 +232,7 @@ export function evaluateReadiness(s: ReadinessState, nowMs: number): Readiness {
   if (!gshFresh) reasons.push(`GSH stale(${ageSec(gshAgeMs)})`);
   if (!(s.lastPrice > 0)) reasons.push('lastPrice<=0');
   if (!gscFresh) reasons.push(`GSC stale(${ageSec(gscAgeMs)})`);
-  if (!enough) reasons.push(`확정봉 부족(${s.confirmedCount}<${MIN_RT_CANDLES})`);
+  if (!enough) reasons.push(`Warm-up(확정봉 ${s.confirmedCount}/${MIN_RT_CANDLES}, remaining=${warmupRemaining})`);
   if (s.storeCorrupted) reasons.push('저장손상→신규매수 차단');
 
   // 신규매수: WS연결 + 양방향 호가>0 + GSH 30초 + lastPrice>0 + GSC 300초 + 확정봉≥20 + 저장정상
@@ -248,6 +252,8 @@ export function evaluateReadiness(s: ReadinessState, nowMs: number): Readiness {
     gscStale: gscAgeMs != null && gscAgeMs > GSC_FRESH_MS,
     gscAgeSec: gscAgeMs == null ? null : Math.round(gscAgeMs / 1000),
     gshAgeSec: gshAgeMs == null ? null : Math.round(gshAgeMs / 1000),
+    warmup,
+    warmupRemaining,
     reasons,
   };
 }

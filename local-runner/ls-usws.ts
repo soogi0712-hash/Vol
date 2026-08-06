@@ -44,20 +44,28 @@ interface SymCtx {
   bestAsk: number;
 }
 
-// 확정봉 ≥20 + GSC 신선(allowSignal) 이면 BB(20,2)/RSI(14)/getBBSignal → OBSERVE 로그.
-// 신호 action + 신호 기준이 된 최신 확정봉 datetime 을 반환(게이트 dedup 키). 형성봉 제외(req 9).
-function observeSignal(log: Logger, ctx: SymCtx): { action: string; candleDatetime: string } | null {
+// Warm-up/관찰 신호 계산 — 확정봉으로 BB(20,2)/RSI(14)/getBBSignal 을 **항상** 계산한다(형성봉 제외).
+//   - Warm-up(확정봉<20): [WARMUP] 로그로 remaining 과 함께 계속 계산(가짜봉으로 채우지 않음, req 2·6·7).
+//   - READY(확정봉==20 순간 자동): [OBSERVE] 로그. 확정봉 부족으로 BB 미산출이면 signal=NONE.
+// 신호 action + 기준 최신 확정봉 datetime 반환(게이트 dedup 키). 확정봉 0개면 null.
+function observeSignal(log: Logger, ctx: SymCtx, warmup: boolean, remaining: number): { action: string; candleDatetime: string } | null {
   const confirmed = ctx.builder.confirmedCandles();   // 확정봉만(형성봉 제외)
-  if (confirmed.length < MIN_RT_CANDLES) return null;
+  if (confirmed.length === 0) return null;
   const closes = confirmed.map(c => c.close);
+  const dts = confirmed.map(c => c.datetime);
+  const rsi = calcRSI(closes, 14);
+  const bands = calcBB(closes, dts, 20, 2);
+  const sig = getBBSignal(bands, false, false, rsi);   // 관찰: 보유/상단돌파 상태 없음
+  const rsiLast = rsi.at(-1);
+  if (warmup) {
+    log.info(`[WARMUP US:${ctx.exchange}:${ctx.symbol}] 확정봉=${confirmed.length}/${MIN_RT_CANDLES} remaining=${remaining} rsi=${Number.isFinite(rsiLast) ? rsiLast!.toFixed(1) : '-'} signal=${sig.action}(${sig.reason}) — 20개까지 계산 대기(가짜봉 없음)`);
+    return { action: sig.action, candleDatetime: dts[dts.length - 1] };
+  }
   const qv = validateCandleData(closes, MIN_RT_CANDLES, 20, 0.001);
   if (!qv.valid) { log.warn(`[US:${ctx.symbol}] 신호검증 스킵 — ${qv.reason} (${qv.detail})`); return null; }
-  const bands = calcBB(closes, confirmed.map(c => c.datetime), 20, 2);
-  const rsi = calcRSI(closes, 14);
-  const sig = getBBSignal(bands, false, false, rsi);   // 관찰: 보유/상단돌파 상태 없음
   // ⚠️ 신호가 BUY/SELL 이어도 주문 함수는 호출하지 않는다 — 로그만.
-  log.info(`[OBSERVE US:${ctx.exchange}:${ctx.symbol}] signal=${sig.action} reason=${sig.reason} 확정봉=${confirmed.length} 현재가=${ctx.lastPrice || '-'} rsi=${rsi.at(-1)?.toFixed(1) ?? '-'} (주문 없음)`);
-  return { action: sig.action, candleDatetime: confirmed[confirmed.length - 1].datetime };
+  log.info(`[OBSERVE US:${ctx.exchange}:${ctx.symbol}] signal=${sig.action} reason=${sig.reason} 확정봉=${confirmed.length} 현재가=${ctx.lastPrice || '-'} rsi=${Number.isFinite(rsiLast) ? rsiLast!.toFixed(1) : '-'} (주문 없음)`);
+  return { action: sig.action, candleDatetime: dts[dts.length - 1] };
 }
 
 async function main() {
@@ -277,15 +285,16 @@ async function main() {
           storeCorrupted: ctx.store.corrupt,
         }, now);
         log.info(
-          `[READY ${ctx.symbol}] confirmed=${ctx.builder.confirmedCount} forming=${ctx.builder.hasForming}`
+          `[READY ${ctx.symbol}] READY=${r.ready} warmup=${r.warmup}${r.warmup ? ` remaining=${r.warmupRemaining}` : ''}`
+          + ` confirmed=${ctx.builder.confirmedCount}/${MIN_RT_CANDLES} forming=${ctx.builder.hasForming}`
           + ` gscAgeSec=${r.gscAgeSec ?? '-'} gshAgeSec=${r.gshAgeSec ?? '-'} wsConnected=${client.connected}`
           + ` bid=${ctx.bestBid || '-'} ask=${ctx.bestAsk || '-'} lastPrice=${ctx.lastPrice || '-'}`
           + ` 신규매수허용=${r.allowNewBuy} 신호계산허용=${r.allowSignal} 보유매도허용=${r.allowSellExisting}`
           + (r.reasons.length ? ` | ${r.reasons.join(', ')}` : ''),
         );
-        // 신호 계산은 GSC 신선 + 확정봉 충분(allowSignal) 일 때만 — 형성봉 제외(req 9).
-        const sig = r.allowSignal ? observeSignal(log, ctx) : null;
-        // ARMED/실주문은 실전 대상 1종목(예: NASDAQ:AAPL)에만 적용(req 1).
+        // BB/RSI/Signal 은 Warm-up 동안에도 계속 계산(확정봉>0). 형성봉 제외(req 2·9).
+        const sig = observeSignal(log, ctx, r.warmup, r.warmupRemaining);
+        // ARMED/실주문은 실전 대상 1종목(예: NASDAQ:AAPL)에만, Warm-up 종료(확정봉≥20)+GSC신선일 때만 평가.
         if (isLiveSymbol(liveCfg, ctx.symbol)) {
           // 미체결 조정: 체결완료→해소 / 타임아웃→취소. 취소TR 미확인이면 취소는 실패로 남고 pending 유지(req15).
           if (ctx.orders.hasPending()) {
@@ -296,7 +305,7 @@ async function main() {
               log.warn(`[RECONCILE ${ctx.symbol}] 미체결 ${ctx.orders.pending.length}건 존재하나 실주문/취소 비활성 → 수동 확인 필요(신규주문 차단)`);
             }
           }
-          if (armedMode && sig) await evaluateArmed(ctx, sig, Date.now());
+          if (armedMode && sig && !r.warmup && r.allowSignal) await evaluateArmed(ctx, sig, Date.now());
         }
       }
     } finally { ticking = false; }

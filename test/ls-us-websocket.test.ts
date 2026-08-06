@@ -109,10 +109,43 @@ describe('readiness gate (req6, GSC/GSH 분리)', () => {
     expect(r.allowNewBuy).toBe(false);
     expect(r.reasons.some(x => x.includes('WS 미연결'))).toBe(true);
   });
-  it('확정봉 부족 → not ready', () => {
+  it('확정봉 부족 → not ready(Warm-up)', () => {
     const r = evaluateReadiness({ ...base(), confirmedCount: 5 }, now);
     expect(r.ready).toBe(false);
-    expect(r.reasons.some(x => x.includes('확정봉 부족'))).toBe(true);
+    expect(r.warmup).toBe(true);
+    expect(r.reasons.some(x => x.includes('Warm-up'))).toBe(true);
+  });
+});
+
+describe('Warm-up 모드 (확정봉<20)', () => {
+  const now = 1_000_000_000_000;
+  const base = () => ({
+    websocketConnected: true, lastGSCatMs: now - 5000, lastGSHatMs: now - 5000,
+    lastPrice: 100, bestBid: 99, bestAsk: 101, storeCorrupted: false,
+  });
+  it('확정봉 8 → warmup=true, remaining=12, READY=false', () => {
+    const r = evaluateReadiness({ ...base(), confirmedCount: 8 }, now);
+    expect(r.warmup).toBe(true);
+    expect(r.warmupRemaining).toBe(12);
+    expect(r.ready).toBe(false);
+  });
+  it('확정봉 19 → remaining=1', () => {
+    expect(evaluateReadiness({ ...base(), confirmedCount: 19 }, now).warmupRemaining).toBe(1);
+  });
+  it('확정봉 20 되는 순간 → warmup=false, remaining=0, READY=true 자동 전환', () => {
+    const r = evaluateReadiness({ ...base(), confirmedCount: 20 }, now);
+    expect(r.warmup).toBe(false);
+    expect(r.warmupRemaining).toBe(0);
+    expect(r.ready).toBe(true);
+  });
+  it('확정봉 25 → warmup=false, remaining=0', () => {
+    const r = evaluateReadiness({ ...base(), confirmedCount: 25 }, now);
+    expect(r.warmup).toBe(false);
+    expect(r.warmupRemaining).toBe(0);
+  });
+  it('remaining 은 실제 확정봉 수만 반영(가짜로 채우지 않음)', () => {
+    expect(evaluateReadiness({ ...base(), confirmedCount: 0 }, now).warmupRemaining).toBe(20);
+    expect(evaluateReadiness({ ...base(), confirmedCount: 13 }, now).warmupRemaining).toBe(7);
   });
 });
 

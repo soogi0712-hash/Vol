@@ -124,7 +124,7 @@ describe('req10-6/7: readiness 게이트(확정봉 기준)', () => {
     const r = evaluateReadiness(goodState({ confirmedCount: 19 }), NOW);
     expect(r.ready).toBe(false);
     expect(r.allowNewBuy).toBe(false);
-    expect(r.reasons.join(' ')).toMatch(/확정봉 부족/);
+    expect(r.reasons.join(' ')).toMatch(/Warm-up/);
   });
   it('확정봉 ≥20 + 모두 신선 → readiness=true, 신규매수 허용', () => {
     const r = evaluateReadiness(goodState(), NOW);
