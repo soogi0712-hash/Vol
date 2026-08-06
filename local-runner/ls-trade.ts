@@ -7,7 +7,7 @@ import { loadConfig, getTokenCached, resolveUSQuote } from './ls-client';
 import { loadKRSymbols, loadUSSymbols } from './universe';
 import { sanitizeBlocks, makeScrubber } from './mask';
 import {
-  getLSKR15Min, getLSUS15Min, getLSKRPrice, getLSUSPrice, classifyChart,
+  getLSKR15Min, getLSUS15MinPaged, getLSKRPrice, getLSUSPrice, classifyChart,
   LSApiError, type LSCandle, type LSHttpDiag,
 } from '../src/lib/ls-api';
 // 유지 대상 엔진 그대로 재사용
@@ -110,11 +110,13 @@ async function main() {
   const sdate = kstYmd(10);   // 최근 ~10일 범위로 40개 확보
   for (const s of (quote.delaygb ? us.ok : [])) {
     try {
-      const r = await getLSUS15Min(acct, token, s.symbol, s.exchcd, quote.delaygb, sdate, 120);
-      const status = classifyChart(r);
-      if (status !== 'OK') {
-        // ── 빈/무효 응답 진단 (req 1·5·6): 원문 HTTP + 요청body + OutBlock(cts) ──
-        log.warn(`[US:${s.symbol}] g3203 ${status} — rsp_cd='${r.rspCd}' msg='${r.rspMsg}' OutBlock1개수=${r.rawCount}`);
+      // 비압축(comp_yn=N, qrycnt=5) 연속조회로 최신 60 확정봉 확보(공식 제한 준수).
+      const paged = await getLSUS15MinPaged(acct, token, s.symbol, s.exchcd, quote.delaygb, { target: 60, maxCalls: 12, ncnt: 15, sdate });
+      const r = paged.last;
+      if (paged.candles.length === 0) {
+        // ── 빈/무효 응답 진단 (req 1·5·6): 원문 HTTP + 요청body + OutBlock(cts) + 연속조회 헤더 ──
+        log.warn(`[US:${s.symbol}] g3203 ${classifyChart(r)} — ${paged.calls}회 연속조회 후 확정봉 0`);
+        log.warn(`[US:${s.symbol}] g3203 진단 — qrycnt=${(r.reqBody as any).g3203InBlock?.qrycnt} comp_yn=${(r.reqBody as any).g3203InBlock?.comp_yn} ncnt=${(r.reqBody as any).g3203InBlock?.ncnt} 요청tr_cont=${r.diag.reqHeaders.tr_cont} 요청tr_cont_key='${r.diag.reqHeaders.tr_cont_key}' 응답tr_cont=${r.resTrCont} 응답tr_cont_key='${r.resTrContKey}' rec_count=${r.recCount}`);
         logHttpDiag(log, scrubReady, 'US', s.symbol, 'g3203', r.diag);
         log.warn(`[US:${s.symbol}] 요청body=${JSON.stringify(sanitizeBlocks(r.reqBody))}`);
         log.warn(`[US:${s.symbol}] OutBlock(cts 포함)=${JSON.stringify(sanitizeBlocks(r.outBlock))}`);
@@ -129,9 +131,10 @@ async function main() {
         }
         continue;
       }
+      log.info(`[US:${s.symbol}] g3203 연속조회 ${paged.calls}회 → 확정봉 ${paged.candles.length}개`);
       let price: number | null = null;
       try { price = (await getLSUSPrice(acct, token, s.symbol, s.exchcd, quote.delaygb!)).price; } catch (e) { logErr(log, scrubReady, 'US', s.symbol, 'g3101', e); }
-      observeSignal(log, 'US', `${s.exchange}:${s.symbol}`, r.candles, price);
+      observeSignal(log, 'US', `${s.exchange}:${s.symbol}`, paged.candles, price);
     } catch (e) { logErr(log, scrubReady, 'US', s.symbol, 'g3203', e); }
   }
 

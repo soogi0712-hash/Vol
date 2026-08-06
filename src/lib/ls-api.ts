@@ -67,14 +67,14 @@ export async function getLSAccessToken(cfg: LSConfig, kv?: KVNamespace): Promise
   return d.access_token;
 }
 
-// LS REST 공통 헤더 (tr_cont='N' 단건 조회)
-function lsHeaders(token: string, trCd: string): Record<string, string> {
+// LS REST 공통 헤더. 연속조회 시 tr_cont='Y' + 이전 응답 tr_cont_key (공식 연속조회 방식).
+function lsHeaders(token: string, trCd: string, trCont = 'N', trContKey = ''): Record<string, string> {
   return {
     'content-type': 'application/json; charset=UTF-8',
     'authorization': `Bearer ${token}`,
     'tr_cd': trCd,
-    'tr_cont': 'N',
-    'tr_cont_key': '',
+    'tr_cont': trCont,
+    'tr_cont_key': trContKey,
   };
 }
 
@@ -177,14 +177,16 @@ async function runLimited<T>(op: () => Promise<T>): Promise<T> {
 // LS REST 공통 POST. rsp_cd 를 즉시 throw 하지 않고 블록을 파싱한다.
 // TR별 허용목록(LS_SUCCESS_CODES)에 없는 rsp_cd 만 실패. 네트워크/호출제한을 분류.
 // 전체 동작을 runLimited 로 감싸 직렬화 + IGW00201 재시도를 적용한다.
-async function lsPost(token: string, path: string, trCd: string, inBlock: Record<string, unknown>): Promise<LSResult> {
-  const reqHeaders = { tr_cd: trCd, tr_cont: 'N', tr_cont_key: '', content_type: 'application/json; charset=UTF-8' };
+async function lsPost(token: string, path: string, trCd: string, inBlock: Record<string, unknown>, cont: { trCont?: string; trContKey?: string } = {}): Promise<LSResult> {
+  const trCont = cont.trCont ?? 'N';
+  const trContKey = cont.trContKey ?? '';
+  const reqHeaders = { tr_cd: trCd, tr_cont: trCont, tr_cont_key: trContKey, content_type: 'application/json; charset=UTF-8' };
   return runLimited(async () => {
     let res: Response;
     try {
       res = await fetch(`${LS_BASE}${path}`, {
         method: 'POST',
-        headers: lsHeaders(token, trCd),
+        headers: lsHeaders(token, trCd, trCont, trContKey),
         body: JSON.stringify(inBlock),
       });
     } catch (e) {
@@ -272,9 +274,15 @@ export async function getLSUSPrice(cfg: LSConfig, token: string, symbol: string,
 // 차트 조회 결과(진단 포함). candles 는 확정봉(형성봉 제외, 오름차순).
 export interface LSChartResult {
   candles: LSCandle[];
+  rows: LSCandle[];        // 형성봉 포함 전체 매핑 행(연속조회 병합용)
   rspCd: string;
   rspMsg: string;
   rawCount: number;        // OutBlock1 원본 행 수(확정봉 제외 전)
+  recCount: number;        // OutBlock.rec_count (응답 건수)
+  ctsDate: string;         // OutBlock.cts_date (연속조회 위치)
+  ctsTime: string;         // OutBlock.cts_time (연속조회 위치)
+  resTrCont: string;       // 응답 헤더 tr_cont ('Y'=연속조회 있음)
+  resTrContKey: string;    // 응답 헤더 tr_cont_key (다음 요청에 사용)
   outBlock: any;           // 요약 OutBlock (연속조회 cts 필드 등 포함)
   reqBody: Record<string, unknown>;   // 실제 요청 body (진단용, 민감정보 없음)
   diag: LSHttpDiag;
@@ -295,26 +303,98 @@ export async function getLSKR15Min(cfg: LSConfig, token: string, shcode: string,
   // 공식 reqExample 필드 유지, ncnt(분)=15 / qrycnt(요청개수)만 조정. edate=99999999=최근.
   const reqBody = { t8412InBlock: { shcode, ncnt: 15, qrycnt, nday: '0', sdate: '', stime: '', edate: '99999999', etime: '', cts_date: '', cts_time: '', comp_yn: 'N' } };
   const { data, rspCd, rspMsg, diag } = await lsPost(token, '/stock/chart', 't8412', reqBody);
-  const rows: any[] = data.t8412OutBlock1 || [];
-  const candles = toConfirmed(rows.map(r => ({
+  const rowsRaw: any[] = data.t8412OutBlock1 || [];
+  const rows = rowsRaw.map(r => ({
     datetime: String(r.date) + String(r.time).padStart(6, '0'),
     open: toNum(r.open), high: toNum(r.high), low: toNum(r.low), close: toNum(r.close), volume: toNum(r.jdiff_vol),
-  })));
-  return { candles, rspCd, rspMsg, rawCount: rows.length, outBlock: data.t8412OutBlock || {}, reqBody, diag };
+  }));
+  const ob = data.t8412OutBlock || {};
+  return {
+    candles: toConfirmed(rows), rows, rspCd, rspMsg, rawCount: rowsRaw.length,
+    recCount: toNum(ob.rec_count), ctsDate: String(ob.cts_date ?? ''), ctsTime: String(ob.cts_time ?? ''),
+    resTrCont: diag.trCont, resTrContKey: diag.trContKey, outBlock: ob, reqBody, diag,
+  };
 }
 
 // ── 해외 15분봉 (g3203, ncnt=15) — OutBlock1: date/loctime/open/high/low/close/exevol ──
-export async function getLSUS15Min(cfg: LSConfig, token: string, symbol: string, exchcd: string, delaygb: string, sdateYYYYMMDD: string, qrycnt = 100): Promise<LSChartResult> {
+// ⚠️ 공식 제한(g3203): comp_yn='N'(비압축) → qrycnt 최대 5. comp_yn='Y'(압축) → 최대 2000.
+//    압축응답 해제 방식은 공식 문서에서 확인되지 않았으므로 여기서는 비압축(N, 상한 5)만 사용한다.
+//    20개 이상 시드는 getLSUS15MinPaged 로 연속조회(tr_cont/tr_cont_key) 반복 호출해 확보한다.
+// g3203InBlock 필드(공식): delaygb/keysymbol/exchcd/symbol/ncnt/qrycnt/comp_yn/sdate/edate — cts_* 입력 없음.
+export const LS_G3203_MAX_QRYCNT_UNCOMPRESSED = 5;   // comp_yn='N' 공식 상한
+
+export interface LSUS15MinOpts {
+  ncnt?: number;        // 분(기본 15)
+  qrycnt?: number;      // 요청건수 — comp_yn='N' 공식 상한 5 로 강제 clamp
+  sdate?: string;       // 시작일 YYYYMMDD (공식 reqExample 필드)
+  edate?: string;       // 종료일(기본 '')
+  trCont?: string;      // 연속조회 요청 헤더('N' 최초 / 'Y' 연속)
+  trContKey?: string;   // 이전 응답 tr_cont_key
+}
+
+export async function getLSUS15Min(
+  cfg: LSConfig, token: string, symbol: string, exchcd: string, delaygb: string, opts: LSUS15MinOpts = {},
+): Promise<LSChartResult> {
   // delaygb 는 하드코딩하지 않는다(req1·4): 호출측이 실시간('R') 또는 공식 지연 코드를 전달.
-  // 그 외 필드는 공식 reqExample 유지: keysymbol=exchcd+symbol, comp_yn=N, edate="".
-  const reqBody = { g3203InBlock: { delaygb, keysymbol: exchcd + symbol, exchcd, symbol, ncnt: 15, qrycnt, comp_yn: 'N', sdate: sdateYYYYMMDD, edate: '' } };
-  const { data, rspCd, rspMsg, diag } = await lsPost(token, '/overseas-stock/chart', 'g3203', reqBody);
-  const rows: any[] = data.g3203OutBlock1 || [];
-  const candles = toConfirmed(rows.map(r => ({
+  const ncnt = opts.ncnt ?? 15;
+  const qrycnt = Math.min(opts.qrycnt ?? LS_G3203_MAX_QRYCNT_UNCOMPRESSED, LS_G3203_MAX_QRYCNT_UNCOMPRESSED);   // 비압축 상한 5
+  const reqBody = { g3203InBlock: { delaygb, keysymbol: exchcd + symbol, exchcd, symbol, ncnt, qrycnt, comp_yn: 'N', sdate: opts.sdate ?? '', edate: opts.edate ?? '' } };
+  const { data, rspCd, rspMsg, diag } = await lsPost(token, '/overseas-stock/chart', 'g3203', reqBody, { trCont: opts.trCont ?? 'N', trContKey: opts.trContKey ?? '' });
+  const rowsRaw: any[] = data.g3203OutBlock1 || [];
+  const rows = rowsRaw.map(r => ({
     datetime: String(r.date) + String(r.loctime).padStart(6, '0'),
     open: toNum(r.open), high: toNum(r.high), low: toNum(r.low), close: toNum(r.close), volume: toNum(r.exevol),
-  })));
-  return { candles, rspCd, rspMsg, rawCount: rows.length, outBlock: data.g3203OutBlock || {}, reqBody, diag };
+  }));
+  const ob = data.g3203OutBlock || {};
+  return {
+    candles: toConfirmed(rows), rows, rspCd, rspMsg, rawCount: rowsRaw.length,
+    recCount: toNum(ob.rec_count), ctsDate: String(ob.cts_date ?? ''), ctsTime: String(ob.cts_time ?? ''),
+    resTrCont: diag.trCont, resTrContKey: diag.trContKey, outBlock: ob, reqBody, diag,
+  };
+}
+
+// ── 해외 15분봉 연속조회 시드 (Phase B) ──────────────────────────
+// 비압축(qrycnt=5)으로 tr_cont='Y' + tr_cont_key(이전 응답 헤더)를 사용해 반복 호출,
+// timestamp 로 중복 제거하며 최신 target 개 확정봉(형성봉 제외)을 확보한다. RateLimiter 준수(lsPost 경유).
+export interface LSChartPaged {
+  candles: LSCandle[];   // 병합·중복제거·정렬된 확정봉(최신 1개=형성봉 제외)
+  calls: number;
+  pages: Array<{ rspCd: string; rawCount: number; recCount: number; resTrCont: string; resTrContKey: string }>;
+  last: LSChartResult;   // 마지막 페이지(진단용)
+}
+
+export async function getLSUS15MinPaged(
+  cfg: LSConfig, token: string, symbol: string, exchcd: string, delaygb: string,
+  opts: { target?: number; maxCalls?: number; ncnt?: number; sdate?: string } = {},
+): Promise<LSChartPaged> {
+  const target = opts.target ?? 60;
+  const maxCalls = opts.maxCalls ?? 12;
+  const ncnt = opts.ncnt ?? 15;
+  const sdate = opts.sdate ?? '';
+  const seen = new Set<string>();
+  const merged: LSCandle[] = [];
+  const pages: LSChartPaged['pages'] = [];
+  let trCont = 'N';
+  let trContKey = '';
+  let calls = 0;
+  let last!: LSChartResult;
+  while (calls < maxCalls) {
+    const r = await getLSUS15Min(cfg, token, symbol, exchcd, delaygb, { ncnt, qrycnt: LS_G3203_MAX_QRYCNT_UNCOMPRESSED, sdate, trCont, trContKey });
+    calls++;
+    last = r;
+    let added = 0;
+    for (const c of r.rows) if (!seen.has(c.datetime)) { seen.add(c.datetime); merged.push(c); added++; }   // 중복 timestamp 제거
+    pages.push({ rspCd: r.rspCd, rawCount: r.rawCount, recCount: r.recCount, resTrCont: r.resTrCont, resTrContKey: r.resTrContKey });
+    if (merged.length >= target + 1) break;                 // +1: 형성봉 제외 후 target 확보
+    if (r.rows.length === 0 || added === 0) break;          // 진전 없음 → 중단
+    if (r.resTrCont !== 'Y' || !r.resTrContKey) break;      // 연속조회 없음(공식 헤더 기준)
+    trCont = 'Y';
+    trContKey = r.resTrContKey;
+  }
+  const sorted = merged.sort((a, b) => a.datetime.localeCompare(b.datetime));
+  const confirmed = sorted.length > 1 ? sorted.slice(0, -1) : sorted;   // 최신 1개=형성봉 제외
+  const candles = confirmed.slice(Math.max(0, confirmed.length - target));   // 최신 target 개
+  return { candles, calls, pages, last };
 }
 
 // ─── 국내 계좌 잔고 (CSPAQ12200) ──────────────────────────────

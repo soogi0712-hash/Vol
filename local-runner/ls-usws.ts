@@ -7,7 +7,7 @@ import { createLogger, type Logger } from './logger';
 import { loadConfig, getTokenCached, resolveUSQuote } from './ls-client';
 import { loadUSSymbols } from './universe';
 import { makeScrubber } from './mask';
-import { getLSUS15Min } from '../src/lib/ls-api';
+import { getLSUS15MinPaged } from '../src/lib/ls-api';
 import {
   LSUSRealtimeClient, RealtimeCandleBuilder, buildWsTrKey, evaluateReadiness, MIN_RT_CANDLES,
   type RTCandle,
@@ -91,18 +91,30 @@ async function main() {
       log.info(`[US:${s.symbol}] 저장 확정봉 복원 ${stored.length}개`);
     }
 
-    // REST 초기 시드(가능 시). 실패는 WS 를 막지 않는다(req 5).
+    // REST 초기 시드(가능 시). 비압축(comp_yn=N, qrycnt=5) 연속조회로 최신 60 확정봉 확보(req 2·4).
+    // 실패는 WebSocket 을 막지 않는다(req 5).
     if (quote.delaygb) {
       try {
-        const r = await getLSUS15Min(cfg, token, s.symbol, s.exchcd, quote.delaygb, sdate, 120);
+        const r = await getLSUS15MinPaged(cfg, token, s.symbol, s.exchcd, quote.delaygb, { target: 60, maxCalls: 12, ncnt: 15, sdate });
+        // 저장 확정봉 + REST 확정봉을 timestamp 로 병합/중복제거. 형성봉은 제외됨(paged 가 최신 1개 제외).
         builder.seed(r.candles.map(c => ({ datetime: c.datetime, open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume })));
-        log.info(`[US:${s.symbol}] REST g3203 시드 ${r.candles.length}개 (rsp_cd='${r.rspCd}') → 병합 후 확정봉=${builder.confirmedCount}`);
-        // REST 로 새로 확보된 확정봉도 저장(손상 아니면). 형성봉은 아직 없음(GSC 전).
+        const lastPage = r.last;
+        log.info(`[US:${s.symbol}] REST g3203 연속조회 ${r.calls}회 → 확정봉 ${r.candles.length}개 (rsp_cd='${lastPage.rspCd}') → 병합 후 확정봉=${builder.confirmedCount}`);
+        if (r.candles.length === 0) {
+          // req 6: 빈 응답 진단 — qrycnt / comp_yn / ncnt / tr_cont / tr_cont_key 반드시 출력
+          const ib = (lastPage.reqBody as any).g3203InBlock ?? {};
+          log.warn(`[US:${s.symbol}] g3203 빈 응답 진단 — qrycnt=${ib.qrycnt} comp_yn=${ib.comp_yn} ncnt=${ib.ncnt}`
+            + ` 요청tr_cont=${lastPage.diag.reqHeaders.tr_cont} 요청tr_cont_key='${lastPage.diag.reqHeaders.tr_cont_key}'`
+            + ` 응답tr_cont=${lastPage.resTrCont} 응답tr_cont_key='${lastPage.resTrContKey}' rec_count=${lastPage.recCount} rawCount=${lastPage.rawCount}`);
+        }
+        // REST 로 확보된 확정봉을 저장(손상 아니면). 형성봉은 아직 없음(GSC 전).
         if (!store.corrupt) {
           let dirty = false;
           for (const c of builder.confirmedCandles()) if (store.upsertConfirmed(toStored(c))) dirty = true;
           if (dirty) store.flush();
         }
+        // confirmed>=20 이면 즉시 READY 평가 가능(이후 WebSocket GSC/GSH 로 실시간 갱신, req 5).
+        if (builder.confirmedCount >= MIN_RT_CANDLES) log.info(`[US:${s.symbol}] 확정봉 ${builder.confirmedCount}개(≥${MIN_RT_CANDLES}) → REST 시드만으로 신호계산 준비됨`);
       } catch (e) { log.warn(`[US:${s.symbol}] REST 시드 실패(무시, WS 로 진행): ${scrub(String(e))}`); }
     } else {
       log.warn(`[US:${s.symbol}] REST 시드 생략(${quote.error ?? 'delaygb 미설정'}) — WS 실시간으로만 집계`);
