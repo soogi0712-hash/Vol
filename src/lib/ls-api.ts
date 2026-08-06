@@ -33,10 +33,10 @@ const toNum = (v: unknown): number => {
  *   resp: { access_token, token_type, expires_in, scope }
  * 유효기간은 익일 07:00 까지(문서). expires_in 을 그대로 캐시 TTL 로 사용.
  */
-export async function getLSAccessToken(cfg: LSConfig, kv?: KVNamespace, cacheKey = 'ls_token_v1'): Promise<string> {
+export async function getLSAccessToken(cfg: LSConfig, kv?: KVNamespace): Promise<string> {
   const now = Date.now();
   if (kv) {
-    const cached = await kv.get(cacheKey);
+    const cached = await kv.get('ls_token_v1');
     if (cached) {
       const t = JSON.parse(cached) as LSTokenCache;
       if (t.expires_at > now + 60_000) return t.access_token;
@@ -62,7 +62,7 @@ export async function getLSAccessToken(cfg: LSConfig, kv?: KVNamespace, cacheKey
   if (!d.access_token) throw new Error('LS Token: access_token 없음');
   const ttl = d.expires_in && d.expires_in > 0 ? d.expires_in : 86400;
   const obj: LSTokenCache = { access_token: d.access_token, expires_at: now + (ttl - 60) * 1000 };
-  if (kv) await kv.put(cacheKey, JSON.stringify(obj), { expirationTtl: ttl - 60 });
+  if (kv) await kv.put('ls_token_v1', JSON.stringify(obj), { expirationTtl: ttl - 60 });
   else _lsMemToken = obj;
   return d.access_token;
 }
@@ -287,20 +287,6 @@ export function classifyChart(r: LSChartResult): LSChartStatus {
   if (r.rawCount === 0 && noEnvelope) return 'INVALID_RESPONSE';
   if (r.candles.length === 0) return 'EMPTY';
   return 'OK';
-}
-
-// 진단용 g3101 프로브 — 유효성 throw 없이 rsp_cd/price/원문을 그대로 반환(키 비교용).
-export interface LSQuoteProbe { rspCd: string; rspMsg: string; price: number; diag: LSHttpDiag | null; }
-export async function probeLSUSQuote(token: string, symbol: string, exchcd: string, delaygb: string): Promise<LSQuoteProbe> {
-  try {
-    const res = await lsPost(token, '/overseas-stock/market-data', 'g3101', {
-      g3101InBlock: { delaygb, keysymbol: exchcd + symbol, exchcd, symbol },
-    });
-    return { rspCd: res.rspCd, rspMsg: res.rspMsg, price: toNum(res.data?.g3101OutBlock?.price), diag: res.diag };
-  } catch (e) {
-    if (e instanceof LSApiError) return { rspCd: e.rspCd ?? '', rspMsg: e.message, price: 0, diag: e.diag ?? null };
-    throw e;
-  }
 }
 
 // ── 국내 15분봉 (t8412, ncnt=15) — OutBlock1: date/time/open/high/low/close/jdiff_vol ──

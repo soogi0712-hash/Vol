@@ -2,46 +2,37 @@
 // src/lib/ls-api.ts(LS 공식 TR) 를 그대로 재사용한다.
 import { getLSAccessToken, getLSKRBalance, getLSUSBalance } from '../src/lib/ls-api';
 import { FileKV } from './file-kv';
-import { maskAccount, makeScrubber, sanitizeBlocks, keyFingerprint } from './mask';
+import { maskAccount, makeScrubber, sanitizeBlocks } from './mask';
 import type { Logger } from './logger';
 
-// KR/US 앱키 완전 분리 (req 1~4). 국내=KR키, overseas-stock/*=US키. 토큰도 분리.
-export interface KeyPair { appKey: string; appSecret: string; }
 export interface LocalLSConfig {
-  kr: KeyPair;
-  us: KeyPair;
+  appKey: string;
+  appSecret: string;
   accountNo?: string;
   accountSuffix?: string;
   liveTrading: boolean;   // LS_LIVE_TRADING === 'true' 일 때만 true (기본 observe-only)
 }
 
 export function loadConfig(): LocalLSConfig {
-  const kr: KeyPair = { appKey: process.env.LS_KR_APP_KEY || '', appSecret: process.env.LS_KR_APP_SECRET || '' };
-  const us: KeyPair = { appKey: process.env.LS_US_APP_KEY || '', appSecret: process.env.LS_US_APP_SECRET || '' };
-  const missing: string[] = [];
-  if (!kr.appKey || !kr.appSecret) missing.push('LS_KR_APP_KEY/LS_KR_APP_SECRET');
-  if (!us.appKey || !us.appSecret) missing.push('LS_US_APP_KEY/LS_US_APP_SECRET');
-  if (missing.length) throw new Error(`${missing.join(', ')} 미설정 (.env.local) — 국내/해외 키 분리 필요`);
+  const appKey = process.env.LS_APP_KEY || '';
+  const appSecret = process.env.LS_APP_SECRET || '';
+  if (!appKey || !appSecret) {
+    throw new Error('LS_APP_KEY / LS_APP_SECRET 미설정 (.env.local 확인)');
+  }
   return {
-    kr, us,
+    appKey, appSecret,
     accountNo: process.env.LS_ACCOUNT_NO || undefined,
     accountSuffix: process.env.LS_ACCOUNT_SUFFIX || undefined,
     liveTrading: process.env.LS_LIVE_TRADING === 'true',   // 기본 false = observe-only
   };
 }
 
-// 지문 로그 (앞 4자리만, req 5): "KR key = abcd****  US key = 9f21****"
-export function logKeyFingerprints(cfg: LocalLSConfig, log: Logger): void {
-  log.info(`KR key = ${keyFingerprint(cfg.kr.appKey)}  US key = ${keyFingerprint(cfg.us.appKey)}`);
-}
-
-// 시장별 토큰 발급/캐시 — KR/US 완전 분리 캐시키(ls_token_kr / ls_token_us).
-// LS_FORCE_TOKEN_REFRESH=true 면 기존 캐시 삭제 후 재발급(req 7 — 해외 약정등록 후).
-export async function getTokenFor(pair: KeyPair, market: 'kr' | 'us'): Promise<string> {
+// 토큰만 발급/캐시해 반환 (Phase 2 시세/분봉 호출용).
+// LS_FORCE_TOKEN_REFRESH=true 면 기존 캐시를 삭제하고 새로 발급한다(req 7 — 해외 약정등록 후).
+export async function getTokenCached(cfg: LocalLSConfig): Promise<string> {
   const kv = new FileKV();
-  const cacheKey = `ls_token_${market}`;
-  if (process.env.LS_FORCE_TOKEN_REFRESH === 'true') kv.delete(cacheKey);
-  return getLSAccessToken({ appKey: pair.appKey, appSecret: pair.appSecret }, kv as any, cacheKey);
+  if (process.env.LS_FORCE_TOKEN_REFRESH === 'true') kv.delete('ls_token_v1');
+  return getLSAccessToken({ appKey: cfg.appKey, appSecret: cfg.appSecret }, kv as any);
 }
 
 // 해외 시세 구분 해석(req 1~6). REALTIME='R'(공식 확인값), DELAYED=공식 지연코드(env 로 입력).
@@ -84,7 +75,8 @@ export interface BalanceReport {
 // diagRaw=true 면 국내 응답 블록 원문을 민감필드 제거 후 임시 로깅한다(필드 유입 확인용).
 export async function runBalanceCheck(cfg: LocalLSConfig, log: Logger, opts: { diagRaw?: boolean } = {}): Promise<BalanceReport> {
   const suffix = cfg.accountSuffix || '';
-  const sensitive: Array<string | undefined> = [cfg.kr.appKey, cfg.kr.appSecret, cfg.us.appKey, cfg.us.appSecret, cfg.accountNo];
+  const kv = new FileKV();
+  const sensitive: Array<string | undefined> = [cfg.appKey, cfg.appSecret, cfg.accountNo];
   let scrub = makeScrubber(sensitive);
 
   const report: BalanceReport = {
@@ -93,49 +85,53 @@ export async function runBalanceCheck(cfg: LocalLSConfig, log: Logger, opts: { d
     us_balance_ok: false, us_rsp_cd: null, us_total_eval_krw: null,
     errors: { kr: null, us: null },
   };
-  logKeyFingerprints(cfg, log);
+
+  let token: string;
+  try {
+    token = await getLSAccessToken({ appKey: cfg.appKey, appSecret: cfg.appSecret }, kv as any);
+    report.token_ok = true;
+    sensitive.push(token);
+    scrub = makeScrubber(sensitive);
+    log.info('LS 토큰 발급/캐시 OK');
+  } catch (e) {
+    log.error(`LS 토큰 발급 실패: ${scrub(String(e))}`);
+    return report;
+  }
 
   // 해외 잔고 기준일 = KST 오늘 (YYYYMMDD)
   const k = new Date(Date.now() + 9 * 3600 * 1000);
   const baseDt = `${k.getUTCFullYear()}${String(k.getUTCMonth() + 1).padStart(2, '0')}${String(k.getUTCDate()).padStart(2, '0')}`;
 
   let acctFromApi: string | null = null;
-
-  // ── 국내: KR 키/토큰 ──
   try {
-    const krToken = await getTokenFor(cfg.kr, 'kr');
-    sensitive.push(krToken); scrub = makeScrubber(sensitive);
-    const b = await getLSKRBalance(cfg.kr, krToken);
+    const b = await getLSKRBalance({ appKey: cfg.appKey, appSecret: cfg.appSecret }, token);
     report.kr_balance_ok = true;
     report.kr_rsp_cd = b.rspCd;
     report.kr_total_eval = b.totalEval;
     report.kr_orderable_cash = b.orderableCash;
     acctFromApi = b.accountNo;
-    log.info(`KR 잔고 OK (KR키 ${keyFingerprint(cfg.kr.appKey)}, rsp_cd=${b.rspCd}) — 총평가=${b.totalEval.toLocaleString()} 주문가능현금=${b.orderableCash.toLocaleString()}`);
+    log.info(`KR 잔고 OK (rsp_cd=${b.rspCd}) — 총평가=${b.totalEval.toLocaleString()} 주문가능현금=${b.orderableCash.toLocaleString()}`);
+    // 임시 진단: 국내 응답 블록 원문(민감필드 제거) — MnyOrdAbleAmt/DpsastTotamt/Dps 유입 확인용
     if (opts.diagRaw) {
       log.info('[DIAG] CSPAQ12200 OutBlock1(민감제거)=' + scrub(JSON.stringify(sanitizeBlocks(b.raw.OutBlock1))));
       log.info('[DIAG] CSPAQ12200 OutBlock2=' + scrub(JSON.stringify(sanitizeBlocks(b.raw.OutBlock2))));
     }
   } catch (e) {
     report.errors.kr = scrub(String(e));
-    log.error(`KR 잔고 실패 (KR키 ${keyFingerprint(cfg.kr.appKey)}): ${report.errors.kr}`);
+    log.error(`KR 잔고 실패: ${report.errors.kr}`);
   }
 
-  // ── 해외: US 키/토큰 ──
   try {
-    const usToken = await getTokenFor(cfg.us, 'us');
-    sensitive.push(usToken); scrub = makeScrubber(sensitive);
-    const b = await getLSUSBalance(cfg.us, usToken, baseDt);
+    const b = await getLSUSBalance({ appKey: cfg.appKey, appSecret: cfg.appSecret }, token, baseDt);
     report.us_balance_ok = true;
     report.us_rsp_cd = b.rspCd;
     report.us_total_eval_krw = b.totalEvalKRW;
     if (!acctFromApi) acctFromApi = b.accountNo;
-    log.info(`US 잔고 OK (US키 ${keyFingerprint(cfg.us.appKey)}, rsp_cd=${b.rspCd}${b.empty ? ', 조회내역 없음→0' : ''}) — 원화환산 총평가=${b.totalEvalKRW.toLocaleString()}`);
+    log.info(`US 잔고 OK (rsp_cd=${b.rspCd}${b.empty ? ', 조회내역 없음→0' : ''}) — 원화환산 총평가=${b.totalEvalKRW.toLocaleString()}`);
   } catch (e) {
     report.errors.us = scrub(String(e));
-    log.error(`US 잔고 실패 (US키 ${keyFingerprint(cfg.us.appKey)}): ${report.errors.us}`);
+    log.error(`US 잔고 실패: ${report.errors.us}`);
   }
-  report.token_ok = report.kr_balance_ok || report.us_balance_ok;
 
   // 계좌 마스킹 (env 우선, 없으면 API 에코). 전체 계좌번호는 절대 로그/반환 금지.
   report.account_masked = maskAccount(cfg.accountNo || acctFromApi, suffix);

@@ -18,12 +18,6 @@ export function makeScrubber(secrets: Array<string | null | undefined>, maxLen =
   };
 }
 
-// APP KEY 지문 — 앞 4자리만 노출(req 5). 예: 'abcd****'. 빈 값은 '(none)'.
-export function keyFingerprint(key: string | null | undefined): string {
-  if (!key) return '(none)';
-  return key.slice(0, 4) + '****';
-}
-
 // 진단 로그용: 응답 블록에서 민감 키(계좌번호/비밀번호/앱키/시크릿/토큰)를 재귀 제거.
 // 금액 필드(MnyOrdAbleAmt 등)는 남겨 실제 값 유입 여부를 확인할 수 있게 한다.
 const SENSITIVE_KEY_RE = /acnt|acct|pwd|pass|secret|token|appkey|app_key/i;

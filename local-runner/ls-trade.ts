@@ -3,9 +3,9 @@
 // → OBSERVE 로그. 주문은 절대 실행하지 않는다(LS_LIVE_TRADING 게이트 + 주문 미구현 2중 차단).
 import { loadEnvLocal } from './env';
 import { createLogger, type Logger } from './logger';
-import { loadConfig, getTokenFor, resolveUSQuote, logKeyFingerprints } from './ls-client';
+import { loadConfig, getTokenCached, resolveUSQuote } from './ls-client';
 import { loadKRSymbols, loadUSSymbols } from './universe';
-import { sanitizeBlocks, makeScrubber, keyFingerprint } from './mask';
+import { sanitizeBlocks, makeScrubber } from './mask';
 import {
   getLSKR15Min, getLSUS15Min, getLSKRPrice, getLSUSPrice, classifyChart,
   LSApiError, type LSCandle, type LSHttpDiag,
@@ -69,26 +69,22 @@ async function main() {
   const observeOnly = !cfg.liveTrading;
   log.info(`모드: ${observeOnly ? 'OBSERVE-ONLY (주문 없음)' : 'LIVE 요청됨'} · LS_LIVE_TRADING=${cfg.liveTrading}`);
 
+  const acct = { appKey: cfg.appKey, appSecret: cfg.appSecret };
   // 원문 로그 마스킹 스크러버 (앱키/시크릿/토큰/계좌) — req 2
-  let scrubReady: Scrub = (s) => s;   // 토큰 발급 전 임시
-  logKeyFingerprints(cfg, log);       // req 5: 앞 4자리만
+  const scrub: Scrub = (s) => s;   // 토큰 발급 전 임시
+  let scrubReady: Scrub = scrub;
 
-  // 국내=KR키/토큰, 해외=US키/토큰 완전 분리 (req 1~4)
-  let krToken = '', usToken = '';
-  try { krToken = await getTokenFor(cfg.kr, 'kr'); log.info(`KR 토큰 OK (${keyFingerprint(cfg.kr.appKey)})`); }
-  catch (e) { logErr(log, scrubReady, 'TOKEN-KR', '-', 'oauth', e); }
-  try { usToken = await getTokenFor(cfg.us, 'us'); log.info(`US 토큰 OK (${keyFingerprint(cfg.us.appKey)})`); }
-  catch (e) { logErr(log, scrubReady, 'TOKEN-US', '-', 'oauth', e); }
-  scrubReady = makeScrubber([cfg.kr.appKey, cfg.kr.appSecret, cfg.us.appKey, cfg.us.appSecret, krToken, usToken, cfg.accountNo]);
-  if (!krToken && !usToken) { log.error('KR/US 토큰 모두 실패 — 중단'); process.exit(1); return; }
+  let token: string;
+  try { token = await getTokenCached(cfg); log.info('LS 토큰 OK'); }
+  catch (e) { logErr(log, scrubReady, 'TOKEN', '-', 'oauth', e); process.exit(1); return; }
+  scrubReady = makeScrubber([cfg.appKey, cfg.appSecret, token, cfg.accountNo]);
 
-  // ── 국내 (KR 키/토큰, 순차 처리, Promise.all 금지) ──
-  const kr = krToken ? loadKRSymbols() : [];
-  if (!krToken) log.warn('KR 토큰 없음 — 국내 스킵');
-  else log.info(`국내 관찰 종목: ${kr.map(s => s.shcode).join(', ')}`);
+  // ── 국내 (순차 처리, Promise.all 금지) ──
+  const kr = loadKRSymbols();
+  log.info(`국내 관찰 종목: ${kr.map(s => s.shcode).join(', ')}`);
   for (const s of kr) {
     try {
-      const r = await getLSKR15Min(cfg.kr, krToken, s.shcode, 60);
+      const r = await getLSKR15Min(acct, token, s.shcode, 60);
       const status = classifyChart(r);
       if (status !== 'OK') {
         log.warn(`[KR:${s.shcode}] t8412 ${status} — rsp_cd=${r.rspCd} msg=${r.rspMsg} OutBlock1개수=${r.rawCount}`);
@@ -96,24 +92,25 @@ async function main() {
         continue;
       }
       let price: number | null = null;
-      try { price = (await getLSKRPrice(cfg.kr, krToken, s.shcode)).price; } catch (e) { logErr(log, scrubReady, 'KR', s.shcode, 't1102', e); }
+      try { price = (await getLSKRPrice(acct, token, s.shcode)).price; } catch (e) { logErr(log, scrubReady, 'KR', s.shcode, 't1102', e); }
       observeSignal(log, 'KR', s.shcode, r.candles, price);
     } catch (e) { logErr(log, scrubReady, 'KR', s.shcode, 't8412', e); }
   }
 
-  // ── 해외 (US 키/토큰, 순차 처리) ──
+  // ── 해외 (순차 처리) ──
   const us = loadUSSymbols();
   for (const u of us.unsupported) log.warn(`[US:${u.token}] UNSUPPORTED_EXCHANGE (${u.exchange}) — LS exchcd 미확인, 스킵(추측 금지)`);
   // 해외 시세 구분(delaygb): 미국 실시간은 Non-Display 불가 → 기본 DELAYED. 공식 지연코드는 env.
   const quote = resolveUSQuote();
-  if (!usToken) log.warn('US 토큰 없음 — 해외 스킵');
-  else if (!quote.delaygb) log.error(`해외 시세 스킵 — ${quote.error}`);
-  else log.info(`해외 시세 구분: mode=${quote.mode} delaygb=${quote.delaygb} (US키 ${keyFingerprint(cfg.us.appKey)}) · 관찰: ${us.ok.map(s => `${s.exchange}:${s.symbol}`).join(', ')}`);
-  const usActive = !!usToken && !!quote.delaygb;
+  if (!quote.delaygb) {
+    log.error(`해외 시세 스킵 — ${quote.error}`);
+  } else {
+    log.info(`해외 시세 구분: mode=${quote.mode} delaygb=${quote.delaygb} · 관찰 종목: ${us.ok.map(s => `${s.exchange}:${s.symbol}`).join(', ')}`);
+  }
   const sdate = kstYmd(10);   // 최근 ~10일 범위로 40개 확보
-  for (const s of (usActive ? us.ok : [])) {
+  for (const s of (quote.delaygb ? us.ok : [])) {
     try {
-      const r = await getLSUS15Min(cfg.us, usToken, s.symbol, s.exchcd, quote.delaygb!, sdate, 120);
+      const r = await getLSUS15Min(acct, token, s.symbol, s.exchcd, quote.delaygb, sdate, 120);
       const status = classifyChart(r);
       if (status !== 'OK') {
         // ── 빈/무효 응답 진단 (req 1·5·6): 원문 HTTP + 요청body + OutBlock(cts) ──
@@ -123,7 +120,7 @@ async function main() {
         log.warn(`[US:${s.symbol}] OutBlock(cts 포함)=${JSON.stringify(sanitizeBlocks(r.outBlock))}`);
         // ── req 7: 현재가 g3101 별도 호출로 "차트만 vs 종목 자체 실패" 구분 (price<=0 이면 이제 throw) ──
         try {
-          const p = await getLSUSPrice(cfg.us, usToken, s.symbol, s.exchcd, quote.delaygb!);
+          const p = await getLSUSPrice(acct, token, s.symbol, s.exchcd, quote.delaygb!);
           logHttpDiag(log, scrubReady, 'US', s.symbol, 'g3101', p.diag);
           log.warn(`[US:${s.symbol}] 현재가 g3101 OK (price=${p.price}) → 차트(g3203)만 문제`);
         } catch (e) {
@@ -133,7 +130,7 @@ async function main() {
         continue;
       }
       let price: number | null = null;
-      try { price = (await getLSUSPrice(cfg.us, usToken, s.symbol, s.exchcd, quote.delaygb!)).price; } catch (e) { logErr(log, scrubReady, 'US', s.symbol, 'g3101', e); }
+      try { price = (await getLSUSPrice(acct, token, s.symbol, s.exchcd, quote.delaygb!)).price; } catch (e) { logErr(log, scrubReady, 'US', s.symbol, 'g3101', e); }
       observeSignal(log, 'US', `${s.exchange}:${s.symbol}`, r.candles, price);
     } catch (e) { logErr(log, scrubReady, 'US', s.symbol, 'g3203', e); }
   }

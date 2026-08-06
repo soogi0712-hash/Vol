@@ -314,21 +314,3 @@ describe('delaygb 파라미터 (하드코딩 금지, g3101·g3203 동일 적용)
     await getLSUS15Min(cfg, 'T', 'AAPL', '82', 'DL', '20260727', 120);
   });
 });
-
-describe('probeLSUSQuote (키 비교용 — throw 없이 rsp_cd 반환)', () => {
-  it('빈 응답 {"rsp_cd":"","rsp_msg":""} → rsp_cd="", price=0', async () => {
-    const { probeLSUSQuote } = await import('../src/lib/ls-api');
-    stubFetch(() => ({ json: { rsp_cd: '', rsp_msg: '' } }));
-    const p = await probeLSUSQuote('KRTOKEN', 'AAPL', '82', 'R');
-    expect(p.rspCd).toBe('');
-    expect(p.price).toBe(0);
-    expect(p.diag).not.toBeNull();
-  });
-  it('정상 rsp_cd="00000" + price>0 → 그대로 반환(throw 안 함)', async () => {
-    const { probeLSUSQuote } = await import('../src/lib/ls-api');
-    stubFetch(() => ({ json: { rsp_cd: '00000', rsp_msg: '조회완료', g3101OutBlock: { price: '283.82' } } }));
-    const p = await probeLSUSQuote('USTOKEN', 'AAPL', '82', 'R');
-    expect(p.rspCd).toBe('00000');
-    expect(p.price).toBeCloseTo(283.82);
-  });
-});
