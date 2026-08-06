@@ -610,3 +610,17 @@ export const LS_CANCEL_TR_CONFIRMED = false;   // 공식 취소 필드 확인 �
 export async function cancelLSUSOrder(_cfg: LSConfig, _token: string, _p: { exchcd: string; symbol: string; ordNo: string; qty: number }): Promise<never> {
   throw new LSApiError('INVALID_RESPONSE', 'COSAT00311(미국 취소/정정) 공식 요청 필드 미확인 — 구현 보류(추측 금지). 공식 스펙 확보 후 구현 필요.');
 }
+
+// ── 해외 보유수량 조회 (COSOQ00201 OutBlock4) — 매도 전 실제 보유/매도가능수량 확인 ──
+// OutBlock4(공식 resExample): ShtnIsuNo(단축종목=심볼)/AstkBalQty(잔고수량)/AstkSellAbleQty(매도가능수량).
+export interface LSUSHolding { symbol: string; balQty: number; sellableQty: number; }
+export async function getLSUSHoldings(cfg: LSConfig, token: string, baseDateYYYYMMDD: string): Promise<{ rspCd: string; rspMsg: string; holdings: LSUSHolding[]; diag: LSHttpDiag }> {
+  const { data, rspCd, rspMsg, diag } = await lsPost(token, '/overseas-stock/accno', 'COSOQ00201', {
+    COSOQ00201InBlock1: { RecCnt: 1, BaseDt: baseDateYYYYMMDD, CrcyCode: 'ALL', AstkBalTpCode: '00' },
+  });
+  const rows: any[] = data.COSOQ00201OutBlock4 || [];
+  const holdings = rows.map(r => ({
+    symbol: String(r.ShtnIsuNo ?? ''), balQty: toNum(r.AstkBalQty), sellableQty: toNum(r.AstkSellAbleQty),
+  })).filter(h => h.symbol);
+  return { rspCd, rspMsg, holdings, diag };
+}

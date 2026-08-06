@@ -18,7 +18,8 @@ import {
 import { CandleStore, type StoredCandle } from './candle-store';
 import { OrderStore } from './order-store';
 import { evaluateTradeGate, canExecuteLive, etDateStr, isUSRegularSession, type GateState } from './trade-gate';
-import { executeBuyOrder } from './trader';
+import { executeBuyOrder, reconcilePending, type TraderDeps } from './trader';
+import { loadLiveConfig, isLiveSymbol, type LiveConfig } from './live-config';
 import { calcBB, calcRSI, getBBSignal, validateCandleData } from '../src/lib/bollinger';
 
 function kstYmd(offsetDays = 0): string {
@@ -176,9 +177,22 @@ async function main() {
   });
   client.connect(us.ok.map(s => ({ exchcd: s.exchcd, symbol: s.symbol })));
 
-  // ── ARMED 모드: 조건 충족 여부만 감시. 주문은 canExecuteLive.execute 일 때만(현재 항상 false) ──
-  const armedMode = process.env.LS_TRADING_ARMED === 'true';
-  log.info(`ARMED 모드=${armedMode} · LS_LIVE_TRADING=${cfg.liveTrading} · 취소TR확인=false → 실주문 ${armedMode ? '차단(조건만 감시)' : '비활성'}`);
+  // ── Phase 3A 실전 설정(1종목/1주/지정가/하루 1회) + ARMED 감시 ──
+  let liveCfg: LiveConfig;
+  try { liveCfg = loadLiveConfig(); } catch (e) { log.error(String(e)); process.exit(1); return; }
+  const armedMode = liveCfg.armed;
+  // 실행 능력(3중): armed=true 가정 시 LIVE_TRADING + 취소TR(코드상수 false) + env 취소확인 모두 필요
+  const liveCapable = canExecuteLive(true, liveCfg.liveTrading, liveCfg.cancelConfirmed).execute;
+  log.info(`[LIVE-CFG] 대상=${liveCfg.liveExchange}:${liveCfg.liveSymbol}(exchcd=${liveCfg.liveExchcd}) maxQty=${liveCfg.maxQty} 하루매수=${liveCfg.dailyMaxBuys} 하루매도=${liveCfg.dailyMaxSells} 미체결타임아웃=${liveCfg.pendingTimeoutSec}s`);
+  log.info(`ARMED=${armedMode} · LS_LIVE_TRADING=${liveCfg.liveTrading} · 취소TR확인(env)=${liveCfg.cancelConfirmed}/(코드)=false → 실주문 ${liveCapable ? '가능' : '차단'}`);
+
+  const traderDeps: TraderDeps = {
+    place: (pp) => placeLSUSBuyOrder(cfg, token, pp),
+    query: (pp) => queryLSUSOrderExec(cfg, token, pp),
+    cancel: (pp) => cancelLSUSOrder(cfg, token, pp),
+    now: () => Date.now(),
+    log: (m) => log.info(scrub(m)),
+  };
 
   // 예수금(주문가능) 조회 캐시 — 계좌 단위라 60초 캐시(불필요 네트워크 억제)
   let depAt = 0; let depUsd = 0; let depOk = false;
@@ -197,13 +211,13 @@ async function main() {
     const gscAgeSec = ctx.lastGSCat == null ? null : Math.round((now - ctx.lastGSCat) / 1000);
     const gshAgeSec = ctx.lastGSHat == null ? null : Math.round((now - ctx.lastGSHat) / 1000);
     // 동일 확정봉 중복/일일한도/손상 → 중복주문으로 간주(cond9), 미체결(cond10)
-    const dup = ctx.orders.corrupt || ctx.orders.hasOrderedCandle(sig.candleDatetime, 'buy') || !ctx.orders.canBuyToday(etDate);
+    const dup = ctx.orders.corrupt || ctx.orders.hasOrderedCandle(sig.candleDatetime, 'buy') || !ctx.orders.canBuyToday(etDate, liveCfg.dailyMaxBuys);
     const pending = ctx.orders.hasPending();
-    // 나머지 조건이 모두 통과할 때만 예수금 조회(불필요 네트워크 억제)
-    const priceNeeded = ctx.bestBid > 0 ? ctx.bestBid : ctx.lastPrice;
+    // 매수 지정가 = GSH ask (req4). 나머지 조건이 모두 통과할 때만 예수금 조회(불필요 네트워크 억제)
+    const buyPrice = ctx.bestAsk;
     const worthQuery = sig.action === 'BUY' && ctx.builder.confirmedCount >= MIN_RT_CANDLES && client.connected
       && isUSRegularSession(now) && ctx.bestBid > 0 && ctx.bestAsk > 0 && ctx.lastPrice > 0 && !dup && !pending;
-    const orderableQtyOk = worthQuery ? await orderableCheck(priceNeeded) : false;
+    const orderableQtyOk = worthQuery ? await orderableCheck(buyPrice) : false;
 
     const state: GateState = {
       confirmedCount: ctx.builder.confirmedCount, signalAction: sig.action, wsConnected: client.connected,
@@ -214,18 +228,13 @@ async function main() {
     log.info(`[ARMED ${ctx.symbol}] armed=${g.armed} 통과=${g.passed.length}/10${g.blockedBy.length ? ` 차단=[${g.blockedBy.join(', ')}]` : ''}`);
     if (!g.armed) return;
 
-    const live = canExecuteLive(g.armed, cfg.liveTrading);
-    if (!live.execute) { log.info(`[ARMED-READY ${ctx.symbol}] 전 10개 조건 충족 · 주문 없음 — ${live.reason}`); return; }
+    const live = canExecuteLive(g.armed, liveCfg.liveTrading, liveCfg.cancelConfirmed);
+    if (!live.execute) { log.info(`[ARMED-READY ${ctx.symbol}] 전 10개 조건 충족 · 매수지정가=${buyPrice}(ask) · 주문 없음 — ${live.reason}`); return; }
     // ↓ 현재 도달 불가(LIVE off 또는 취소 TR 미확인). 도달 시에도 trader 가 한도/중복/미체결 재검증.
-    const outcome = await executeBuyOrder(
-      {
-        place: (pp) => placeLSUSBuyOrder(cfg, token, pp),
-        query: (pp) => queryLSUSOrderExec(cfg, token, pp),
-        cancel: (pp) => cancelLSUSOrder(cfg, token, pp),
-        log: (m) => log.info(scrub(m)),
-      },
-      { orders: ctx.orders, exchcd: ctx.exchcd, symbol: ctx.symbol, candleDatetime: sig.candleDatetime, qty: 1, price: priceNeeded, etDate },
-    );
+    const outcome = await executeBuyOrder(traderDeps, {
+      orders: ctx.orders, exchcd: ctx.exchcd, symbol: ctx.symbol, candleDatetime: sig.candleDatetime,
+      qty: liveCfg.maxQty, price: buyPrice, etDate, dailyMaxBuys: liveCfg.dailyMaxBuys,
+    });
     log.info(`[ORDER-RESULT ${ctx.symbol}] status=${outcome.status} ordNo=${outcome.ordNo ?? '-'} ${outcome.reason}`);
   }
 
@@ -256,7 +265,19 @@ async function main() {
         );
         // 신호 계산은 GSC 신선 + 확정봉 충분(allowSignal) 일 때만 — 형성봉 제외(req 9).
         const sig = r.allowSignal ? observeSignal(log, ctx) : null;
-        if (armedMode && sig) await evaluateArmed(ctx, sig, Date.now());
+        // ARMED/실주문은 실전 대상 1종목(예: NASDAQ:AAPL)에만 적용(req 1).
+        if (isLiveSymbol(liveCfg, ctx.symbol)) {
+          // 미체결 조정: 체결완료→해소 / 타임아웃→취소. 취소TR 미확인이면 취소는 실패로 남고 pending 유지(req15).
+          if (ctx.orders.hasPending()) {
+            if (liveCapable) {
+              const rec = await reconcilePending(traderDeps, { orders: ctx.orders, exchcd: ctx.exchcd, ordDate: etDateStr(Date.now()), timeoutMs: liveCfg.pendingTimeoutSec * 1000 });
+              for (const o of rec) log.info(`[RECONCILE ${ctx.symbol}] ordNo=${o.ordNo} ${o.status} — ${o.reason}`);
+            } else {
+              log.warn(`[RECONCILE ${ctx.symbol}] 미체결 ${ctx.orders.pending.length}건 존재하나 실주문/취소 비활성 → 수동 확인 필요(신규주문 차단)`);
+            }
+          }
+          if (armedMode && sig) await evaluateArmed(ctx, sig, Date.now());
+        }
       }
     } finally { ticking = false; }
   }, 10_000);

@@ -125,6 +125,37 @@ AAPL 1종목에 대해 `g3203 / g3202 / g3103 / g3204` 를 각 1회 호출해
 - 매도상환 `COSMT00300` (카탈로그에 요청 필드 없음)
 - 예수금 `PrsmptFcurrDps1` 를 주문가능액으로 사용 — 실주문 전 사용자 검증 권장.
 
+### COSAT00311(미체결 취소) 공식 필드 확인 결과 — 근거
+
+Phase 3A 완성을 위해 취소 TR 을 구현하려 했으나, **공식 필드를 확인하지 못했습니다.** 확인 경로와 결과:
+
+| 출처 | 결과 |
+|---|---|
+| LS 공식 카탈로그 스냅샷(`blocks.json`) | `COSAT00311` → `in_blocks:{}`, `out_blocks:{}` (필드 없음) |
+| 공식 카탈로그 API 파일 | `COSAT00311` → `reqExample:null`, `resExample:null` |
+| LS 공식 포털(`openapi.ls-sec.co.kr`) | HTTP 403(비로그인 접근 차단) |
+| 제3자 라이브러리(`smallfish06/krsec`) | "LS 주문 정정/취소는 `ErrNotSupported` 반환"(미구현) |
+
+`COSAT00301`(주문)·`COSAQ00102`(체결)·`COSOQ00201`(잔고)·`COSOQ02701`(예수금)은 공식 필드가
+카탈로그에 있어 구현했지만, **`COSAT00311` 은 어느 공식 출처에도 요청 필드(원주문번호/취소수량/
+정정취소구분 등)가 없습니다.** 추측 금지 원칙에 따라 **취소 요청 본문을 임의로 만들지 않았습니다.**
+
+→ 결과: `cancelLSUSOrder` 는 예외를 던지고, 코드 상수 `LS_CANCEL_TR_CONFIRMED=false` 가
+**실주문을 3중 차단**합니다. 취소 흐름은 **모의(주입식) 함수로 BUY→PENDING→CANCELLED 를
+단위테스트로 검증**했습니다(`test/trader.test.ts`). 공식 `COSAT00311` 스펙(요청 InBlock 필드,
+원주문번호 필드명, 정정/취소 구분값, 응답 필드)을 주시면 즉시 실함수로 교체하고 상수를 켭니다.
+
+### Phase 3A 오늘 실전 제한(코드로 강제)
+
+`LS_US_LIVE_SYMBOL`(기본 NASDAQ:AAPL) 1종목 · `LS_US_MAX_QTY=1`(상한 강제) · 지정가만 ·
+매수가=GSH ask · 매도가=GSH bid · 하루 매수/매도 각 1회 · 정규장만 · `confirmed≥20`+`signal=BUY`+
+READY · 미체결 시 신규 금지 · 동일봉 중복 금지 · 주문번호 즉시 디스크 저장 · `COSAQ00102` 체결확인 ·
+미체결 `LS_US_PENDING_TIMEOUT_SEC`(기본 60s) 경과 시 취소 시도 · 취소 성공 전 다음 주문 금지 ·
+재시작 시 pending·주문번호 복원 · 매도는 보유수량(`COSOQ00201` `AstkSellAbleQty`) 확인 후 최대 1주 ·
+모든 LS 원문 `rsp_cd/rsp_msg` 저장 · 실패해도 자동 재주문 금지.
+
+**현재 실주문은 실행되지 않습니다** — 취소 TR 미확인으로 3중 차단 유지, `LS_LIVE_TRADING=false`.
+
 ### 해외 시세 구분(delaygb) — 미국 실시간 Non-Display 불가
 
 미국주식 **실시간 시세는 Non-Display(오픈API) 이용이 불가**합니다. 따라서 US 는 기본

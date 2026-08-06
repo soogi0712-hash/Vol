@@ -74,11 +74,13 @@ export function evaluateTradeGate(s: GateState): GateResult {
   return { armed, passed, blockedBy };
 }
 
-// 실주문 실행 가능 여부(러너용) — armed + LIVE 스위치 + 취소 TR 확인까지 모두 필요.
-// ⚠️ LS_CANCEL_TR_CONFIRMED=false 인 동안에는 LIVE_TRADING=true 여도 실주문을 차단한다(안전).
-export function canExecuteLive(armed: boolean, liveTrading: boolean): { execute: boolean; reason: string } {
+// 실주문 실행 가능 여부(러너용) — armed + LIVE 스위치 + 취소 TR 확인까지 모두 필요(3중 차단).
+// ⚠️ 코드 상수 LS_CANCEL_TR_CONFIRMED(공식 취소 필드 확인 시에만 true)가 최종 안전장치다.
+//    env LS_CANCEL_TR_CONFIRMED=true 로 바꿔도 코드 상수가 false 면 실주문은 차단된다.
+export function canExecuteLive(armed: boolean, liveTrading: boolean, cancelEnvConfirmed = false): { execute: boolean; reason: string } {
   if (!armed) return { execute: false, reason: 'ARMED 조건 미충족' };
   if (!liveTrading) return { execute: false, reason: 'LS_LIVE_TRADING=false (관찰/ARMED 전용)' };
-  if (!LS_CANCEL_TR_CONFIRMED) return { execute: false, reason: '미체결 취소 TR(공식 필드) 미확인 → 실주문 차단' };
+  if (!LS_CANCEL_TR_CONFIRMED) return { execute: false, reason: '미체결 취소 TR(COSAT00311) 공식 필드 미확인 → 실주문 차단(코드)' };
+  if (!cancelEnvConfirmed) return { execute: false, reason: 'LS_CANCEL_TR_CONFIRMED=false → 실주문 차단' };
   return { execute: true, reason: '실행 가능' };
 }

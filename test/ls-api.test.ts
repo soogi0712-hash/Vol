@@ -3,7 +3,7 @@ import {
   getLSAccessToken, getLSKRBalance, getLSUSBalance,
   getLSKRPrice, getLSUSPrice, getLSKR15Min, getLSUS15Min, getLSUS15MinPaged,
   getLSUSTicks, getLSUSTicksPaged, lsOverseasChartRaw,
-  placeLSUSBuyOrder, queryLSUSOrderExec, getLSUSDeposit, cancelLSUSOrder, LS_CANCEL_TR_CONFIRMED,
+  placeLSUSBuyOrder, queryLSUSOrderExec, getLSUSDeposit, getLSUSHoldings, cancelLSUSOrder, LS_CANCEL_TR_CONFIRMED,
   toLSOverseasExchcd, LSApiError, configureLSRateLimiter, classifyChart,
   LS_G3203_MAX_QRYCNT_UNCOMPRESSED,
 } from '../src/lib/ls-api';
@@ -493,6 +493,20 @@ describe('해외 주문/체결/예수금 (공식 필드)', () => {
   it('cancelLSUSOrder — 공식 취소 필드 미확인 → 예외(추측 금지)', async () => {
     expect(LS_CANCEL_TR_CONFIRMED).toBe(false);
     await expect(cancelLSUSOrder(cfg, 'T', { exchcd: '82', symbol: 'AAPL', ordNo: '1', qty: 1 })).rejects.toThrow(/COSAT00311/);
+  });
+
+  it('COSOQ00201 OutBlock4 보유수량 — ShtnIsuNo/AstkBalQty/AstkSellAbleQty(매도 전 확인)', async () => {
+    stubFetch((url, init) => {
+      expect(init.headers['tr_cd']).toBe('COSOQ00201');
+      return { json: { rsp_cd: '00000', COSOQ00201OutBlock4: [
+        { ShtnIsuNo: 'TSLA', AstkBalQty: '15.000000', AstkSellAbleQty: '15.000000' },
+        { ShtnIsuNo: 'AAPL', AstkBalQty: '1.000000', AstkSellAbleQty: '1.000000' },
+      ] } };
+    });
+    const r = await getLSUSHoldings(cfg, 'T', '20260806');
+    const aapl = r.holdings.find(h => h.symbol === 'AAPL');
+    expect(aapl?.balQty).toBe(1);
+    expect(aapl?.sellableQty).toBe(1);
   });
 });
 
