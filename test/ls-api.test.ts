@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
   getLSAccessToken, getLSKRBalance, getLSUSBalance,
   getLSKRPrice, getLSUSPrice, getLSKR15Min, getLSUS15Min,
-  toLSOverseasExchcd, LSApiError,
+  toLSOverseasExchcd, LSApiError, configureLSRateLimiter,
 } from '../src/lib/ls-api';
 
 // global fetch 스텁 — LS 엔드포인트별 응답 제어
@@ -19,7 +19,13 @@ function stubFetch(handler: (url: string, init: any) => { status?: number; json:
     } as any;
   }));
 }
-beforeEach(() => { calls = []; });
+// 테스트 무지연화 — 공용 limiter 의 최소간격/재시도 대기를 즉시 처리
+let sleeps: number[] = [];
+beforeEach(() => {
+  calls = [];
+  sleeps = [];
+  configureLSRateLimiter({ minIntervalMs: 0, backoffMs: [1500, 3000], maxRetries: 2, sleep: async (ms) => { sleeps.push(ms); } });
+});
 afterEach(() => { vi.unstubAllGlobals(); });
 
 const cfg = { appKey: 'APPKEY', appSecret: 'APPSECRET' };
@@ -165,9 +171,10 @@ describe('getLSKR15Min (t8412) / getLSUS15Min (g3203)', () => {
         { date: '20260806', time: '090000', open: 20, high: 21, low: 19, close: 20, jdiff_vol: 200 },
       ] } };
     });
-    const cs = await getLSKR15Min(cfg, 'T', '005930', 60);
-    expect(cs.map(c => c.datetime)).toEqual(['20260806090000', '20260806091500']);  // 093000(최근) 제외
-    expect(cs[0].close).toBe(20); expect(cs[0].volume).toBe(200);
+    const r = await getLSKR15Min(cfg, 'T', '005930', 60);
+    expect(r.candles.map(c => c.datetime)).toEqual(['20260806090000', '20260806091500']);  // 093000(최근) 제외
+    expect(r.candles[0].close).toBe(20); expect(r.candles[0].volume).toBe(200);
+    expect(r.rawCount).toBe(3);
   });
   it('해외: ncnt=15 전송, exevol→volume, 형성봉 제외', async () => {
     stubFetch((url, init) => {
@@ -179,14 +186,55 @@ describe('getLSKR15Min (t8412) / getLSUS15Min (g3203)', () => {
         { date: '20260805', loctime: '012000', open: '1.5', high: '2.5', low: '1', close: '2', exevol: 13514 },
       ] } };
     });
-    const cs = await getLSUS15Min(cfg, 'T', 'TSLA', '82', '20260726', 120);
-    expect(cs).toHaveLength(1);                       // 2개 중 형성봉 1개 제외
-    expect(cs[0].datetime).toBe('20260805011000');
-    expect(cs[0].close).toBe(1.5); expect(cs[0].volume).toBe(8016);
+    const r = await getLSUS15Min(cfg, 'T', 'TSLA', '82', '20260726', 120);
+    expect(r.candles).toHaveLength(1);                // 2개 중 형성봉 1개 제외
+    expect(r.candles[0].datetime).toBe('20260805011000');
+    expect(r.candles[0].close).toBe(1.5); expect(r.candles[0].volume).toBe(8016);
   });
-  it('빈 OutBlock1 → 빈 배열', async () => {
+  it('빈 OutBlock1 → candles 빈 배열', async () => {
     stubFetch(() => ({ json: { rsp_cd: '00000' } }));
-    expect(await getLSKR15Min(cfg, 'T', '005930')).toEqual([]);
+    expect((await getLSKR15Min(cfg, 'T', '005930')).candles).toEqual([]);
+  });
+});
+
+describe('AAPL 빈 응답 진단 (g3203)', () => {
+  it('빈 OutBlock1 시 rsp_cd/msg/OutBlock(연속조회)/개수/요청body 를 노출', async () => {
+    stubFetch((url, init) => {
+      const b = JSON.parse(init.body).g3203InBlock;
+      expect(b.exchcd).toBe('82'); expect(b.keysymbol).toBe('82AAPL'); expect(b.ncnt).toBe(15);
+      expect(b.comp_yn).toBe('N'); expect(b.edate).toBe('');
+      return { json: {
+        rsp_cd: '00000', rsp_msg: '조회완료',
+        g3203OutBlock: { keysymbol: '82AAPL', cts_date: '20260806', cts_time: '093000', rec_count: 0 },
+        // g3203OutBlock1 없음(빈 응답)
+      } };
+    });
+    const r = await getLSUS15Min(cfg, 'T', 'AAPL', '82', '20260727', 120);
+    expect(r.candles).toEqual([]);
+    expect(r.rawCount).toBe(0);
+    expect(r.rspCd).toBe('00000');
+    expect(r.outBlock.cts_date).toBe('20260806');    // 연속조회 필드 노출
+    expect(r.outBlock.cts_time).toBe('093000');
+    expect((r.reqBody as any).g3203InBlock.symbol).toBe('AAPL');   // 요청 body 진단
+  });
+});
+
+describe('호출제한(IGW00201) 재시도', () => {
+  it('IGW00201 2회 → 3번째 성공, 대기 [1500,3000]', async () => {
+    let n = 0;
+    stubFetch(() => {
+      n++;
+      if (n <= 2) return { json: { rsp_cd: 'IGW00201', rsp_msg: '초당 호출 거래건수를 초과하였습니다.' } };
+      return { json: { rsp_cd: '00000', t1102OutBlock: { price: '75000', open: '0', high: '0', low: '0', volume: '0' } } };
+    });
+    const p = await getLSKRPrice(cfg, 'T', '005930');
+    expect(p.price).toBe(75000);
+    expect(n).toBe(3);                 // 2회 재시도 후 성공
+    expect(sleeps).toEqual([1500, 3000]);
+  });
+  it('IGW00201 가 재시도 후에도 지속되면 RATE_LIMIT 로 throw', async () => {
+    stubFetch(() => ({ json: { rsp_cd: 'IGW00201', rsp_msg: '초과' } }));
+    await expect(getLSKRPrice(cfg, 'T', '005930')).rejects.toMatchObject({ kind: 'RATE_LIMIT', rspCd: 'IGW00201' });
   });
 });
 

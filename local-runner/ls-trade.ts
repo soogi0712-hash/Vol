@@ -5,6 +5,7 @@ import { loadEnvLocal } from './env';
 import { createLogger, type Logger } from './logger';
 import { loadConfig, getTokenCached } from './ls-client';
 import { loadKRSymbols, loadUSSymbols } from './universe';
+import { sanitizeBlocks } from './mask';
 import {
   getLSKR15Min, getLSUS15Min, getLSKRPrice, getLSUSPrice, LSApiError, type LSCandle,
 } from '../src/lib/ls-api';
@@ -59,33 +60,50 @@ async function main() {
   try { token = await getTokenCached(cfg); log.info('LS 토큰 OK'); }
   catch (e) { logErr(log, 'TOKEN', '-', e); process.exit(1); return; }
 
-  // ── 국내 ──
+  const acct = { appKey: cfg.appKey, appSecret: cfg.appSecret };
+
+  // ── 국내 (순차 처리, Promise.all 금지) ──
   const kr = loadKRSymbols();
   log.info(`국내 관찰 종목: ${kr.map(s => s.shcode).join(', ')}`);
   for (const s of kr) {
     try {
-      const candles = await getLSKR15Min({ appKey: cfg.appKey, appSecret: cfg.appSecret }, token, s.shcode, 60);
-      if (candles.length === 0) { logErr(log, 'KR', s.shcode, new LSApiError('EMPTY', '15분봉 빈 응답')); continue; }
+      const r = await getLSKR15Min(acct, token, s.shcode, 60);
+      if (r.candles.length === 0) {
+        log.warn(`[KR:${s.shcode}] 15분봉 빈 응답 — rsp_cd=${r.rspCd} msg=${r.rspMsg} OutBlock1개수=${r.rawCount}`);
+        continue;
+      }
       let price: number | null = null;
-      try { price = (await getLSKRPrice({ appKey: cfg.appKey, appSecret: cfg.appSecret }, token, s.shcode)).price; }
-      catch (e) { logErr(log, 'KR', s.shcode, e); }
-      observeSignal(log, 'KR', s.shcode, candles, price);
+      try { price = (await getLSKRPrice(acct, token, s.shcode)).price; } catch (e) { logErr(log, 'KR', s.shcode, e); }
+      observeSignal(log, 'KR', s.shcode, r.candles, price);
     } catch (e) { logErr(log, 'KR', s.shcode, e); }
   }
 
-  // ── 해외 ──
+  // ── 해외 (순차 처리) ──
   const us = loadUSSymbols();
   for (const u of us.unsupported) log.warn(`[US:${u.token}] UNSUPPORTED_EXCHANGE (${u.exchange}) — LS exchcd 미확인, 스킵(추측 금지)`);
   log.info(`해외 관찰 종목: ${us.ok.map(s => `${s.exchange}:${s.symbol}`).join(', ')}`);
   const sdate = kstYmd(10);   // 최근 ~10일 범위로 40개 확보
   for (const s of us.ok) {
     try {
-      const candles = await getLSUS15Min({ appKey: cfg.appKey, appSecret: cfg.appSecret }, token, s.symbol, s.exchcd, sdate, 120);
-      if (candles.length === 0) { logErr(log, 'US', s.symbol, new LSApiError('EMPTY', '15분봉 빈 응답')); continue; }
+      const r = await getLSUS15Min(acct, token, s.symbol, s.exchcd, sdate, 120);
+      if (r.candles.length === 0) {
+        // ── 빈 응답 진단 (req 6): 요청 body(민감제거)/rsp_cd·msg/OutBlock/OutBlock1 개수/연속조회 필드 ──
+        log.warn(`[US:${s.symbol}] 15분봉 빈 응답 — rsp_cd=${r.rspCd} msg=${r.rspMsg} OutBlock1개수=${r.rawCount}`);
+        log.warn(`[US:${s.symbol}] 요청body=${JSON.stringify(sanitizeBlocks(r.reqBody))}`);
+        log.warn(`[US:${s.symbol}] OutBlock(cts 포함)=${JSON.stringify(sanitizeBlocks(r.outBlock))}`);
+        // ── req 7: 현재가 g3101 별도 호출로 "차트만 빈 응답 vs 종목 자체 실패" 구분 ──
+        try {
+          const p = await getLSUSPrice(acct, token, s.symbol, s.exchcd);
+          log.warn(`[US:${s.symbol}] 현재가 g3101 OK (price=${p.price}) → 차트(g3203)만 빈 응답`);
+        } catch (e) {
+          logErr(log, 'US', s.symbol, e);
+          log.warn(`[US:${s.symbol}] 현재가 g3101 도 실패 → 종목/거래소/시세권한 의심`);
+        }
+        continue;
+      }
       let price: number | null = null;
-      try { price = (await getLSUSPrice({ appKey: cfg.appKey, appSecret: cfg.appSecret }, token, s.symbol, s.exchcd)).price; }
-      catch (e) { logErr(log, 'US', s.symbol, e); }
-      observeSignal(log, 'US', `${s.exchange}:${s.symbol}`, candles, price);
+      try { price = (await getLSUSPrice(acct, token, s.symbol, s.exchcd)).price; } catch (e) { logErr(log, 'US', s.symbol, e); }
+      observeSignal(log, 'US', `${s.exchange}:${s.symbol}`, r.candles, price);
     } catch (e) { logErr(log, 'US', s.symbol, e); }
   }
 

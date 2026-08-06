@@ -51,11 +51,12 @@ export async function getLSAccessToken(cfg: LSConfig, kv?: KVNamespace): Promise
     grant_type: 'client_credentials',
     scope: 'oob',
   });
-  const res = await fetch(`${LS_BASE}/oauth2/token`, {
+  // 토큰 발급도 공용 limiter 로 직렬화(req 4)
+  const res = await runLimited(() => fetch(`${LS_BASE}/oauth2/token`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: body.toString(),
-  });
+  }));
   if (!res.ok) throw new Error(`LS Token Error ${res.status}: ${await res.text()}`);
   const d = await res.json() as { access_token?: string; expires_in?: number };
   if (!d.access_token) throw new Error('LS Token: access_token 없음');
@@ -107,34 +108,89 @@ export class LSApiError extends Error {
   }
 }
 
+// LS 호출제한 rsp_cd (초당/건수 초과). IGW00201 = 유량초과(거래건수 초과).
+export const LS_RATE_LIMIT_CODES = new Set(['IGW00201', 'IGW00121']);
+export function isLSRateLimited(e: unknown): boolean {
+  return e instanceof LSApiError && e.kind === 'RATE_LIMIT';
+}
+
+// ── 공용 RateLimiter — 모든 LS REST 호출을 하나로 직렬화 + 최소간격 + IGW00201 재시도 ──
+// 토큰/현재가/차트/잔고가 이 limiter 를 공유한다(req 1·2·4). 테스트는 configure 로 무지연화.
+interface LSLimiterState {
+  minIntervalMs: number;
+  maxRetries: number;
+  backoffMs: number[];
+  sleep: (ms: number) => Promise<void>;
+  now: () => number;
+}
+let _lim: LSLimiterState = {
+  minIntervalMs: 1100,               // 기본 1초 이상 (안전)
+  maxRetries: 2,                     // IGW00201 최대 2회 재시도
+  backoffMs: [1500, 3000],           // 1차 1.5s, 2차 3s
+  sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+  now: () => Date.now(),
+};
+let _chain: Promise<unknown> = Promise.resolve();
+let _lastAt = 0;
+/** 테스트/운영 튜닝용 — 공용 limiter 재설정. */
+export function configureLSRateLimiter(opts: Partial<LSLimiterState>): void {
+  _lim = { ..._lim, ...opts };
+}
+// 직렬 실행(chain) + 최소간격 대기 + rate-limit 재시도.
+async function runLimited<T>(op: () => Promise<T>): Promise<T> {
+  const exec = async (): Promise<T> => {
+    const wait = _lim.minIntervalMs - (_lim.now() - _lastAt);
+    if (wait > 0) await _lim.sleep(wait);
+    let attempt = 0;
+    for (;;) {
+      try { const r = await op(); _lastAt = _lim.now(); return r; }
+      catch (e) {
+        _lastAt = _lim.now();
+        if (isLSRateLimited(e) && attempt < _lim.maxRetries) {
+          await _lim.sleep(_lim.backoffMs[attempt] ?? _lim.backoffMs[_lim.backoffMs.length - 1] ?? 1500);
+          attempt++;
+          continue;
+        }
+        throw e;
+      }
+    }
+  };
+  const p = _chain.then(exec, exec);
+  _chain = p.then(() => undefined, () => undefined);
+  return p;
+}
+
 // LS REST 공통 POST. rsp_cd 를 즉시 throw 하지 않고 블록을 파싱한다.
 // TR별 허용목록(LS_SUCCESS_CODES)에 없는 rsp_cd 만 실패. 네트워크/호출제한을 분류.
+// 전체 동작을 runLimited 로 감싸 직렬화 + IGW00201 재시도를 적용한다.
 async function lsPost(token: string, path: string, trCd: string, inBlock: Record<string, unknown>): Promise<LSResult> {
-  let res: Response;
-  try {
-    res = await fetch(`${LS_BASE}${path}`, {
-      method: 'POST',
-      headers: lsHeaders(token, trCd),
-      body: JSON.stringify(inBlock),
-    });
-  } catch (e) {
-    throw new LSApiError('NETWORK', `LS ${trCd} 네트워크 오류: ${e instanceof Error ? e.message : String(e)}`);
-  }
-  if (res.status === 429) throw new LSApiError('RATE_LIMIT', `LS ${trCd} 호출 제한(HTTP 429)`);
-  const text = await res.text();
-  let data: any;
-  try { data = text ? JSON.parse(text) : {}; }
-  catch { throw new LSApiError('API', `LS ${trCd}: 비정상 응답(HTTP ${res.status})`); }
-  const rspCd = String(data.rsp_cd ?? '');
-  const rspMsg = String(data.rsp_msg ?? '');
-  const ok = LS_SUCCESS_CODES[trCd] ?? ['00000'];
-  if (res.status >= 400 || (rspCd && !ok.includes(rspCd))) {
-    // LS 호출제한 코드도 RATE_LIMIT 로 분류(메시지에 '초과/제한' 포함 시)
-    const kind: LSErrorKind = /제한|초과|traffic|quota/i.test(rspMsg) ? 'RATE_LIMIT' : 'API';
-    throw new LSApiError(kind, `LS ${trCd} rsp_cd=${rspCd || res.status} msg=${rspMsg}`, rspCd);
-  }
-  const empty = (LS_EMPTY_CODES[trCd] ?? []).includes(rspCd);
-  return { data, rspCd, rspMsg, empty };
+  return runLimited(async () => {
+    let res: Response;
+    try {
+      res = await fetch(`${LS_BASE}${path}`, {
+        method: 'POST',
+        headers: lsHeaders(token, trCd),
+        body: JSON.stringify(inBlock),
+      });
+    } catch (e) {
+      throw new LSApiError('NETWORK', `LS ${trCd} 네트워크 오류: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    if (res.status === 429) throw new LSApiError('RATE_LIMIT', `LS ${trCd} 호출 제한(HTTP 429)`);
+    const text = await res.text();
+    let data: any;
+    try { data = text ? JSON.parse(text) : {}; }
+    catch { throw new LSApiError('API', `LS ${trCd}: 비정상 응답(HTTP ${res.status})`); }
+    const rspCd = String(data.rsp_cd ?? '');
+    const rspMsg = String(data.rsp_msg ?? '');
+    const ok = LS_SUCCESS_CODES[trCd] ?? ['00000'];
+    if (res.status >= 400 || (rspCd && !ok.includes(rspCd))) {
+      // 호출제한(IGW00201 등) 은 RATE_LIMIT 으로 분류 → limiter 가 재시도
+      const rl = LS_RATE_LIMIT_CODES.has(rspCd) || /제한|초과|traffic|quota/i.test(rspMsg);
+      throw new LSApiError(rl ? 'RATE_LIMIT' : 'API', `LS ${trCd} rsp_cd=${rspCd || res.status} msg=${rspMsg}`, rspCd);
+    }
+    const empty = (LS_EMPTY_CODES[trCd] ?? []).includes(rspCd);
+    return { data, rspCd, rspMsg, empty };
+  });
 }
 
 // ── 해외 거래소코드(exchcd) — LS 공식 확인분만 명시 관리 ──────
@@ -173,33 +229,40 @@ export async function getLSUSPrice(cfg: LSConfig, token: string, symbol: string,
   return { price: toNum(o.price), open: toNum(o.open), high: toNum(o.high), low: toNum(o.low), volume: toNum(o.volume) };
 }
 
+// 차트 조회 결과(진단 포함). candles 는 확정봉(형성봉 제외, 오름차순).
+export interface LSChartResult {
+  candles: LSCandle[];
+  rspCd: string;
+  rspMsg: string;
+  rawCount: number;        // OutBlock1 원본 행 수(확정봉 제외 전)
+  outBlock: any;           // 요약 OutBlock (연속조회 cts 필드 등 포함)
+  reqBody: Record<string, unknown>;   // 실제 요청 body (진단용, 민감정보 없음)
+}
+
 // ── 국내 15분봉 (t8412, ncnt=15) — OutBlock1: date/time/open/high/low/close/jdiff_vol ──
-// 반환: 확정봉(형성 중 마지막 봉 제외), 오름차순. 빈 응답이면 [].
-export async function getLSKR15Min(cfg: LSConfig, token: string, shcode: string, qrycnt = 60): Promise<LSCandle[]> {
-  const { data } = await lsPost(token, '/stock/chart', 't8412', {
-    // 공식 reqExample 필드 유지, ncnt(분)=15 / qrycnt(요청개수)만 조정. edate=99999999=최근.
-    t8412InBlock: { shcode, ncnt: 15, qrycnt, nday: '0', sdate: '', stime: '', edate: '99999999', etime: '', cts_date: '', cts_time: '', comp_yn: 'N' },
-  });
+export async function getLSKR15Min(cfg: LSConfig, token: string, shcode: string, qrycnt = 60): Promise<LSChartResult> {
+  // 공식 reqExample 필드 유지, ncnt(분)=15 / qrycnt(요청개수)만 조정. edate=99999999=최근.
+  const reqBody = { t8412InBlock: { shcode, ncnt: 15, qrycnt, nday: '0', sdate: '', stime: '', edate: '99999999', etime: '', cts_date: '', cts_time: '', comp_yn: 'N' } };
+  const { data, rspCd, rspMsg } = await lsPost(token, '/stock/chart', 't8412', reqBody);
   const rows: any[] = data.t8412OutBlock1 || [];
-  const candles: LSCandle[] = rows.map(r => ({
+  const candles = toConfirmed(rows.map(r => ({
     datetime: String(r.date) + String(r.time).padStart(6, '0'),
     open: toNum(r.open), high: toNum(r.high), low: toNum(r.low), close: toNum(r.close), volume: toNum(r.jdiff_vol),
-  }));
-  return toConfirmed(candles);
+  })));
+  return { candles, rspCd, rspMsg, rawCount: rows.length, outBlock: data.t8412OutBlock || {}, reqBody };
 }
 
 // ── 해외 15분봉 (g3203, ncnt=15) — OutBlock1: date/loctime/open/high/low/close/exevol ──
-export async function getLSUS15Min(cfg: LSConfig, token: string, symbol: string, exchcd: string, sdateYYYYMMDD: string, qrycnt = 100): Promise<LSCandle[]> {
-  const { data } = await lsPost(token, '/overseas-stock/chart', 'g3203', {
-    // 공식 reqExample 필드 유지, ncnt(분)=15. sdate~edate 범위 내 최근 qrycnt.
-    g3203InBlock: { delaygb: 'R', keysymbol: exchcd + symbol, exchcd, symbol, ncnt: 15, qrycnt, comp_yn: 'N', sdate: sdateYYYYMMDD, edate: '' },
-  });
+export async function getLSUS15Min(cfg: LSConfig, token: string, symbol: string, exchcd: string, sdateYYYYMMDD: string, qrycnt = 100): Promise<LSChartResult> {
+  // 공식 reqExample 필드/값 유지: delaygb=R, keysymbol=exchcd+symbol, comp_yn=N, edate="".
+  const reqBody = { g3203InBlock: { delaygb: 'R', keysymbol: exchcd + symbol, exchcd, symbol, ncnt: 15, qrycnt, comp_yn: 'N', sdate: sdateYYYYMMDD, edate: '' } };
+  const { data, rspCd, rspMsg } = await lsPost(token, '/overseas-stock/chart', 'g3203', reqBody);
   const rows: any[] = data.g3203OutBlock1 || [];
-  const candles: LSCandle[] = rows.map(r => ({
+  const candles = toConfirmed(rows.map(r => ({
     datetime: String(r.date) + String(r.loctime).padStart(6, '0'),
     open: toNum(r.open), high: toNum(r.high), low: toNum(r.low), close: toNum(r.close), volume: toNum(r.exevol),
-  }));
-  return toConfirmed(candles);
+  })));
+  return { candles, rspCd, rspMsg, rawCount: rows.length, outBlock: data.g3203OutBlock || {}, reqBody };
 }
 
 // ─── 국내 계좌 잔고 (CSPAQ12200) ──────────────────────────────
