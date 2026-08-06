@@ -2,20 +2,25 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
   getLSAccessToken, getLSKRBalance, getLSUSBalance,
   getLSKRPrice, getLSUSPrice, getLSKR15Min, getLSUS15Min,
-  toLSOverseasExchcd, LSApiError, configureLSRateLimiter,
+  toLSOverseasExchcd, LSApiError, configureLSRateLimiter, classifyChart,
 } from '../src/lib/ls-api';
 
-// global fetch 스텁 — LS 엔드포인트별 응답 제어
+// global fetch 스텁 — LS 엔드포인트별 응답 제어 (status/statusText/headers/text/json)
 let calls: Array<{ url: string; init: any }>;
-function stubFetch(handler: (url: string, init: any) => { status?: number; json: any }) {
+function stubFetch(handler: (url: string, init: any) => { status?: number; statusText?: string; headers?: Record<string, string>; json?: any; text?: string }) {
   vi.stubGlobal('fetch', vi.fn(async (url: string, init: any) => {
     calls.push({ url, init });
     const r = handler(url, init);
+    const status = r.status ?? 200;
+    const hmap = new Map(Object.entries(r.headers ?? { 'content-type': 'application/json; charset=UTF-8' }).map(([k, v]) => [k.toLowerCase(), v]));
+    const text = r.text !== undefined ? r.text : (r.json !== undefined ? JSON.stringify(r.json) : '');
     return {
-      ok: (r.status ?? 200) < 400,
-      status: r.status ?? 200,
+      ok: status < 400,
+      status,
+      statusText: r.statusText ?? (status < 400 ? 'OK' : 'ERR'),
+      headers: { get: (k: string) => hmap.get(k.toLowerCase()) ?? null },
       json: async () => r.json,
-      text: async () => JSON.stringify(r.json),
+      text: async () => text,
     } as any;
   }));
 }
@@ -250,5 +255,46 @@ describe('오류 분류 (LSApiError.kind)', () => {
   it('네트워크 예외 → NETWORK', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('ECONNRESET'); }));
     await expect(getLSKRPrice(cfg, 'T', '005930')).rejects.toMatchObject({ kind: 'NETWORK' });
+  });
+});
+
+// ─── req 10: 해외 응답 유효성 회귀 ────────────────────────────
+describe('해외 응답 유효성 (INVALID_RESPONSE / EMPTY / 정상)', () => {
+  it('HTTP 200 + 빈 본문 → INVALID_RESPONSE', async () => {
+    stubFetch(() => ({ status: 200, text: '' }));
+    await expect(getLSUSPrice(cfg, 'T', 'AAPL', '82')).rejects.toMatchObject({ kind: 'INVALID_RESPONSE' });
+  });
+  it('HTTP 200 + price=0 + OutBlock 없음 → 성공 처리 금지(EMPTY/INVALID)', async () => {
+    // rsp_cd 공백 + OutBlock 없음 → INVALID_RESPONSE
+    stubFetch(() => ({ json: {} }));
+    await expect(getLSUSPrice(cfg, 'T', 'AAPL', '82')).rejects.toMatchObject({ kind: 'INVALID_RESPONSE' });
+  });
+  it('HTTP 200 + OutBlock 있으나 price=0 → EMPTY', async () => {
+    stubFetch(() => ({ json: { rsp_cd: '00000', g3101OutBlock: { price: '0', open: '0', high: '0', low: '0', volume: 0 } } }));
+    await expect(getLSUSPrice(cfg, 'T', 'AAPL', '82')).rejects.toMatchObject({ kind: 'EMPTY' });
+  });
+  it('정상 g3101 price>0 → 성공 + diag 포함', async () => {
+    stubFetch(() => ({ json: { rsp_cd: '00000', g3101OutBlock: { price: '283.82', open: '285', high: '286', low: '281', volume: 100 } } }));
+    const p = await getLSUSPrice(cfg, 'T', 'TSLA', '82');
+    expect(p.price).toBeCloseTo(283.82);
+    expect(p.diag.status).toBe(200);
+    expect(p.diag.reqHeaders.tr_cd).toBe('g3101');
+  });
+  it('g3203 rsp_cd 공백 + OutBlock 없음 + 0개 → classifyChart=INVALID_RESPONSE', async () => {
+    stubFetch(() => ({ json: {} }));   // rsp_cd 없음, OutBlock 없음
+    const r = await getLSUS15Min(cfg, 'T', 'AAPL', '82', '20260727', 120);
+    expect(r.candles).toEqual([]);
+    expect(classifyChart(r)).toBe('INVALID_RESPONSE');
+    expect(r.diag.status).toBe(200);   // 원문 진단 확보
+  });
+  it('정상 g3203 OutBlock1 45개(형성봉 제외 44) → classifyChart=OK, 40개 이상', async () => {
+    const rows = Array.from({ length: 45 }, (_, i) => {
+      const t = 9 * 60 + i * 15; const hh = Math.floor(t / 60), mm = t % 60;
+      return { date: '20260805', loctime: `${String(hh).padStart(2, '0')}${String(mm).padStart(2, '0')}00`, open: '1', high: '2', low: '0.5', close: String(1 + i * 0.01), exevol: 100 };
+    });
+    stubFetch(() => ({ json: { rsp_cd: '00000', g3203OutBlock: { rec_count: 45 }, g3203OutBlock1: rows } }));
+    const r = await getLSUS15Min(cfg, 'T', 'TSLA', '82', '20260726', 120);
+    expect(classifyChart(r)).toBe('OK');
+    expect(r.candles.length).toBeGreaterThanOrEqual(40);   // 44 확정봉
   });
 });

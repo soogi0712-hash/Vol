@@ -93,18 +93,32 @@ export const LS_EMPTY_CODES: Record<string, string[]> = {
   COSOQ00201: ['02679'],
 };
 
-export interface LSResult { data: any; rspCd: string; rspMsg: string; empty: boolean; }
+export interface LSResult { data: any; rspCd: string; rspMsg: string; empty: boolean; diag: LSHttpDiag; }
 
-// 오류 분류 — 데이터 부족/빈 응답/호출 제한/네트워크/일반 API 를 구분해서 기록한다.
-export type LSErrorKind = 'NETWORK' | 'RATE_LIMIT' | 'API' | 'EMPTY' | 'INSUFFICIENT';
+// HTTP 원문 진단 (JSON 파싱 전 캡처) — 요청/응답 메타. textHead 는 호출측이 마스킹해 로깅.
+export interface LSHttpDiag {
+  reqHeaders: { tr_cd: string; tr_cont: string; tr_cont_key: string; content_type: string };
+  status: number;
+  statusText: string;
+  contentType: string;      // 응답 content-type
+  trCont: string;           // 응답 tr_cont 헤더
+  trContKey: string;        // 응답 tr_cont_key 헤더
+  textLen: number;
+  textHead: string;         // raw 본문 앞 1000자 (미마스킹 — 호출측이 scrub 후 로깅)
+}
+
+// 오류 분류 — 데이터부족/빈응답/호출제한/네트워크/무효응답/일반 API 를 구분해서 기록한다.
+export type LSErrorKind = 'NETWORK' | 'RATE_LIMIT' | 'API' | 'EMPTY' | 'INSUFFICIENT' | 'INVALID_RESPONSE';
 export class LSApiError extends Error {
   kind: LSErrorKind;
   rspCd?: string;
-  constructor(kind: LSErrorKind, message: string, rspCd?: string) {
+  diag?: LSHttpDiag;
+  constructor(kind: LSErrorKind, message: string, rspCd?: string, diag?: LSHttpDiag) {
     super(message);
     this.name = 'LSApiError';
     this.kind = kind;
     this.rspCd = rspCd;
+    this.diag = diag;
   }
 }
 
@@ -164,6 +178,7 @@ async function runLimited<T>(op: () => Promise<T>): Promise<T> {
 // TR별 허용목록(LS_SUCCESS_CODES)에 없는 rsp_cd 만 실패. 네트워크/호출제한을 분류.
 // 전체 동작을 runLimited 로 감싸 직렬화 + IGW00201 재시도를 적용한다.
 async function lsPost(token: string, path: string, trCd: string, inBlock: Record<string, unknown>): Promise<LSResult> {
+  const reqHeaders = { tr_cd: trCd, tr_cont: 'N', tr_cont_key: '', content_type: 'application/json; charset=UTF-8' };
   return runLimited(async () => {
     let res: Response;
     try {
@@ -175,21 +190,33 @@ async function lsPost(token: string, path: string, trCd: string, inBlock: Record
     } catch (e) {
       throw new LSApiError('NETWORK', `LS ${trCd} 네트워크 오류: ${e instanceof Error ? e.message : String(e)}`);
     }
-    if (res.status === 429) throw new LSApiError('RATE_LIMIT', `LS ${trCd} 호출 제한(HTTP 429)`);
+    // JSON 파싱 전에 HTTP 원문 진단을 캡처(req 1)
     const text = await res.text();
+    const diag: LSHttpDiag = {
+      reqHeaders,
+      status: res.status,
+      statusText: res.statusText,
+      contentType: res.headers.get('content-type') || '',
+      trCont: res.headers.get('tr_cont') || '',
+      trContKey: res.headers.get('tr_cont_key') || '',
+      textLen: text.length,
+      textHead: text.slice(0, 1000),
+    };
+    if (res.status === 429) throw new LSApiError('RATE_LIMIT', `LS ${trCd} 호출 제한(HTTP 429)`, undefined, diag);
+    // HTTP 200 이어도 본문이 비면 성공 처리 금지(req 3)
+    if (!text.trim()) throw new LSApiError('INVALID_RESPONSE', `LS ${trCd}: 빈 응답 본문(HTTP ${res.status})`, undefined, diag);
     let data: any;
-    try { data = text ? JSON.parse(text) : {}; }
-    catch { throw new LSApiError('API', `LS ${trCd}: 비정상 응답(HTTP ${res.status})`); }
+    try { data = JSON.parse(text); }
+    catch { throw new LSApiError('INVALID_RESPONSE', `LS ${trCd}: JSON 아님(HTTP ${res.status})`, undefined, diag); }
     const rspCd = String(data.rsp_cd ?? '');
     const rspMsg = String(data.rsp_msg ?? '');
     const ok = LS_SUCCESS_CODES[trCd] ?? ['00000'];
     if (res.status >= 400 || (rspCd && !ok.includes(rspCd))) {
-      // 호출제한(IGW00201 등) 은 RATE_LIMIT 으로 분류 → limiter 가 재시도
       const rl = LS_RATE_LIMIT_CODES.has(rspCd) || /제한|초과|traffic|quota/i.test(rspMsg);
-      throw new LSApiError(rl ? 'RATE_LIMIT' : 'API', `LS ${trCd} rsp_cd=${rspCd || res.status} msg=${rspMsg}`, rspCd);
+      throw new LSApiError(rl ? 'RATE_LIMIT' : 'API', `LS ${trCd} rsp_cd=${rspCd || res.status} msg=${rspMsg}`, rspCd, diag);
     }
     const empty = (LS_EMPTY_CODES[trCd] ?? []).includes(rspCd);
-    return { data, rspCd, rspMsg, empty };
+    return { data, rspCd, rspMsg, empty, diag };
   });
 }
 
@@ -205,7 +232,20 @@ export function toLSOverseasExchcd(name: string): string | null {
 }
 
 export interface LSCandle { datetime: string; open: number; high: number; low: number; close: number; volume: number; }
-export interface LSPrice { price: number; open: number; high: number; low: number; volume: number; }
+export interface LSPrice { price: number; open: number; high: number; low: number; volume: number; diag: LSHttpDiag; }
+
+// 현재가 유효성(req 3·4·5): OutBlock·rsp_cd 모두 없으면 INVALID_RESPONSE, price<=0 이면 EMPTY.
+function parseLSPrice(trCd: string, res: LSResult, outBlockName: string): LSPrice {
+  const o = res.data?.[outBlockName];
+  if ((o === undefined || o === null) && !res.rspCd) {
+    throw new LSApiError('INVALID_RESPONSE', `LS ${trCd}: rsp_cd·${outBlockName} 모두 없음`, res.rspCd || undefined, res.diag);
+  }
+  const price = toNum(o?.price);
+  if (!(price > 0)) {
+    throw new LSApiError('EMPTY', `LS ${trCd}: price<=0 (데이터 없음/시세권한 의심)`, res.rspCd || undefined, res.diag);
+  }
+  return { price, open: toNum(o.open), high: toNum(o.high), low: toNum(o.low), volume: toNum(o.volume), diag: res.diag };
+}
 
 // 오름차순 정렬 후 마지막(형성 중) 봉 1개 제외 → 확정봉만 반환.
 function toConfirmed(candles: LSCandle[]): LSCandle[] {
@@ -215,18 +255,16 @@ function toConfirmed(candles: LSCandle[]): LSCandle[] {
 
 // ── 국내 현재가 (t1102) ──────────────────────────────────────
 export async function getLSKRPrice(cfg: LSConfig, token: string, shcode: string): Promise<LSPrice> {
-  const { data } = await lsPost(token, '/stock/market-data', 't1102', { t1102InBlock: { shcode } });
-  const o = data.t1102OutBlock || {};
-  return { price: toNum(o.price), open: toNum(o.open), high: toNum(o.high), low: toNum(o.low), volume: toNum(o.volume) };
+  const res = await lsPost(token, '/stock/market-data', 't1102', { t1102InBlock: { shcode } });
+  return parseLSPrice('t1102', res, 't1102OutBlock');
 }
 
 // ── 해외 현재가 (g3101) — keysymbol = exchcd + symbol ────────
 export async function getLSUSPrice(cfg: LSConfig, token: string, symbol: string, exchcd: string): Promise<LSPrice> {
-  const { data } = await lsPost(token, '/overseas-stock/market-data', 'g3101', {
+  const res = await lsPost(token, '/overseas-stock/market-data', 'g3101', {
     g3101InBlock: { delaygb: 'R', keysymbol: exchcd + symbol, exchcd, symbol },
   });
-  const o = data.g3101OutBlock || {};
-  return { price: toNum(o.price), open: toNum(o.open), high: toNum(o.high), low: toNum(o.low), volume: toNum(o.volume) };
+  return parseLSPrice('g3101', res, 'g3101OutBlock');
 }
 
 // 차트 조회 결과(진단 포함). candles 는 확정봉(형성봉 제외, 오름차순).
@@ -237,32 +275,43 @@ export interface LSChartResult {
   rawCount: number;        // OutBlock1 원본 행 수(확정봉 제외 전)
   outBlock: any;           // 요약 OutBlock (연속조회 cts 필드 등 포함)
   reqBody: Record<string, unknown>;   // 실제 요청 body (진단용, 민감정보 없음)
+  diag: LSHttpDiag;
+}
+
+// 차트 응답 분류(req 3·5·10): rsp_cd·OutBlock 모두 없고 데이터 0 → INVALID_RESPONSE,
+// 확정봉 0 → EMPTY, 그 외 OK(개수 충족 여부는 호출측이 minConfirmed 로 별도 판정).
+export type LSChartStatus = 'OK' | 'EMPTY' | 'INVALID_RESPONSE';
+export function classifyChart(r: LSChartResult): LSChartStatus {
+  const noEnvelope = !r.rspCd && (!r.outBlock || Object.keys(r.outBlock).length === 0);
+  if (r.rawCount === 0 && noEnvelope) return 'INVALID_RESPONSE';
+  if (r.candles.length === 0) return 'EMPTY';
+  return 'OK';
 }
 
 // ── 국내 15분봉 (t8412, ncnt=15) — OutBlock1: date/time/open/high/low/close/jdiff_vol ──
 export async function getLSKR15Min(cfg: LSConfig, token: string, shcode: string, qrycnt = 60): Promise<LSChartResult> {
   // 공식 reqExample 필드 유지, ncnt(분)=15 / qrycnt(요청개수)만 조정. edate=99999999=최근.
   const reqBody = { t8412InBlock: { shcode, ncnt: 15, qrycnt, nday: '0', sdate: '', stime: '', edate: '99999999', etime: '', cts_date: '', cts_time: '', comp_yn: 'N' } };
-  const { data, rspCd, rspMsg } = await lsPost(token, '/stock/chart', 't8412', reqBody);
+  const { data, rspCd, rspMsg, diag } = await lsPost(token, '/stock/chart', 't8412', reqBody);
   const rows: any[] = data.t8412OutBlock1 || [];
   const candles = toConfirmed(rows.map(r => ({
     datetime: String(r.date) + String(r.time).padStart(6, '0'),
     open: toNum(r.open), high: toNum(r.high), low: toNum(r.low), close: toNum(r.close), volume: toNum(r.jdiff_vol),
   })));
-  return { candles, rspCd, rspMsg, rawCount: rows.length, outBlock: data.t8412OutBlock || {}, reqBody };
+  return { candles, rspCd, rspMsg, rawCount: rows.length, outBlock: data.t8412OutBlock || {}, reqBody, diag };
 }
 
 // ── 해외 15분봉 (g3203, ncnt=15) — OutBlock1: date/loctime/open/high/low/close/exevol ──
 export async function getLSUS15Min(cfg: LSConfig, token: string, symbol: string, exchcd: string, sdateYYYYMMDD: string, qrycnt = 100): Promise<LSChartResult> {
   // 공식 reqExample 필드/값 유지: delaygb=R, keysymbol=exchcd+symbol, comp_yn=N, edate="".
   const reqBody = { g3203InBlock: { delaygb: 'R', keysymbol: exchcd + symbol, exchcd, symbol, ncnt: 15, qrycnt, comp_yn: 'N', sdate: sdateYYYYMMDD, edate: '' } };
-  const { data, rspCd, rspMsg } = await lsPost(token, '/overseas-stock/chart', 'g3203', reqBody);
+  const { data, rspCd, rspMsg, diag } = await lsPost(token, '/overseas-stock/chart', 'g3203', reqBody);
   const rows: any[] = data.g3203OutBlock1 || [];
   const candles = toConfirmed(rows.map(r => ({
     datetime: String(r.date) + String(r.loctime).padStart(6, '0'),
     open: toNum(r.open), high: toNum(r.high), low: toNum(r.low), close: toNum(r.close), volume: toNum(r.exevol),
   })));
-  return { candles, rspCd, rspMsg, rawCount: rows.length, outBlock: data.g3203OutBlock || {}, reqBody };
+  return { candles, rspCd, rspMsg, rawCount: rows.length, outBlock: data.g3203OutBlock || {}, reqBody, diag };
 }
 
 // ─── 국내 계좌 잔고 (CSPAQ12200) ──────────────────────────────

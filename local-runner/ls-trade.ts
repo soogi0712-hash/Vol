@@ -5,27 +5,40 @@ import { loadEnvLocal } from './env';
 import { createLogger, type Logger } from './logger';
 import { loadConfig, getTokenCached } from './ls-client';
 import { loadKRSymbols, loadUSSymbols } from './universe';
-import { sanitizeBlocks } from './mask';
+import { sanitizeBlocks, makeScrubber } from './mask';
 import {
-  getLSKR15Min, getLSUS15Min, getLSKRPrice, getLSUSPrice, LSApiError, type LSCandle,
+  getLSKR15Min, getLSUS15Min, getLSKRPrice, getLSUSPrice, classifyChart,
+  LSApiError, type LSCandle, type LSHttpDiag,
 } from '../src/lib/ls-api';
 // 유지 대상 엔진 그대로 재사용
 import { calcBB, calcRSI, getBBSignal, validateCandleData } from '../src/lib/bollinger';
 
 const MIN_CONFIRMED = 40;   // req 8: 국내·해외 각각 최소 40개 확정봉
 
+type Scrub = (s: string) => string;
+
 function kstYmd(offsetDays = 0): string {
   const k = new Date(Date.now() + 9 * 3600 * 1000 - offsetDays * 86400_000);
   return `${k.getUTCFullYear()}${String(k.getUTCMonth() + 1).padStart(2, '0')}${String(k.getUTCDate()).padStart(2, '0')}`;
 }
 
-// 오류를 종류별로 구분해 기록 (req 11)
-function logErr(log: Logger, market: string, id: string, e: unknown) {
+// HTTP 원문 진단 로그 (req 1·2·6) — textHead·헤더를 마스킹해 출력
+function logHttpDiag(log: Logger, scrub: Scrub, market: string, id: string, tr: string, diag?: LSHttpDiag) {
+  if (!diag) { log.warn(`[${market}:${id}] ${tr} HTTP diag 없음`); return; }
+  const h = diag.reqHeaders;
+  log.info(`[${market}:${id}] ${tr} 요청헤더 tr_cd=${h.tr_cd} tr_cont=${h.tr_cont} tr_cont_key=${h.tr_cont_key} content-type=${h.content_type}`);
+  log.info(`[${market}:${id}] ${tr} HTTP status=${diag.status} ${diag.statusText} content-type=${diag.contentType} tr_cont=${diag.trCont} tr_cont_key=${diag.trContKey} textLen=${diag.textLen}`);
+  log.info(`[${market}:${id}] ${tr} rawHead(1000, 마스킹)=${scrub(diag.textHead)}`);
+}
+
+// 오류를 종류별로 구분해 기록 (req 11) + 원문 진단
+function logErr(log: Logger, scrub: Scrub, market: string, id: string, tr: string, e: unknown) {
   if (e instanceof LSApiError) {
-    const tag = { NETWORK: '네트워크오류', RATE_LIMIT: '호출제한', EMPTY: '빈응답', API: 'API오류', INSUFFICIENT: '데이터부족' }[e.kind];
-    log.error(`[${market}:${id}] ${e.kind}(${tag}) ${e.rspCd ? 'rsp_cd=' + e.rspCd + ' ' : ''}${e.message}`);
+    const tag = { NETWORK: '네트워크오류', RATE_LIMIT: '호출제한', EMPTY: '빈응답', API: 'API오류', INSUFFICIENT: '데이터부족', INVALID_RESPONSE: '무효응답' }[e.kind];
+    log.error(`[${market}:${id}] ${e.kind}(${tag}) ${e.rspCd ? 'rsp_cd=' + e.rspCd + ' ' : ''}${scrub(e.message)}`);
+    logHttpDiag(log, scrub, market, id, tr, e.diag);
   } else {
-    log.error(`[${market}:${id}] UNKNOWN ${e instanceof Error ? e.message : String(e)}`);
+    log.error(`[${market}:${id}] UNKNOWN ${scrub(e instanceof Error ? e.message : String(e))}`);
   }
 }
 
@@ -56,11 +69,15 @@ async function main() {
   const observeOnly = !cfg.liveTrading;
   log.info(`모드: ${observeOnly ? 'OBSERVE-ONLY (주문 없음)' : 'LIVE 요청됨'} · LS_LIVE_TRADING=${cfg.liveTrading}`);
 
+  const acct = { appKey: cfg.appKey, appSecret: cfg.appSecret };
+  // 원문 로그 마스킹 스크러버 (앱키/시크릿/토큰/계좌) — req 2
+  const scrub: Scrub = (s) => s;   // 토큰 발급 전 임시
+  let scrubReady: Scrub = scrub;
+
   let token: string;
   try { token = await getTokenCached(cfg); log.info('LS 토큰 OK'); }
-  catch (e) { logErr(log, 'TOKEN', '-', e); process.exit(1); return; }
-
-  const acct = { appKey: cfg.appKey, appSecret: cfg.appSecret };
+  catch (e) { logErr(log, scrubReady, 'TOKEN', '-', 'oauth', e); process.exit(1); return; }
+  scrubReady = makeScrubber([cfg.appKey, cfg.appSecret, token, cfg.accountNo]);
 
   // ── 국내 (순차 처리, Promise.all 금지) ──
   const kr = loadKRSymbols();
@@ -68,14 +85,16 @@ async function main() {
   for (const s of kr) {
     try {
       const r = await getLSKR15Min(acct, token, s.shcode, 60);
-      if (r.candles.length === 0) {
-        log.warn(`[KR:${s.shcode}] 15분봉 빈 응답 — rsp_cd=${r.rspCd} msg=${r.rspMsg} OutBlock1개수=${r.rawCount}`);
+      const status = classifyChart(r);
+      if (status !== 'OK') {
+        log.warn(`[KR:${s.shcode}] t8412 ${status} — rsp_cd=${r.rspCd} msg=${r.rspMsg} OutBlock1개수=${r.rawCount}`);
+        logHttpDiag(log, scrubReady, 'KR', s.shcode, 't8412', r.diag);
         continue;
       }
       let price: number | null = null;
-      try { price = (await getLSKRPrice(acct, token, s.shcode)).price; } catch (e) { logErr(log, 'KR', s.shcode, e); }
+      try { price = (await getLSKRPrice(acct, token, s.shcode)).price; } catch (e) { logErr(log, scrubReady, 'KR', s.shcode, 't1102', e); }
       observeSignal(log, 'KR', s.shcode, r.candles, price);
-    } catch (e) { logErr(log, 'KR', s.shcode, e); }
+    } catch (e) { logErr(log, scrubReady, 'KR', s.shcode, 't8412', e); }
   }
 
   // ── 해외 (순차 처리) ──
@@ -86,25 +105,28 @@ async function main() {
   for (const s of us.ok) {
     try {
       const r = await getLSUS15Min(acct, token, s.symbol, s.exchcd, sdate, 120);
-      if (r.candles.length === 0) {
-        // ── 빈 응답 진단 (req 6): 요청 body(민감제거)/rsp_cd·msg/OutBlock/OutBlock1 개수/연속조회 필드 ──
-        log.warn(`[US:${s.symbol}] 15분봉 빈 응답 — rsp_cd=${r.rspCd} msg=${r.rspMsg} OutBlock1개수=${r.rawCount}`);
+      const status = classifyChart(r);
+      if (status !== 'OK') {
+        // ── 빈/무효 응답 진단 (req 1·5·6): 원문 HTTP + 요청body + OutBlock(cts) ──
+        log.warn(`[US:${s.symbol}] g3203 ${status} — rsp_cd='${r.rspCd}' msg='${r.rspMsg}' OutBlock1개수=${r.rawCount}`);
+        logHttpDiag(log, scrubReady, 'US', s.symbol, 'g3203', r.diag);
         log.warn(`[US:${s.symbol}] 요청body=${JSON.stringify(sanitizeBlocks(r.reqBody))}`);
         log.warn(`[US:${s.symbol}] OutBlock(cts 포함)=${JSON.stringify(sanitizeBlocks(r.outBlock))}`);
-        // ── req 7: 현재가 g3101 별도 호출로 "차트만 빈 응답 vs 종목 자체 실패" 구분 ──
+        // ── req 7: 현재가 g3101 별도 호출로 "차트만 vs 종목 자체 실패" 구분 (price<=0 이면 이제 throw) ──
         try {
           const p = await getLSUSPrice(acct, token, s.symbol, s.exchcd);
-          log.warn(`[US:${s.symbol}] 현재가 g3101 OK (price=${p.price}) → 차트(g3203)만 빈 응답`);
+          logHttpDiag(log, scrubReady, 'US', s.symbol, 'g3101', p.diag);
+          log.warn(`[US:${s.symbol}] 현재가 g3101 OK (price=${p.price}) → 차트(g3203)만 문제`);
         } catch (e) {
-          logErr(log, 'US', s.symbol, e);
-          log.warn(`[US:${s.symbol}] 현재가 g3101 도 실패 → 종목/거래소/시세권한 의심`);
+          logErr(log, scrubReady, 'US', s.symbol, 'g3101', e);
+          log.warn(`[US:${s.symbol}] 현재가 g3101 도 실패 → 종목/거래소/해외시세 이용신청·권한 의심`);
         }
         continue;
       }
       let price: number | null = null;
-      try { price = (await getLSUSPrice(acct, token, s.symbol, s.exchcd)).price; } catch (e) { logErr(log, 'US', s.symbol, e); }
+      try { price = (await getLSUSPrice(acct, token, s.symbol, s.exchcd)).price; } catch (e) { logErr(log, scrubReady, 'US', s.symbol, 'g3101', e); }
       observeSignal(log, 'US', `${s.exchange}:${s.symbol}`, r.candles, price);
-    } catch (e) { logErr(log, 'US', s.symbol, e); }
+    } catch (e) { logErr(log, scrubReady, 'US', s.symbol, 'g3203', e); }
   }
 
   // ── 주문 경계: 2중 안전장치 ──
