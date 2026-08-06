@@ -7,10 +7,10 @@ import { createLogger, type Logger } from './logger';
 import { loadConfig, getTokenCached, resolveUSQuote } from './ls-client';
 import { loadUSSymbols } from './universe';
 import { makeScrubber } from './mask';
-import { getLSUS15MinPaged } from '../src/lib/ls-api';
+import { getLSUS15MinPaged, getLSUSTicksPaged } from '../src/lib/ls-api';
 import {
   LSUSRealtimeClient, RealtimeCandleBuilder, buildWsTrKey, evaluateReadiness, MIN_RT_CANDLES,
-  type RTCandle,
+  aggregateTicksTo15Min, type RTCandle,
 } from './ls-us-websocket';
 import { CandleStore, type StoredCandle } from './candle-store';
 import { calcBB, calcRSI, getBBSignal, validateCandleData } from '../src/lib/bollinger';
@@ -106,6 +106,20 @@ async function main() {
           log.warn(`[US:${s.symbol}] g3203 빈 응답 진단 — qrycnt=${ib.qrycnt} comp_yn=${ib.comp_yn} ncnt=${ib.ncnt}`
             + ` 요청tr_cont=${lastPage.diag.reqHeaders.tr_cont} 요청tr_cont_key='${lastPage.diag.reqHeaders.tr_cont_key}'`
             + ` 응답tr_cont=${lastPage.resTrCont} 응답tr_cont_key='${lastPage.resTrContKey}' rec_count=${lastPage.recCount} rawCount=${lastPage.rawCount}`);
+          // ── fallback: g3202(과거 틱) → 15분 재집계 (공식 TR). 실패/빈응답이면 WS 누적으로만 진행 ──
+          try {
+            const tp = await getLSUSTicksPaged(cfg, token, s.symbol, s.exchcd, quote.delaygb, { target: 21, maxCalls: 40, ncnt: 5, sdate });
+            const bars = aggregateTicksTo15Min(tp.ticks.map(t => ({ datetime: t.datetime, open: t.open, high: t.high, low: t.low, close: t.close, volume: t.volume })));
+            if (bars.length > 0) {
+              builder.seed(bars);
+              if (!store.corrupt) { let d = false; for (const c of builder.confirmedCandles()) if (store.upsertConfirmed(toStored(c))) d = true; if (d) store.flush(); }
+              log.info(`[US:${s.symbol}] g3202 틱 fallback ${tp.calls}회 · 틱 ${tp.ticks.length}개 → 15분 확정봉 ${bars.length}개 (병합 후 확정봉=${builder.confirmedCount})`);
+            } else {
+              const tl = tp.last;
+              const tib = (tl.reqBody as any).g3202InBlock ?? {};
+              log.warn(`[US:${s.symbol}] g3202 틱 fallback 도 빈 응답 — ${tp.calls}회 · qrycnt=${tib.qrycnt} comp_yn=${tib.comp_yn} ncnt=${tib.ncnt} rsp_cd='${tl.rspCd}' rawCount=${tl.rawCount} rec_count=${tl.recCount} 응답tr_cont=${tl.resTrCont} → WS 누적으로만 진행`);
+            }
+          } catch (e) { log.warn(`[US:${s.symbol}] g3202 틱 fallback 실패(무시, WS 로 진행): ${scrub(String(e))}`); }
         }
         // REST 로 확보된 확정봉을 저장(손상 아니면). 형성봉은 아직 없음(GSC 전).
         if (!store.corrupt) {

@@ -397,6 +397,87 @@ export async function getLSUS15MinPaged(
   return { candles, calls, pages, last };
 }
 
+// ── 해외 과거 틱 (g3202 NTICK) — 15분봉 재집계 fallback 용 ────────
+// g3203(NMIN)이 빈 응답일 때, 공식 g3202(과거 틱)로 틱을 받아 15분 OHLCV 로 재집계한다.
+// OutBlock1: date/loctime/open/high/low/close/exevol (+ jongchk/sign 등). 연속조회 위치 = OutBlock.cts_seq.
+// g3202InBlock 필드(공식): delaygb/keysymbol/exchcd/symbol/ncnt/qrycnt/comp_yn/sdate/edate — cts 입력 없음(헤더 연속조회).
+export interface LSTick { datetime: string; open: number; high: number; low: number; close: number; volume: number; }
+export interface LSTickResult {
+  ticks: LSTick[];
+  rspCd: string; rspMsg: string;
+  rawCount: number; recCount: number;
+  ctsSeq: string;
+  resTrCont: string; resTrContKey: string;
+  outBlock: any; reqBody: Record<string, unknown>; diag: LSHttpDiag;
+}
+
+export interface LSTicksOpts { ncnt?: number; qrycnt?: number; sdate?: string; edate?: string; trCont?: string; trContKey?: string; }
+
+export async function getLSUSTicks(
+  cfg: LSConfig, token: string, symbol: string, exchcd: string, delaygb: string, opts: LSTicksOpts = {},
+): Promise<LSTickResult> {
+  const ncnt = opts.ncnt ?? 5;   // 공식 reqExample 값(추측 금지). 어떤 값이든 각 행이 date/loctime/OHLC/exevol 이라 15분 재집계 가능.
+  const qrycnt = Math.min(opts.qrycnt ?? LS_G3203_MAX_QRYCNT_UNCOMPRESSED, LS_G3203_MAX_QRYCNT_UNCOMPRESSED);   // 비압축 상한 5
+  const reqBody = { g3202InBlock: { delaygb, keysymbol: exchcd + symbol, exchcd, symbol, ncnt, qrycnt, comp_yn: 'N', sdate: opts.sdate ?? '', edate: opts.edate ?? '' } };
+  const { data, rspCd, rspMsg, diag } = await lsPost(token, '/overseas-stock/chart', 'g3202', reqBody, { trCont: opts.trCont ?? 'N', trContKey: opts.trContKey ?? '' });
+  const rowsRaw: any[] = data.g3202OutBlock1 || [];
+  const ticks = rowsRaw.map(r => ({
+    datetime: String(r.date) + String(r.loctime).padStart(6, '0'),
+    open: toNum(r.open), high: toNum(r.high), low: toNum(r.low), close: toNum(r.close), volume: toNum(r.exevol),
+  }));
+  const ob = data.g3202OutBlock || {};
+  return {
+    ticks, rspCd, rspMsg, rawCount: rowsRaw.length, recCount: toNum(ob.rec_count),
+    ctsSeq: String(ob.cts_seq ?? ''), resTrCont: diag.trCont, resTrContKey: diag.trContKey, outBlock: ob, reqBody, diag,
+  };
+}
+
+// 15분 버킷 키(ET 벽시계 문자열 floor) — 조기중단용 진행도 계산 전용(집계 본체는 러너 aggregateTicksTo15Min).
+function mins15Key(ts: string): string {
+  if (ts.length < 12) return ts;
+  const mm = parseInt(ts.slice(10, 12) || '0', 10);
+  return ts.slice(0, 8) + ts.slice(8, 10) + String(Math.floor(mm / 15) * 15).padStart(2, '0');
+}
+
+// g3202 연속조회로 틱을 누적한다(tr_cont/tr_cont_key 헤더). 틱은 같은 loctime 중복이 정상 → timestamp dedup 금지.
+// 15분 버킷 target 개가 모이면 조기 종료. RateLimiter 준수(lsPost 경유).
+export interface LSTicksPaged { ticks: LSTick[]; calls: number; pages: Array<{ rspCd: string; rawCount: number; recCount: number; resTrCont: string }>; last: LSTickResult; }
+export async function getLSUSTicksPaged(
+  cfg: LSConfig, token: string, symbol: string, exchcd: string, delaygb: string,
+  opts: { target?: number; maxCalls?: number; ncnt?: number; sdate?: string } = {},
+): Promise<LSTicksPaged> {
+  const target = opts.target ?? 21;      // 확정 20 + 형성 1 버킷
+  const maxCalls = opts.maxCalls ?? 40;
+  const ncnt = opts.ncnt ?? 5;
+  const sdate = opts.sdate ?? '';
+  const ticks: LSTick[] = [];
+  const buckets = new Set<string>();
+  const pages: LSTicksPaged['pages'] = [];
+  let trCont = 'N', trContKey = '', calls = 0;
+  let last!: LSTickResult;
+  while (calls < maxCalls) {
+    const r = await getLSUSTicks(cfg, token, symbol, exchcd, delaygb, { ncnt, qrycnt: LS_G3203_MAX_QRYCNT_UNCOMPRESSED, sdate, trCont, trContKey });
+    calls++;
+    last = r;
+    for (const t of r.ticks) { ticks.push(t); if (t.datetime.length >= 12) buckets.add(mins15Key(t.datetime)); }   // 틱 중복제거 안 함
+    pages.push({ rspCd: r.rspCd, rawCount: r.rawCount, recCount: r.recCount, resTrCont: r.resTrCont });
+    if (buckets.size >= target) break;
+    if (r.ticks.length === 0) break;
+    if (r.resTrCont !== 'Y' || !r.resTrContKey) break;   // 연속조회 없음
+    trCont = 'Y';
+    trContKey = r.resTrContKey;
+  }
+  return { ticks, calls, pages, last };
+}
+
+// 해외 차트 원문 프로브(진단 전용) — 임의 TR(g3103/g3202/g3203/g3204)을 그대로 호출해 rsp_cd/행수/원문을 반환.
+export async function lsOverseasChartRaw(
+  token: string, trCd: string, inBlock: Record<string, unknown>, cont: { trCont?: string; trContKey?: string } = {},
+): Promise<{ rspCd: string; rspMsg: string; out1: any[]; outBlock: any; diag: LSHttpDiag }> {
+  const { data, rspCd, rspMsg, diag } = await lsPost(token, '/overseas-stock/chart', trCd, inBlock, cont);
+  return { rspCd, rspMsg, out1: data[`${trCd}OutBlock1`] || [], outBlock: data[`${trCd}OutBlock`] || {}, diag };
+}
+
 // ─── 국내 계좌 잔고 (CSPAQ12200) ──────────────────────────────
 // req: { CSPAQ12200InBlock1: { BalCreTp: "1" } }
 // resp OutBlock2: MnyOrdAbleAmt(주문가능현금) / DpsastTotamt(예탁자산총평가) /

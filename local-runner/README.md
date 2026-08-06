@@ -68,6 +68,35 @@ LS 공식 문서상 `g3203` 는 **비압축(`comp_yn="N"`) 시 `qrycnt` 최대 5
   `g3203InBlock` 에는 `cts_date/cts_time` 입력 필드가 없으므로(공식) 연속조회는 헤더 방식만 사용합니다.
 - 빈 응답 진단 로그에 `qrycnt / comp_yn / ncnt / tr_cont / tr_cont_key` 를 반드시 출력합니다.
 
+#### g3203 이 빈 응답일 때 — g3202(과거 틱) fallback + WebSocket 누적
+
+실계정에서 `g3203` 이 `rsp_cd=''`, `rec_count=0`, `tr_cont=N` 으로 **빈 응답**이면 연속조회가
+시작조차 안 됩니다. 이때 공식 대체 TR 을 다음 순서로 사용합니다(가짜 봉 생성·readiness 우회 금지):
+
+1. **g3202 (NTICK, 과거 틱)** → 15분 재집계. `date+loctime`(America/New_York)로 15분 버킷팅,
+   `open/high/low/close/exevol` 집계, 최신(형성) 버킷 제외, 거래 없는 구간은 채우지 않음.
+   비압축 `qrycnt=5` + `tr_cont` 연속조회로 최대 40회 누적(틱은 같은 시각 중복이 정상 → dedup 안 함).
+2. g3202 도 빈 응답이면 **WebSocket GSC 누적만으로** 확정봉을 모읍니다. `confirmed≥20` 전에는
+   신규매수 금지(readiness 게이트 유지), 오늘 실주문 없음.
+
+> `g3103`(일주월)·`g3204`(일주월년)은 **일봉류**라 15분봉 전략에 부적합 → 사용하지 않습니다.
+
+#### 어떤 TR 이 과거 데이터를 주는지 진단 — `npm run ls:us-history-diag`
+
+```cmd
+npm run ls:us-history-diag
+```
+AAPL 1종목에 대해 `g3203 / g3202 / g3103 / g3204` 를 각 1회 호출해
+`rsp_cd`, `rawCount`(행수), 시간범위, **생성 가능한 15분봉 수**를 출력합니다.
+실계정에서 어떤 TR 이 실제로 과거 데이터를 반환하는지 경험적으로 확인하는 용도입니다. 주문 없음.
+
+### 실주문 게이트 (아직 주문 미구현 — Phase 3)
+
+실주문은 아래를 **모두** 충족하기 전에는 구현·호출하지 않습니다:
+`confirmed≥20` · GSC fresh · GSH fresh · `bid/ask>0` · 미국 정규장 · `signal=BUY` ·
+중복주문 방지 · 체결확인/미체결취소 구현. 현재는 이 전부가 아직 미구현이므로 **주문은 없습니다**
+(`LS_LIVE_TRADING=false` 와 2중 차단).
+
 ### 해외 시세 구분(delaygb) — 미국 실시간 Non-Display 불가
 
 미국주식 **실시간 시세는 Non-Display(오픈API) 이용이 불가**합니다. 따라서 US 는 기본

@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
   getLSAccessToken, getLSKRBalance, getLSUSBalance,
   getLSKRPrice, getLSUSPrice, getLSKR15Min, getLSUS15Min, getLSUS15MinPaged,
+  getLSUSTicks, getLSUSTicksPaged, lsOverseasChartRaw,
   toLSOverseasExchcd, LSApiError, configureLSRateLimiter, classifyChart,
   LS_G3203_MAX_QRYCNT_UNCOMPRESSED,
 } from '../src/lib/ls-api';
@@ -387,6 +388,72 @@ describe('해외 응답 유효성 (INVALID_RESPONSE / EMPTY / 정상)', () => {
     const r = await getLSUS15Min(cfg, 'T', 'TSLA', '82', 'R', { sdate: '20260726' });
     expect(classifyChart(r)).toBe('OK');
     expect(r.candles.length).toBeGreaterThanOrEqual(40);   // 44 확정봉
+  });
+});
+
+describe('g3202 NTICK 과거 틱 (15분 재집계 fallback)', () => {
+  it('comp_yn=N·qrycnt 상한 5 전송, date+loctime→datetime, exevol→volume, cts_seq 노출', async () => {
+    stubFetch((url, init) => {
+      expect(url).toBe('https://openapi.ls-sec.co.kr:8080/overseas-stock/chart');
+      const b = JSON.parse(init.body).g3202InBlock;
+      expect(init.headers['tr_cd']).toBe('g3202');
+      expect(b.comp_yn).toBe('N');
+      expect(b.qrycnt).toBe(5);   // 120 요청해도 상한 5
+      return { json: { rsp_cd: '00000', g3202OutBlock: { rec_count: 2, cts_seq: 20250428014650000 }, g3202OutBlock1: [
+        { date: '20260805', loctime: '014721', open: '283.16', high: '283.16', low: '283.10', close: '283.10', exevol: 25 },
+        { date: '20260805', loctime: '014730', open: '283.10', high: '283.12', low: '283.02', close: '283.12', exevol: 111 },
+      ] } };
+    });
+    const r = await getLSUSTicks(cfg, 'T', 'AAPL', '82', 'R', { qrycnt: 120, sdate: '20260801' });
+    expect(r.ticks).toHaveLength(2);
+    expect(r.ticks[0].datetime).toBe('20260805014721');
+    expect(r.ticks[1].volume).toBe(111);
+    expect(r.ctsSeq).toBe('20250428014650000');
+    expect(r.rawCount).toBe(2);
+  });
+
+  it('연속조회: tr_cont=Y 로 틱 누적(같은 시각 중복 유지), 버킷 target 도달 시 종료', async () => {
+    let call = 0;
+    stubFetch(() => {
+      call++;
+      // 각 호출 5틱, 15분 간격으로 새 버킷 하나씩 생성 → 버킷 수 = 호출 수
+      const base = 9 * 60 + (call - 1) * 15;   // 분(09:00 부터 15분씩)
+      const hh = String(Math.floor(base / 60)).padStart(2, '0');
+      const mm = String(base % 60).padStart(2, '0');
+      const rows = Array.from({ length: 5 }, (_, i) => ({
+        date: '20260805', loctime: `${hh}${mm}${String(10 + i).padStart(2, '0')}`,   // 같은 버킷 내 여러 틱(일부 같은 시각)
+        open: '1', high: '2', low: '0.5', close: '1.5', exevol: 10,
+      }));
+      return {
+        headers: { 'content-type': 'application/json; charset=UTF-8', 'tr_cont': 'Y', 'tr_cont_key': 'K' + call },
+        json: { rsp_cd: '00000', g3202OutBlock: { rec_count: 5 }, g3202OutBlock1: rows },
+      };
+    });
+    const r = await getLSUSTicksPaged(cfg, 'T', 'AAPL', '82', 'R', { target: 21, maxCalls: 40, sdate: '20260801' });
+    expect(r.calls).toBe(21);                  // 버킷 21개(=호출 21회) 도달 시 종료
+    expect(r.ticks.length).toBe(21 * 5);       // 틱은 dedup 안 함
+  });
+
+  it('tr_cont=N 이면 1회로 종료', async () => {
+    stubFetch(() => ({
+      headers: { 'content-type': 'application/json; charset=UTF-8', 'tr_cont': 'N', 'tr_cont_key': '' },
+      json: { rsp_cd: '00000', g3202OutBlock: { rec_count: 1 }, g3202OutBlock1: [
+        { date: '20260805', loctime: '093012', open: '1', high: '1', low: '1', close: '1', exevol: 1 },
+      ] },
+    }));
+    const r = await getLSUSTicksPaged(cfg, 'T', 'AAPL', '82', 'R', { target: 21, maxCalls: 40 });
+    expect(r.calls).toBe(1);
+  });
+});
+
+describe('lsOverseasChartRaw (진단 프로브)', () => {
+  it('임의 TR 의 rsp_cd·OutBlock1·OutBlock 원문을 반환(빈 rsp_cd 도 그대로)', async () => {
+    stubFetch(() => ({ json: { rsp_cd: '', rsp_msg: '', g3203OutBlock: { rec_count: 0 }, g3203OutBlock1: [] } }));
+    const r = await lsOverseasChartRaw('T', 'g3203', { g3203InBlock: { symbol: 'AAPL' } });
+    expect(r.rspCd).toBe('');            // 빈 rsp_cd 도 throw 없이 노출
+    expect(r.out1).toEqual([]);
+    expect(r.outBlock.rec_count).toBe(0);
+    expect(r.diag.reqHeaders.tr_cd).toBe('g3203');
   });
 });
 

@@ -76,6 +76,36 @@ export function bucket15(localTs: string): string {
  *   - forming:   현재 형성 중인 최신 버킷 1개(별도 상태). confirmed 개수/신호 계산에서 제외.
  *   버킷 전환 전(첫 GSC ~ 15분 경과 전)에는 confirmedCount 가 0 이어야 한다.
  */
+/**
+ * 과거 틱(g3202)을 15분 OHLCV 확정봉으로 재집계한다(fallback).
+ *   - date+loctime(미국 현지=America/New_York 벽시계)로 15분 버킷팅(서머타임 자동).
+ *   - open=버킷 첫 틱 open, high=max, low=min, close=마지막 틱 close, volume=exevol 합.
+ *   - 거래 없는 구간은 임의 봉으로 채우지 않는다(버킷은 틱이 있을 때만 생성).
+ *   - 최신(형성 중) 버킷 1개는 제외한다. 틱은 같은 시각 중복이 정상이라 timestamp dedup 하지 않는다.
+ */
+export function aggregateTicksTo15Min(ticks: RTCandle[]): RTCandle[] {
+  const map = new Map<string, RTCandle>();
+  const sorted = [...ticks].sort((a, b) => a.datetime.localeCompare(b.datetime));   // 시간순
+  for (const t of sorted) {
+    if (!(t.close > 0) || t.datetime.length < 12) continue;
+    const bk = bucket15(t.datetime);
+    const hi = t.high > 0 ? t.high : t.close;
+    const lo = t.low > 0 ? t.low : t.close;
+    const op = t.open > 0 ? t.open : t.close;
+    const cur = map.get(bk);
+    if (!cur) {
+      map.set(bk, { datetime: bk, open: op, high: hi, low: lo, close: t.close, volume: Math.max(0, t.volume) });
+    } else {
+      cur.high = Math.max(cur.high, hi);
+      cur.low = Math.min(cur.low, lo);
+      cur.close = t.close;
+      cur.volume += Math.max(0, t.volume);
+    }
+  }
+  const arr = [...map.values()].sort((a, b) => a.datetime.localeCompare(b.datetime));
+  return arr.slice(0, -1);   // 최신(형성 중) 버킷은 항상 제외(1개뿐이면 확정봉 0)
+}
+
 export class RealtimeCandleBuilder {
   private confirmed = new Map<string, RTCandle>();   // 종료된 봉만
   private forming: RTCandle | null = null;           // 현재 형성 중 봉(별도 상태)

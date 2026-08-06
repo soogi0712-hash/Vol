@@ -111,7 +111,7 @@ async function main() {
   for (const s of (quote.delaygb ? us.ok : [])) {
     try {
       // 비압축(comp_yn=N, qrycnt=5) 연속조회로 최신 60 확정봉 확보(공식 제한 준수).
-      const paged = await getLSUS15MinPaged(acct, token, s.symbol, s.exchcd, quote.delaygb, { target: 60, maxCalls: 12, ncnt: 15, sdate });
+      const paged = await getLSUS15MinPaged(acct, token, s.symbol, s.exchcd, quote.delaygb!, { target: 60, maxCalls: 12, ncnt: 15, sdate });
       const r = paged.last;
       if (paged.candles.length === 0) {
         // ── 빈/무효 응답 진단 (req 1·5·6): 원문 HTTP + 요청body + OutBlock(cts) + 연속조회 헤더 ──

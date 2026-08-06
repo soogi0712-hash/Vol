@@ -4,8 +4,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CandleStore, type StoredCandle } from '../local-runner/candle-store';
 import {
-  RealtimeCandleBuilder, bucket15, evaluateReadiness, GSC_FRESH_MS, GSH_FRESH_MS, MIN_RT_CANDLES,
-  type ReadinessState,
+  RealtimeCandleBuilder, bucket15, evaluateReadiness, aggregateTicksTo15Min,
+  GSC_FRESH_MS, GSH_FRESH_MS, MIN_RT_CANDLES,
+  type ReadinessState, type RTCandle,
 } from '../local-runner/ls-us-websocket';
 
 let dir: string;
@@ -261,6 +262,53 @@ describe('저장 안전성 + 비밀값 미저장', () => {
     s.flush();
     expect(existsSync(s.file)).toBe(true);
     expect(existsSync(s.file + '.tmp')).toBe(false);
+  });
+});
+
+describe('g3202 틱 → 15분 재집계 fallback (이번 수정)', () => {
+  const tk = (dt: string, o: number, h: number, l: number, c: number, v: number): RTCandle =>
+    ({ datetime: dt, open: o, high: h, low: l, close: c, volume: v });
+  it('같은 15분 버킷 틱들을 OHLCV 로 집계 (open=첫, high=max, low=min, close=마지막, volume=합)', () => {
+    const bars = aggregateTicksTo15Min([
+      tk('20260703093012', 100, 100, 100, 100, 5),
+      tk('20260703093712', 101, 102, 99, 101, 3),
+      tk('20260703094400', 100, 100, 98, 98, 2),
+      // 다음 버킷(형성봉 → 제외)
+      tk('20260703094600', 105, 105, 105, 105, 1),
+    ]);
+    expect(bars).toHaveLength(1);   // 0930 확정, 0945 형성 제외
+    expect(bars[0]).toMatchObject({ datetime: '20260703093000', open: 100, high: 102, low: 98, close: 98, volume: 10 });
+  });
+  it('같은 loctime 중복 틱도 합산(틱은 timestamp dedup 하지 않음)', () => {
+    const bars = aggregateTicksTo15Min([
+      tk('20260703093000', 10, 10, 10, 10, 100),
+      tk('20260703093000', 11, 11, 11, 11, 50),   // 같은 시각 다른 체결
+      tk('20260703094600', 12, 12, 12, 12, 1),     // 다음 버킷(형성 제외)
+    ]);
+    expect(bars).toHaveLength(1);
+    expect(bars[0].volume).toBe(150);              // 중복 시각이지만 둘 다 합산
+    expect(bars[0].close).toBe(11);
+  });
+  it('거래 없는 구간을 임의 봉으로 채우지 않는다(빈 버킷 미생성)', () => {
+    const bars = aggregateTicksTo15Min([
+      tk('20260703090000', 1, 1, 1, 1, 1),
+      // 09:15, 09:30 버킷 거래 없음 — 채우지 않음
+      tk('20260703094500', 2, 2, 2, 2, 1),
+      tk('20260703100100', 3, 3, 3, 3, 1),   // 10:00 형성 제외
+    ]);
+    expect(bars.map(b => b.datetime)).toEqual(['20260703090000', '20260703094500']);   // 09:15/09:30 없음
+  });
+  it('NY 현지(date+loctime) 기준 버킷 — 서머타임 오프셋 보정 없음', () => {
+    const bars = aggregateTicksTo15Min([
+      tk('20260703093700', 1, 1, 1, 1, 1),   // 여름(EDT)
+      tk('20260703095200', 2, 2, 2, 2, 1),
+      tk('20260703101200', 3, 3, 3, 3, 1),   // 형성 제외
+    ]);
+    expect(bars[0].datetime).toBe('20260703093000');
+    expect(bars[1].datetime).toBe('20260703094500');
+  });
+  it('틱이 한 버킷뿐이면 확정봉 0(전부 형성)', () => {
+    expect(aggregateTicksTo15Min([tk('20260703093012', 1, 1, 1, 1, 1)])).toHaveLength(0);
   });
 });
 
