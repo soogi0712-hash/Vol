@@ -3,7 +3,27 @@
 // 비밀값은 .env.local 에서만 읽고, 콘솔/파일 로그에는 마스킹된 값만 남긴다.
 import { loadEnvLocal } from './env';
 import { createLogger } from './logger';
-import { loadConfig, getPublicIp, runBalanceCheck } from './ls-client';
+import { loadConfig, getPublicIp, runBalanceCheck, getTokenFor, resolveUSQuote, type LocalLSConfig } from './ls-client';
+import { keyFingerprint } from './mask';
+import { probeLSUSQuote } from '../src/lib/ls-api';
+import type { Logger } from './logger';
+
+// req 6·7: 동일 AAPL g3101 요청을 KR 키 vs US 키 토큰으로 각각 호출해 rsp_cd 비교.
+async function runKeyTest(cfg: LocalLSConfig, log: Logger) {
+  const q = resolveUSQuote();
+  const delaygb = q.delaygb ?? 'R';   // 키 비교 목적이므로 공식 확인값 R 로 진행
+  log.info(`===== LS_US_KEY_TEST: AAPL g3101 을 KR키 vs US키 로 비교 (delaygb=${delaygb}) =====`);
+  for (const [label, pair, market] of [['KR', cfg.kr, 'kr'], ['US', cfg.us, 'us']] as const) {
+    try {
+      const token = await getTokenFor(pair, market);
+      const p = await probeLSUSQuote(token, 'AAPL', '82', delaygb);
+      log.info(`[KEYTEST g3101 AAPL] via ${label} key(${keyFingerprint(pair.appKey)}) → rsp_cd='${p.rspCd}' rsp_msg='${p.rspMsg}' price=${p.price} textLen=${p.diag?.textLen ?? '-'}`);
+    } catch (e) {
+      log.error(`[KEYTEST g3101 AAPL] via ${label} key(${keyFingerprint(pair.appKey)}) 실패: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+  log.info('판정: US키 rsp_cd="00000" 이고 KR키 rsp_cd="" 이면 → 해외는 US 전용 키가 필요함이 확정.');
+}
 
 async function main() {
   loadEnvLocal();
@@ -16,6 +36,9 @@ async function main() {
   let cfg;
   try { cfg = loadConfig(); }
   catch (e) { log.error(String(e)); process.exit(1); return; }
+
+  // req 6: 키 비교 진단은 LS_US_KEY_TEST=true 일 때만 실행
+  if (process.env.LS_US_KEY_TEST === 'true') { await runKeyTest(cfg, log); }
 
   // [DIAG] 원문 로그는 기본 비활성 — 필요 시 .env.local 에 LS_DIAG_RAW=true (req 14)
   const r = await runBalanceCheck(cfg, log, { diagRaw: process.env.LS_DIAG_RAW === 'true' });

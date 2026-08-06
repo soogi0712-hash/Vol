@@ -49,3 +49,13 @@ describe('sanitizeBlocks', () => {
     expect(out.list[0].val).toBe('5');
   });
 });
+
+describe('keyFingerprint', () => {
+  it('앞 4자리 + **** (req5)', async () => {
+    const { keyFingerprint } = await import('../local-runner/mask');
+    expect(keyFingerprint('abcd1234efgh')).toBe('abcd****');
+    expect(keyFingerprint('9f21xxxx')).toBe('9f21****');
+    expect(keyFingerprint('')).toBe('(none)');
+    expect(keyFingerprint(undefined)).toBe('(none)');
+  });
+});
