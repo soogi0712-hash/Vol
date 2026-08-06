@@ -52,8 +52,21 @@ npm run ls:trade
 
 - 거래소코드(exchcd)는 확인분만: **NASDAQ=82, NYSE=81**. 미확인 거래소(AMEX 등)는
   추측하지 않고 `UNSUPPORTED_EXCHANGE`로 로그 후 스킵합니다(공식 코드 확인 후 추가).
-- 오류는 종류별로 구분 기록: 네트워크오류 / 호출제한 / 빈응답 / 데이터부족 / API오류.
+- 오류는 종류별로 구분 기록: 네트워크오류 / 호출제한 / 빈응답 / 데이터부족 / API오류 / 무효응답.
 - TR: 국내현재가 `t1102`, 해외현재가 `g3101`, 국내분봉 `t8412`, 해외분봉 `g3203` (모두 공식).
+
+### 해외 시세 구분(delaygb) — 미국 실시간 Non-Display 불가
+
+미국주식 **실시간 시세는 Non-Display(오픈API) 이용이 불가**합니다. 따라서 US 는 기본
+**지연시세(DELAYED)** 로 조회합니다. `delaygb` 는 코드에 하드코딩하지 않으며, 다음처럼 정합니다:
+
+- `LS_US_QUOTE_MODE=REALTIME` → `delaygb='R'` (공식 reqExample 로 확인된 값)
+- `LS_US_QUOTE_MODE=DELAYED`(기본) → `delaygb = LS_US_DELAYGB` (LS 공식 g3101/g3203 문서의
+  **지연 delaygb 코드를 직접 입력**). 확인 못 한 코드는 추측해 넣지 않으므로, 미설정 시
+  US 시세는 건너뛰고 안내 로그를 남깁니다.
+
+> 해외 약정등록 직후에는 약정 전 발급된 토큰 캐시를 지워야 합니다:
+> `.env.local` 에 `LS_FORCE_TOKEN_REFRESH=true` (또는 `rmdir /s /q local-runner\.cache`).
 
 ## 4) Windows 작업 스케줄러 자동 시작
 

@@ -260,9 +260,10 @@ export async function getLSKRPrice(cfg: LSConfig, token: string, shcode: string)
 }
 
 // ── 해외 현재가 (g3101) — keysymbol = exchcd + symbol ────────
-export async function getLSUSPrice(cfg: LSConfig, token: string, symbol: string, exchcd: string): Promise<LSPrice> {
+// delaygb 는 하드코딩하지 않는다(req1): 호출측이 실시간('R') 또는 공식 지연 코드를 전달.
+export async function getLSUSPrice(cfg: LSConfig, token: string, symbol: string, exchcd: string, delaygb: string): Promise<LSPrice> {
   const res = await lsPost(token, '/overseas-stock/market-data', 'g3101', {
-    g3101InBlock: { delaygb: 'R', keysymbol: exchcd + symbol, exchcd, symbol },
+    g3101InBlock: { delaygb, keysymbol: exchcd + symbol, exchcd, symbol },
   });
   return parseLSPrice('g3101', res, 'g3101OutBlock');
 }
@@ -302,9 +303,10 @@ export async function getLSKR15Min(cfg: LSConfig, token: string, shcode: string,
 }
 
 // ── 해외 15분봉 (g3203, ncnt=15) — OutBlock1: date/loctime/open/high/low/close/exevol ──
-export async function getLSUS15Min(cfg: LSConfig, token: string, symbol: string, exchcd: string, sdateYYYYMMDD: string, qrycnt = 100): Promise<LSChartResult> {
-  // 공식 reqExample 필드/값 유지: delaygb=R, keysymbol=exchcd+symbol, comp_yn=N, edate="".
-  const reqBody = { g3203InBlock: { delaygb: 'R', keysymbol: exchcd + symbol, exchcd, symbol, ncnt: 15, qrycnt, comp_yn: 'N', sdate: sdateYYYYMMDD, edate: '' } };
+export async function getLSUS15Min(cfg: LSConfig, token: string, symbol: string, exchcd: string, delaygb: string, sdateYYYYMMDD: string, qrycnt = 100): Promise<LSChartResult> {
+  // delaygb 는 하드코딩하지 않는다(req1·4): 호출측이 실시간('R') 또는 공식 지연 코드를 전달.
+  // 그 외 필드는 공식 reqExample 유지: keysymbol=exchcd+symbol, comp_yn=N, edate="".
+  const reqBody = { g3203InBlock: { delaygb, keysymbol: exchcd + symbol, exchcd, symbol, ncnt: 15, qrycnt, comp_yn: 'N', sdate: sdateYYYYMMDD, edate: '' } };
   const { data, rspCd, rspMsg, diag } = await lsPost(token, '/overseas-stock/chart', 'g3203', reqBody);
   const rows: any[] = data.g3203OutBlock1 || [];
   const candles = toConfirmed(rows.map(r => ({

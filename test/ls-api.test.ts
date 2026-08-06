@@ -158,7 +158,7 @@ describe('getLSKRPrice / getLSUSPrice', () => {
       expect(b.exchcd).toBe('82'); expect(b.symbol).toBe('TSLA'); expect(b.keysymbol).toBe('82TSLA');
       return { json: { rsp_cd: '00000', g3101OutBlock: { price: '283.8200', open: '285.09', high: '285.31', low: '281.84', volume: 414175 } } };
     });
-    const p = await getLSUSPrice(cfg, 'T', 'TSLA', '82');
+    const p = await getLSUSPrice(cfg, 'T', 'TSLA', '82', 'R');
     expect(p.price).toBeCloseTo(283.82); expect(p.volume).toBe(414175);
   });
 });
@@ -191,7 +191,7 @@ describe('getLSKR15Min (t8412) / getLSUS15Min (g3203)', () => {
         { date: '20260805', loctime: '012000', open: '1.5', high: '2.5', low: '1', close: '2', exevol: 13514 },
       ] } };
     });
-    const r = await getLSUS15Min(cfg, 'T', 'TSLA', '82', '20260726', 120);
+    const r = await getLSUS15Min(cfg, 'T', 'TSLA', '82', 'R', '20260726', 120);
     expect(r.candles).toHaveLength(1);                // 2개 중 형성봉 1개 제외
     expect(r.candles[0].datetime).toBe('20260805011000');
     expect(r.candles[0].close).toBe(1.5); expect(r.candles[0].volume).toBe(8016);
@@ -214,7 +214,7 @@ describe('AAPL 빈 응답 진단 (g3203)', () => {
         // g3203OutBlock1 없음(빈 응답)
       } };
     });
-    const r = await getLSUS15Min(cfg, 'T', 'AAPL', '82', '20260727', 120);
+    const r = await getLSUS15Min(cfg, 'T', 'AAPL', '82', 'R', '20260727', 120);
     expect(r.candles).toEqual([]);
     expect(r.rawCount).toBe(0);
     expect(r.rspCd).toBe('00000');
@@ -262,27 +262,27 @@ describe('오류 분류 (LSApiError.kind)', () => {
 describe('해외 응답 유효성 (INVALID_RESPONSE / EMPTY / 정상)', () => {
   it('HTTP 200 + 빈 본문 → INVALID_RESPONSE', async () => {
     stubFetch(() => ({ status: 200, text: '' }));
-    await expect(getLSUSPrice(cfg, 'T', 'AAPL', '82')).rejects.toMatchObject({ kind: 'INVALID_RESPONSE' });
+    await expect(getLSUSPrice(cfg, 'T', 'AAPL', '82', 'R')).rejects.toMatchObject({ kind: 'INVALID_RESPONSE' });
   });
   it('HTTP 200 + price=0 + OutBlock 없음 → 성공 처리 금지(EMPTY/INVALID)', async () => {
     // rsp_cd 공백 + OutBlock 없음 → INVALID_RESPONSE
     stubFetch(() => ({ json: {} }));
-    await expect(getLSUSPrice(cfg, 'T', 'AAPL', '82')).rejects.toMatchObject({ kind: 'INVALID_RESPONSE' });
+    await expect(getLSUSPrice(cfg, 'T', 'AAPL', '82', 'R')).rejects.toMatchObject({ kind: 'INVALID_RESPONSE' });
   });
   it('HTTP 200 + OutBlock 있으나 price=0 → EMPTY', async () => {
     stubFetch(() => ({ json: { rsp_cd: '00000', g3101OutBlock: { price: '0', open: '0', high: '0', low: '0', volume: 0 } } }));
-    await expect(getLSUSPrice(cfg, 'T', 'AAPL', '82')).rejects.toMatchObject({ kind: 'EMPTY' });
+    await expect(getLSUSPrice(cfg, 'T', 'AAPL', '82', 'R')).rejects.toMatchObject({ kind: 'EMPTY' });
   });
   it('정상 g3101 price>0 → 성공 + diag 포함', async () => {
     stubFetch(() => ({ json: { rsp_cd: '00000', g3101OutBlock: { price: '283.82', open: '285', high: '286', low: '281', volume: 100 } } }));
-    const p = await getLSUSPrice(cfg, 'T', 'TSLA', '82');
+    const p = await getLSUSPrice(cfg, 'T', 'TSLA', '82', 'R');
     expect(p.price).toBeCloseTo(283.82);
     expect(p.diag.status).toBe(200);
     expect(p.diag.reqHeaders.tr_cd).toBe('g3101');
   });
   it('g3203 rsp_cd 공백 + OutBlock 없음 + 0개 → classifyChart=INVALID_RESPONSE', async () => {
     stubFetch(() => ({ json: {} }));   // rsp_cd 없음, OutBlock 없음
-    const r = await getLSUS15Min(cfg, 'T', 'AAPL', '82', '20260727', 120);
+    const r = await getLSUS15Min(cfg, 'T', 'AAPL', '82', 'R', '20260727', 120);
     expect(r.candles).toEqual([]);
     expect(classifyChart(r)).toBe('INVALID_RESPONSE');
     expect(r.diag.status).toBe(200);   // 원문 진단 확보
@@ -293,8 +293,24 @@ describe('해외 응답 유효성 (INVALID_RESPONSE / EMPTY / 정상)', () => {
       return { date: '20260805', loctime: `${String(hh).padStart(2, '0')}${String(mm).padStart(2, '0')}00`, open: '1', high: '2', low: '0.5', close: String(1 + i * 0.01), exevol: 100 };
     });
     stubFetch(() => ({ json: { rsp_cd: '00000', g3203OutBlock: { rec_count: 45 }, g3203OutBlock1: rows } }));
-    const r = await getLSUS15Min(cfg, 'T', 'TSLA', '82', '20260726', 120);
+    const r = await getLSUS15Min(cfg, 'T', 'TSLA', '82', 'R', '20260726', 120);
     expect(classifyChart(r)).toBe('OK');
     expect(r.candles.length).toBeGreaterThanOrEqual(40);   // 44 확정봉
+  });
+});
+
+describe('delaygb 파라미터 (하드코딩 금지, g3101·g3203 동일 적용)', () => {
+  it('g3101/g3203 모두 호출측 delaygb 값을 그대로 전송', async () => {
+    stubFetch((url, init) => {
+      const body = JSON.parse(init.body);
+      if (url.includes('/market-data')) {
+        expect(body.g3101InBlock.delaygb).toBe('DL');   // 임의 지연코드 예시 — 하드코딩 R 아님
+        return { json: { rsp_cd: '00000', g3101OutBlock: { price: '10', open: '10', high: '10', low: '10', volume: 1 } } };
+      }
+      expect(body.g3203InBlock.delaygb).toBe('DL');
+      return { json: { rsp_cd: '00000', g3203OutBlock: { rec_count: 0 }, g3203OutBlock1: [] } };
+    });
+    await getLSUSPrice(cfg, 'T', 'AAPL', '82', 'DL');
+    await getLSUS15Min(cfg, 'T', 'AAPL', '82', 'DL', '20260727', 120);
   });
 });

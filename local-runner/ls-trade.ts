@@ -3,7 +3,7 @@
 // → OBSERVE 로그. 주문은 절대 실행하지 않는다(LS_LIVE_TRADING 게이트 + 주문 미구현 2중 차단).
 import { loadEnvLocal } from './env';
 import { createLogger, type Logger } from './logger';
-import { loadConfig, getTokenCached } from './ls-client';
+import { loadConfig, getTokenCached, resolveUSQuote } from './ls-client';
 import { loadKRSymbols, loadUSSymbols } from './universe';
 import { sanitizeBlocks, makeScrubber } from './mask';
 import {
@@ -100,11 +100,17 @@ async function main() {
   // ── 해외 (순차 처리) ──
   const us = loadUSSymbols();
   for (const u of us.unsupported) log.warn(`[US:${u.token}] UNSUPPORTED_EXCHANGE (${u.exchange}) — LS exchcd 미확인, 스킵(추측 금지)`);
-  log.info(`해외 관찰 종목: ${us.ok.map(s => `${s.exchange}:${s.symbol}`).join(', ')}`);
+  // 해외 시세 구분(delaygb): 미국 실시간은 Non-Display 불가 → 기본 DELAYED. 공식 지연코드는 env.
+  const quote = resolveUSQuote();
+  if (!quote.delaygb) {
+    log.error(`해외 시세 스킵 — ${quote.error}`);
+  } else {
+    log.info(`해외 시세 구분: mode=${quote.mode} delaygb=${quote.delaygb} · 관찰 종목: ${us.ok.map(s => `${s.exchange}:${s.symbol}`).join(', ')}`);
+  }
   const sdate = kstYmd(10);   // 최근 ~10일 범위로 40개 확보
-  for (const s of us.ok) {
+  for (const s of (quote.delaygb ? us.ok : [])) {
     try {
-      const r = await getLSUS15Min(acct, token, s.symbol, s.exchcd, sdate, 120);
+      const r = await getLSUS15Min(acct, token, s.symbol, s.exchcd, quote.delaygb, sdate, 120);
       const status = classifyChart(r);
       if (status !== 'OK') {
         // ── 빈/무효 응답 진단 (req 1·5·6): 원문 HTTP + 요청body + OutBlock(cts) ──
@@ -114,7 +120,7 @@ async function main() {
         log.warn(`[US:${s.symbol}] OutBlock(cts 포함)=${JSON.stringify(sanitizeBlocks(r.outBlock))}`);
         // ── req 7: 현재가 g3101 별도 호출로 "차트만 vs 종목 자체 실패" 구분 (price<=0 이면 이제 throw) ──
         try {
-          const p = await getLSUSPrice(acct, token, s.symbol, s.exchcd);
+          const p = await getLSUSPrice(acct, token, s.symbol, s.exchcd, quote.delaygb!);
           logHttpDiag(log, scrubReady, 'US', s.symbol, 'g3101', p.diag);
           log.warn(`[US:${s.symbol}] 현재가 g3101 OK (price=${p.price}) → 차트(g3203)만 문제`);
         } catch (e) {
@@ -124,7 +130,7 @@ async function main() {
         continue;
       }
       let price: number | null = null;
-      try { price = (await getLSUSPrice(acct, token, s.symbol, s.exchcd)).price; } catch (e) { logErr(log, scrubReady, 'US', s.symbol, 'g3101', e); }
+      try { price = (await getLSUSPrice(acct, token, s.symbol, s.exchcd, quote.delaygb!)).price; } catch (e) { logErr(log, scrubReady, 'US', s.symbol, 'g3101', e); }
       observeSignal(log, 'US', `${s.exchange}:${s.symbol}`, r.candles, price);
     } catch (e) { logErr(log, scrubReady, 'US', s.symbol, 'g3203', e); }
   }

@@ -28,9 +28,23 @@ export function loadConfig(): LocalLSConfig {
 }
 
 // 토큰만 발급/캐시해 반환 (Phase 2 시세/분봉 호출용).
+// LS_FORCE_TOKEN_REFRESH=true 면 기존 캐시를 삭제하고 새로 발급한다(req 7 — 해외 약정등록 후).
 export async function getTokenCached(cfg: LocalLSConfig): Promise<string> {
   const kv = new FileKV();
+  if (process.env.LS_FORCE_TOKEN_REFRESH === 'true') kv.delete('ls_token_v1');
   return getLSAccessToken({ appKey: cfg.appKey, appSecret: cfg.appSecret }, kv as any);
+}
+
+// 해외 시세 구분 해석(req 1~6). REALTIME='R'(공식 확인값), DELAYED=공식 지연코드(env 로 입력).
+// 미국주식 실시간은 Non-Display 불가 → 기본 DELAYED. 공식 지연 코드는 추측하지 않는다.
+export function resolveUSQuote(): { mode: 'REALTIME' | 'DELAYED'; delaygb: string | null; error?: string } {
+  const mode = (process.env.LS_US_QUOTE_MODE || 'DELAYED').toUpperCase() === 'REALTIME' ? 'REALTIME' : 'DELAYED';
+  if (mode === 'REALTIME') return { mode, delaygb: 'R' };   // 공식 reqExample 로 확인된 값
+  const code = (process.env.LS_US_DELAYGB || '').trim();
+  if (!code) {
+    return { mode, delaygb: null, error: 'LS_US_DELAYGB 미설정 — LS 공식 g3101/g3203 문서의 지연 delaygb 코드를 .env.local 에 입력하세요(추측 금지).' };
+  }
+  return { mode, delaygb: code };
 }
 
 // 현재 공인 IP (LS 등록 IP 확인용). 실패해도 진행.
