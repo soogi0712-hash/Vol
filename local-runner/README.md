@@ -68,6 +68,21 @@ npm run ls:trade
 > 해외 약정등록 직후에는 약정 전 발급된 토큰 캐시를 지워야 합니다:
 > `.env.local` 에 `LS_FORCE_TOKEN_REFRESH=true` (또는 `rmdir /s /q local-runner\.cache`).
 
+### 해외 실시간 시세 (WebSocket GSC/GSH)
+
+미국 실시간 시세는 REST(g3101)가 아닌 **WebSocket GSC(체결)/GSH(호가)** 로 받습니다.
+
+```cmd
+npm run ls:usws
+```
+- URL `wss://openapi.ls-sec.co.kr:9443/websocket`, 등록 `{header:{token,tr_type:"3"},body:{tr_cd:"GSC"|"GSH",tr_key}}`.
+- `tr_key = exchcd+symbol` 을 **총 18자리 오른쪽 공백 패딩**(공식 예: `"81SOXL            "`). REST `keysymbol`(패딩 없음)과 **혼용 금지**.
+- 거래소코드: **82=NASDAQ, 81=NYSE/AMEX**(SOXL=81, 공식 GSH 예제로 확인).
+- GSC 체결로 **실시간 15분봉** 생성(초기 REST g3203 시드 + 이후 실시간 집계), GSH 로 최우선 매수/매도 호가 수집.
+- readiness gate: GSC 30초 이내 수신 + `lastPrice>0` + 15분봉 ≥20 이어야 신규매수 허용(아니면 stale → 신규매수 금지, 보유매도만 stale 표시로 허용).
+- **주문은 하지 않습니다**(`LS_LIVE_TRADING=false`, 시세/봉 생성 검증까지만).
+- Node 21+ 의 전역 WebSocket 사용(별도 패키지 불필요). 실행 시간은 `LS_WS_SECONDS`(기본 60초).
+
 ## 4) Windows 작업 스케줄러 자동 시작
 
 `schtasks` 예 (평일 09:00~15:30 사이 5분마다 트레이드 러너 실행):

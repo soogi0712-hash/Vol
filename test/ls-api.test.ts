@@ -135,7 +135,7 @@ describe('거래소코드 매핑 (확인분만)', () => {
     expect(toLSOverseasExchcd('NASDAQ')).toBe('82');
     expect(toLSOverseasExchcd('NASD')).toBe('82');
     expect(toLSOverseasExchcd('NYSE')).toBe('81');
-    expect(toLSOverseasExchcd('AMEX')).toBeNull();   // 미확인 → 추측 금지
+    expect(toLSOverseasExchcd('AMEX')).toBe('81');   // 공식 GSH 예제 81SOXL 로 확인
     expect(toLSOverseasExchcd('XYZ')).toBeNull();
   });
 });

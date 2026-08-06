@@ -220,11 +220,12 @@ async function lsPost(token: string, path: string, trCd: string, inBlock: Record
   });
 }
 
-// ── 해외 거래소코드(exchcd) — LS 공식 확인분만 명시 관리 ──────
-// 확인: 82=NASDAQ(공식 reqExample), 81=NYSE(공식 예제). AMEX 등은 미확인 → 매핑 안 함(추측 금지).
+// ── 해외 거래소코드(exchcd) — LS 공식 확인분 ──────────────────
+// 82=NASDAQ(공식 reqExample), 81=NYSE/AMEX(공식 GSH reqExample: "81SOXL"). ARCA 계열도 81.
 export const LS_OVERSEAS_EXCHCD: Record<string, string> = {
   NASDAQ: '82', NASD: '82', NAS: '82',
   NYSE: '81', NYS: '81',
+  AMEX: '81', AMS: '81', ARCA: '81',
 };
 /** 거래소명 → LS exchcd. 미확인 거래소는 null (호출측이 UNSUPPORTED 처리). */
 export function toLSOverseasExchcd(name: string): string | null {

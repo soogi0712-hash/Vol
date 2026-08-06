@@ -12,6 +12,7 @@
     "dev:local": "wrangler dev --test-scheduled --local",
     "ls:diag": "tsx local-runner/ls-diag.ts",
     "ls:trade": "tsx local-runner/ls-trade.ts",
+    "ls:usws": "tsx local-runner/ls-usws.ts",
     "db:create": "wrangler d1 create bollinger-trader-production",
     "db:migrate:local": "wrangler d1 migrations apply bollinger-trader-production --local",
     "db:migrate:prod": "wrangler d1 migrations apply bollinger-trader-production --remote",

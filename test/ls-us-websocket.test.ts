@@ -1,0 +1,150 @@
+import { describe, it, expect, vi } from 'vitest';
+import {
+  buildRestKeysymbol, buildWsTrKey, buildRegisterMessage,
+  parseGSC, parseGSH, bucket15, RealtimeCandleBuilder,
+  evaluateReadiness, LSUSRealtimeClient, type WsLike,
+} from '../local-runner/ls-us-websocket';
+import { toLSOverseasExchcd } from '../src/lib/ls-api';
+
+describe('키 형식 분리 (REST vs WS, req5)', () => {
+  it('REST keysymbol = exchcd+symbol, 공백 없음', () => {
+    expect(buildRestKeysymbol('82', 'AAPL')).toBe('82AAPL');
+    expect(buildRestKeysymbol('82', 'AAPL')).not.toMatch(/ /);
+  });
+  it('WS tr_key = 총 18자리 오른쪽 공백 패딩 (AAPL exchcd 82)', () => {
+    const k = buildWsTrKey('82', 'AAPL');
+    expect(k.length).toBe(18);
+    expect(k).toBe('82AAPL' + ' '.repeat(12));
+    expect(k.startsWith('82AAPL')).toBe(true);
+  });
+  it('SOXL: 공식 예제와 동일 (거래소 81) → "81SOXL"+패딩, 18자리', () => {
+    // 공식 GSH reqExample: "81SOXL            "
+    expect(toLSOverseasExchcd('AMEX')).toBe('81');   // 종목마스터상 SOXL(NYSE Arca)=81
+    const k = buildWsTrKey('81', 'SOXL');
+    expect(k).toBe('81SOXL            ');
+    expect(k.length).toBe(18);
+  });
+  it('JSON 직렬화 후에도 tr_key trailing spaces 보존 (trKeyLength=18)', () => {
+    const trKey = buildWsTrKey('82', 'AAPL');
+    const msg = buildRegisterMessage('TOK', 'GSC', trKey);
+    const serialized = JSON.stringify(msg);
+    const parsed = JSON.parse(serialized);
+    expect(parsed.body.tr_key).toBe(trKey);
+    expect(parsed.body.tr_key.length).toBe(18);          // 직렬화/역직렬화 후에도 18
+    expect(parsed.header.tr_type).toBe('3');
+    expect(parsed.body.tr_cd).toBe('GSC');
+  });
+});
+
+describe('GSC/GSH 파서 (공식 필드)', () => {
+  it('GSC: price/trdq/totq/ovsdate+trdtm', () => {
+    const t = parseGSC({ symbol: 'AAPL', price: '283.82', trdq: '10', totq: '414175', ovsdate: '20260805', trdtm: '093015' });
+    expect(t.lastPrice).toBeCloseTo(283.82);
+    expect(t.tradeQty).toBe(10);
+    expect(t.cumulativeVolume).toBe(414175);
+    expect(t.localTs).toBe('20260805093015');
+  });
+  it('GSH: offerho1/bidho1/offerrem1/bidrem1 (공식 SOXL 예제값)', () => {
+    const q = parseGSH({ symbol: 'SOXL', offerho1: '12.2100', bidho1: '12.2000', offerrem1: '8418', bidrem1: '12760' });
+    expect(q.bestAsk).toBeCloseTo(12.21);
+    expect(q.bestBid).toBeCloseTo(12.20);
+    expect(q.askRem).toBe(8418);
+    expect(q.bidRem).toBe(12760);
+  });
+});
+
+describe('실시간 15분봉 집계', () => {
+  it('bucket15: 15분 버킷 시작', () => {
+    expect(bucket15('20260805093015')).toBe('20260805093000');
+    expect(bucket15('20260805094459')).toBe('20260805093000');
+    expect(bucket15('20260805094500')).toBe('20260805094500');
+  });
+  it('체결 → OHLCV, 형성봉 제외 옵션', () => {
+    const b = new RealtimeCandleBuilder();
+    b.addTrade(10, 5, '20260805093001');   // 09:30 버킷
+    b.addTrade(12, 3, '20260805093500');
+    b.addTrade(9, 2, '20260805094000');
+    b.addTrade(11, 4, '20260805094600');   // 09:45 버킷(형성 중)
+    const all = b.candles();
+    expect(all.map(c => c.datetime)).toEqual(['20260805093000', '20260805094500']);
+    expect(all[0]).toMatchObject({ open: 10, high: 12, low: 9, close: 9, volume: 10 });
+    expect(b.candles(true).map(c => c.datetime)).toEqual(['20260805093000']);  // 형성봉 제외
+  });
+  it('REST 시드 후 실시간 확장', () => {
+    const b = new RealtimeCandleBuilder();
+    b.seed([{ datetime: '20260805090000', open: 1, high: 2, low: 1, close: 2, volume: 100 }]);
+    b.addTrade(3, 1, '20260805091601');   // 09:16 → 09:15 버킷(신규)
+    expect(b.size).toBe(2);
+    b.addTrade(4, 1, '20260805090500');   // 09:05 → 09:00 버킷(시드 갱신)
+    expect(b.size).toBe(2);               // 새 버킷 아님
+    expect(b.candles()[0].close).toBe(4); // 시드 버킷 close 갱신됨
+  });
+});
+
+describe('readiness gate (req6)', () => {
+  const now = 1_000_000_000_000;
+  it('신선+가격>0+봉20 → ready, 신규매수 허용', () => {
+    const r = evaluateReadiness({ lastGSCatMs: now - 5000, lastPrice: 100, candleCount: 25 }, now);
+    expect(r.ready).toBe(true); expect(r.stale).toBe(false); expect(r.allowNewBuy).toBe(true);
+  });
+  it('GSC 30초 초과 → stale, 신규매수 금지, 보유매도는 허용', () => {
+    const r = evaluateReadiness({ lastGSCatMs: now - 31_000, lastPrice: 100, candleCount: 25 }, now);
+    expect(r.stale).toBe(true); expect(r.allowNewBuy).toBe(false); expect(r.allowSellExisting).toBe(true);
+    expect(r.reasons.some(x => x.includes('stale'))).toBe(true);
+  });
+  it('봉 부족 → not ready', () => {
+    const r = evaluateReadiness({ lastGSCatMs: now, lastPrice: 100, candleCount: 5 }, now);
+    expect(r.ready).toBe(false);
+    expect(r.reasons.some(x => x.includes('15분봉 부족'))).toBe(true);
+  });
+});
+
+describe('LSUSRealtimeClient (fake socket)', () => {
+  function fakeWs() {
+    const ws: any = { sent: [] as string[], send(d: string) { ws.sent.push(d); }, close() { ws.onclose?.(); }, onopen: null, onmessage: null, onclose: null, onerror: null };
+    return ws as WsLike & { sent: string[] };
+  }
+  it('연결 시 종목마다 GSC·GSH 등록(tr_type=3, tr_key 18자리)', () => {
+    const ws = fakeWs();
+    const client = new LSUSRealtimeClient('TOK', {}, { wsFactory: () => ws });
+    client.connect([{ exchcd: '82', symbol: 'AAPL' }]);
+    ws.onopen?.();
+    expect(ws.sent).toHaveLength(2);   // GSC + GSH
+    const regs = ws.sent.map((s) => JSON.parse(s));
+    expect(regs.map(r => r.body.tr_cd).sort()).toEqual(['GSC', 'GSH']);
+    for (const r of regs) {
+      expect(r.header.tr_type).toBe('3');
+      expect(r.body.tr_key.length).toBe(18);
+      expect(r.body.tr_key.startsWith('82AAPL')).toBe(true);
+    }
+  });
+  it('GSC/GSH 메시지 라우팅 + PINGPONG 에코', () => {
+    const ws = fakeWs();
+    const ticks: any[] = []; const quotes: any[] = [];
+    const client = new LSUSRealtimeClient('TOK', { onGSC: t => ticks.push(t), onGSH: q => quotes.push(q) }, { wsFactory: () => ws });
+    client.connect([{ exchcd: '82', symbol: 'AAPL' }]);
+    ws.onopen?.();
+    ws.sent.length = 0;
+    ws.onmessage?.({ data: JSON.stringify({ header: { tr_cd: 'GSC' }, body: { symbol: 'AAPL', price: '283.82', trdq: '10', totq: '1', ovsdate: '20260805', trdtm: '093015' } }) });
+    ws.onmessage?.({ data: JSON.stringify({ header: { tr_cd: 'GSH' }, body: { symbol: 'AAPL', offerho1: '284', bidho1: '283', offerrem1: '5', bidrem1: '7' } }) });
+    ws.onmessage?.({ data: JSON.stringify({ header: { tr_cd: 'PINGPONG' }, body: {} }) });
+    expect(ticks[0].lastPrice).toBeCloseTo(283.82);
+    expect(quotes[0].bestAsk).toBe(284);
+    expect(ws.sent).toHaveLength(1);   // PINGPONG 에코 1건
+    expect(JSON.parse(ws.sent[0]).header.tr_cd).toBe('PINGPONG');
+  });
+  it('예기치 않은 종료 시 백오프 재연결 후 자동 재등록', async () => {
+    const sockets: any[] = [];
+    const factory = () => { const w = fakeWs(); sockets.push(w); return w; };
+    const client = new LSUSRealtimeClient('TOK', {}, { wsFactory: factory, backoffMs: [1], sleep: async () => {} });
+    client.connect([{ exchcd: '81', symbol: 'SOXL' }]);
+    sockets[0].onopen?.();
+    expect(sockets[0].sent).toHaveLength(2);
+    sockets[0].onclose?.();               // 비정상 종료 → 재연결
+    await new Promise(r => setTimeout(r, 5));
+    expect(sockets.length).toBe(2);       // 새 소켓 생성
+    sockets[1].onopen?.();
+    expect(sockets[1].sent).toHaveLength(2);   // 재등록됨
+    client.close();
+  });
+});
