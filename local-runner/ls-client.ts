@@ -27,6 +27,12 @@ export function loadConfig(): LocalLSConfig {
   };
 }
 
+// 토큰만 발급/캐시해 반환 (Phase 2 시세/분봉 호출용).
+export async function getTokenCached(cfg: LocalLSConfig): Promise<string> {
+  const kv = new FileKV();
+  return getLSAccessToken({ appKey: cfg.appKey, appSecret: cfg.appSecret }, kv as any);
+}
+
 // 현재 공인 IP (LS 등록 IP 확인용). 실패해도 진행.
 export async function getPublicIp(): Promise<string | null> {
   try {

@@ -1,5 +1,9 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { getLSAccessToken, getLSKRBalance, getLSUSBalance } from '../src/lib/ls-api';
+import {
+  getLSAccessToken, getLSKRBalance, getLSUSBalance,
+  getLSKRPrice, getLSUSPrice, getLSKR15Min, getLSUS15Min,
+  toLSOverseasExchcd, LSApiError,
+} from '../src/lib/ls-api';
 
 // global fetch 스텁 — LS 엔드포인트별 응답 제어
 let calls: Array<{ url: string; init: any }>;
@@ -111,5 +115,92 @@ describe('getLSUSBalance (COSOQ00201)', () => {
   it('허용목록에 없는 실제 오류코드는 throw', async () => {
     stubFetch(() => ({ json: { rsp_cd: 'IGW00001', rsp_msg: '권한 오류' } }));
     await expect(getLSUSBalance(cfg, 'T', '20260806')).rejects.toThrow(/COSOQ00201 rsp_cd=IGW00001/);
+  });
+});
+
+// ─── Phase 2: 시세 / 15분봉 / 거래소코드 / 오류분류 ───────────
+describe('거래소코드 매핑 (확인분만)', () => {
+  it('NASDAQ→82, NYSE→81 (공식 확인), 미확인은 null', () => {
+    expect(toLSOverseasExchcd('NASDAQ')).toBe('82');
+    expect(toLSOverseasExchcd('NASD')).toBe('82');
+    expect(toLSOverseasExchcd('NYSE')).toBe('81');
+    expect(toLSOverseasExchcd('AMEX')).toBeNull();   // 미확인 → 추측 금지
+    expect(toLSOverseasExchcd('XYZ')).toBeNull();
+  });
+});
+
+describe('getLSKRPrice / getLSUSPrice', () => {
+  it('t1102 현재가 파싱', async () => {
+    stubFetch((url, init) => {
+      expect(url).toBe('https://openapi.ls-sec.co.kr:8080/stock/market-data');
+      expect(init.headers['tr_cd']).toBe('t1102');
+      expect(JSON.parse(init.body)).toEqual({ t1102InBlock: { shcode: '005930' } });
+      return { json: { rsp_cd: '00000', t1102OutBlock: { price: '75000', open: '74000', high: '75500', low: '73800', volume: '1234567' } } };
+    });
+    const p = await getLSKRPrice(cfg, 'T', '005930');
+    expect(p.price).toBe(75000); expect(p.open).toBe(74000); expect(p.volume).toBe(1234567);
+  });
+  it('g3101 해외 현재가 파싱 + keysymbol=exchcd+symbol', async () => {
+    stubFetch((url, init) => {
+      expect(url).toBe('https://openapi.ls-sec.co.kr:8080/overseas-stock/market-data');
+      const b = JSON.parse(init.body).g3101InBlock;
+      expect(b.exchcd).toBe('82'); expect(b.symbol).toBe('TSLA'); expect(b.keysymbol).toBe('82TSLA');
+      return { json: { rsp_cd: '00000', g3101OutBlock: { price: '283.8200', open: '285.09', high: '285.31', low: '281.84', volume: 414175 } } };
+    });
+    const p = await getLSUSPrice(cfg, 'T', 'TSLA', '82');
+    expect(p.price).toBeCloseTo(283.82); expect(p.volume).toBe(414175);
+  });
+});
+
+describe('getLSKR15Min (t8412) / getLSUS15Min (g3203)', () => {
+  it('국내: ncnt=15 전송, OutBlock1 파싱 + 형성봉 제외 + 오름차순', async () => {
+    stubFetch((url, init) => {
+      expect(url).toBe('https://openapi.ls-sec.co.kr:8080/stock/chart');
+      expect(init.headers['tr_cd']).toBe('t8412');
+      expect(JSON.parse(init.body).t8412InBlock.ncnt).toBe(15);
+      // 일부러 뒤섞인 순서로 3개 제공 → 정렬 후 마지막(가장 최근=형성봉) 제외 → 2개
+      return { json: { rsp_cd: '00000', t8412OutBlock1: [
+        { date: '20260806', time: '093000', open: 10, high: 11, low: 9, close: 10, jdiff_vol: 100 },
+        { date: '20260806', time: '091500', open: 12, high: 13, low: 11, close: 12, jdiff_vol: 120 },
+        { date: '20260806', time: '090000', open: 20, high: 21, low: 19, close: 20, jdiff_vol: 200 },
+      ] } };
+    });
+    const cs = await getLSKR15Min(cfg, 'T', '005930', 60);
+    expect(cs.map(c => c.datetime)).toEqual(['20260806090000', '20260806091500']);  // 093000(최근) 제외
+    expect(cs[0].close).toBe(20); expect(cs[0].volume).toBe(200);
+  });
+  it('해외: ncnt=15 전송, exevol→volume, 형성봉 제외', async () => {
+    stubFetch((url, init) => {
+      expect(url).toBe('https://openapi.ls-sec.co.kr:8080/overseas-stock/chart');
+      expect(init.headers['tr_cd']).toBe('g3203');
+      expect(JSON.parse(init.body).g3203InBlock.ncnt).toBe(15);
+      return { json: { rsp_cd: '00000', g3203OutBlock1: [
+        { date: '20260805', loctime: '011000', open: '1', high: '2', low: '0.5', close: '1.5', exevol: 8016 },
+        { date: '20260805', loctime: '012000', open: '1.5', high: '2.5', low: '1', close: '2', exevol: 13514 },
+      ] } };
+    });
+    const cs = await getLSUS15Min(cfg, 'T', 'TSLA', '82', '20260726', 120);
+    expect(cs).toHaveLength(1);                       // 2개 중 형성봉 1개 제외
+    expect(cs[0].datetime).toBe('20260805011000');
+    expect(cs[0].close).toBe(1.5); expect(cs[0].volume).toBe(8016);
+  });
+  it('빈 OutBlock1 → 빈 배열', async () => {
+    stubFetch(() => ({ json: { rsp_cd: '00000' } }));
+    expect(await getLSKR15Min(cfg, 'T', '005930')).toEqual([]);
+  });
+});
+
+describe('오류 분류 (LSApiError.kind)', () => {
+  it('HTTP 429 → RATE_LIMIT', async () => {
+    stubFetch(() => ({ status: 429, json: {} }));
+    await expect(getLSKRPrice(cfg, 'T', '005930')).rejects.toMatchObject({ kind: 'RATE_LIMIT' });
+  });
+  it('허용목록 밖 rsp_cd → API', async () => {
+    stubFetch(() => ({ json: { rsp_cd: 'IGW00001', rsp_msg: '권한 오류' } }));
+    await expect(getLSKRPrice(cfg, 'T', '005930')).rejects.toMatchObject({ kind: 'API', rspCd: 'IGW00001' });
+  });
+  it('네트워크 예외 → NETWORK', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('ECONNRESET'); }));
+    await expect(getLSKRPrice(cfg, 'T', '005930')).rejects.toMatchObject({ kind: 'NETWORK' });
   });
 });

@@ -40,14 +40,20 @@ npm run ls:diag
 
 성공 기준: `token_ok && kr_balance_ok && us_balance_ok` → 종료코드 0.
 
-## 3) 트레이드 러너 (현재: Phase 1 게이트 + 엔진 로드 확인)
+## 3) Phase 2 — 시세·15분봉·관찰 신호 (주문 없음)
 
 ```cmd
 npm run ls:trade
 ```
-잔고 점검 통과 + 전략엔진(BB/RSI) 로드 확인까지 수행합니다.
-**시세/15분봉/주문(Phase 2)은 LS 공식 TR 확정 후 추가**되며, 그전까지는
-`LS_LIVE_TRADING=true` 여도 주문을 실행하지 않습니다(안전 차단).
+동작: 지정 종목(`LS_KR_SYMBOLS`/`LS_US_SYMBOLS`)에 대해 LS 15분봉(국내 t8412 / 해외 g3203)을
+받아 **형성 중 봉을 제외한 확정봉 40개 이상**을 확보하고, 기존 엔진 BB(20,2)·RSI(14)·
+`getBBSignal`로 신호를 계산해 `[OBSERVE ...]` 로그만 남깁니다. **주문은 하지 않습니다**
+(`LS_LIVE_TRADING`은 observe 유지, 주문 기능은 Phase 3).
+
+- 거래소코드(exchcd)는 확인분만: **NASDAQ=82, NYSE=81**. 미확인 거래소(AMEX 등)는
+  추측하지 않고 `UNSUPPORTED_EXCHANGE`로 로그 후 스킵합니다(공식 코드 확인 후 추가).
+- 오류는 종류별로 구분 기록: 네트워크오류 / 호출제한 / 빈응답 / 데이터부족 / API오류.
+- TR: 국내현재가 `t1102`, 해외현재가 `g3101`, 국내분봉 `t8412`, 해외분봉 `g3203` (모두 공식).
 
 ## 4) Windows 작업 스케줄러 자동 시작
 

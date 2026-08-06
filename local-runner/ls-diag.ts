@@ -17,7 +17,8 @@ async function main() {
   try { cfg = loadConfig(); }
   catch (e) { log.error(String(e)); process.exit(1); return; }
 
-  const r = await runBalanceCheck(cfg, log, { diagRaw: true });
+  // [DIAG] 원문 로그는 기본 비활성 — 필요 시 .env.local 에 LS_DIAG_RAW=true (req 14)
+  const r = await runBalanceCheck(cfg, log, { diagRaw: process.env.LS_DIAG_RAW === 'true' });
 
   log.info('----- 결과 요약 -----');
   log.info(JSON.stringify({

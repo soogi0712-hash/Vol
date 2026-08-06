@@ -94,27 +94,112 @@ export const LS_EMPTY_CODES: Record<string, string[]> = {
 
 export interface LSResult { data: any; rspCd: string; rspMsg: string; empty: boolean; }
 
+// 오류 분류 — 데이터 부족/빈 응답/호출 제한/네트워크/일반 API 를 구분해서 기록한다.
+export type LSErrorKind = 'NETWORK' | 'RATE_LIMIT' | 'API' | 'EMPTY' | 'INSUFFICIENT';
+export class LSApiError extends Error {
+  kind: LSErrorKind;
+  rspCd?: string;
+  constructor(kind: LSErrorKind, message: string, rspCd?: string) {
+    super(message);
+    this.name = 'LSApiError';
+    this.kind = kind;
+    this.rspCd = rspCd;
+  }
+}
+
 // LS REST 공통 POST. rsp_cd 를 즉시 throw 하지 않고 블록을 파싱한다.
-// TR별 허용목록(LS_SUCCESS_CODES)에 없는 rsp_cd 또는 HTTP 4xx/5xx 만 실패로 throw.
+// TR별 허용목록(LS_SUCCESS_CODES)에 없는 rsp_cd 만 실패. 네트워크/호출제한을 분류.
 async function lsPost(token: string, path: string, trCd: string, inBlock: Record<string, unknown>): Promise<LSResult> {
-  const res = await fetch(`${LS_BASE}${path}`, {
-    method: 'POST',
-    headers: lsHeaders(token, trCd),
-    body: JSON.stringify(inBlock),
-  });
+  let res: Response;
+  try {
+    res = await fetch(`${LS_BASE}${path}`, {
+      method: 'POST',
+      headers: lsHeaders(token, trCd),
+      body: JSON.stringify(inBlock),
+    });
+  } catch (e) {
+    throw new LSApiError('NETWORK', `LS ${trCd} 네트워크 오류: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  if (res.status === 429) throw new LSApiError('RATE_LIMIT', `LS ${trCd} 호출 제한(HTTP 429)`);
   const text = await res.text();
   let data: any;
   try { data = text ? JSON.parse(text) : {}; }
-  catch { throw new Error(`LS ${trCd}: 비정상 응답(HTTP ${res.status})`); }
+  catch { throw new LSApiError('API', `LS ${trCd}: 비정상 응답(HTTP ${res.status})`); }
   const rspCd = String(data.rsp_cd ?? '');
   const rspMsg = String(data.rsp_msg ?? '');
   const ok = LS_SUCCESS_CODES[trCd] ?? ['00000'];
-  // rsp_cd 가 비어있으면(일부 응답) 통과, 있으면 허용목록으로 판정
   if (res.status >= 400 || (rspCd && !ok.includes(rspCd))) {
-    throw new Error(`LS ${trCd} rsp_cd=${rspCd || res.status} msg=${rspMsg}`);
+    // LS 호출제한 코드도 RATE_LIMIT 로 분류(메시지에 '초과/제한' 포함 시)
+    const kind: LSErrorKind = /제한|초과|traffic|quota/i.test(rspMsg) ? 'RATE_LIMIT' : 'API';
+    throw new LSApiError(kind, `LS ${trCd} rsp_cd=${rspCd || res.status} msg=${rspMsg}`, rspCd);
   }
   const empty = (LS_EMPTY_CODES[trCd] ?? []).includes(rspCd);
   return { data, rspCd, rspMsg, empty };
+}
+
+// ── 해외 거래소코드(exchcd) — LS 공식 확인분만 명시 관리 ──────
+// 확인: 82=NASDAQ(공식 reqExample), 81=NYSE(공식 예제). AMEX 등은 미확인 → 매핑 안 함(추측 금지).
+export const LS_OVERSEAS_EXCHCD: Record<string, string> = {
+  NASDAQ: '82', NASD: '82', NAS: '82',
+  NYSE: '81', NYS: '81',
+};
+/** 거래소명 → LS exchcd. 미확인 거래소는 null (호출측이 UNSUPPORTED 처리). */
+export function toLSOverseasExchcd(name: string): string | null {
+  return LS_OVERSEAS_EXCHCD[(name || '').toUpperCase()] ?? null;
+}
+
+export interface LSCandle { datetime: string; open: number; high: number; low: number; close: number; volume: number; }
+export interface LSPrice { price: number; open: number; high: number; low: number; volume: number; }
+
+// 오름차순 정렬 후 마지막(형성 중) 봉 1개 제외 → 확정봉만 반환.
+function toConfirmed(candles: LSCandle[]): LSCandle[] {
+  const sorted = [...candles].sort((a, b) => a.datetime.localeCompare(b.datetime));
+  return sorted.length > 1 ? sorted.slice(0, -1) : sorted;
+}
+
+// ── 국내 현재가 (t1102) ──────────────────────────────────────
+export async function getLSKRPrice(cfg: LSConfig, token: string, shcode: string): Promise<LSPrice> {
+  const { data } = await lsPost(token, '/stock/market-data', 't1102', { t1102InBlock: { shcode } });
+  const o = data.t1102OutBlock || {};
+  return { price: toNum(o.price), open: toNum(o.open), high: toNum(o.high), low: toNum(o.low), volume: toNum(o.volume) };
+}
+
+// ── 해외 현재가 (g3101) — keysymbol = exchcd + symbol ────────
+export async function getLSUSPrice(cfg: LSConfig, token: string, symbol: string, exchcd: string): Promise<LSPrice> {
+  const { data } = await lsPost(token, '/overseas-stock/market-data', 'g3101', {
+    g3101InBlock: { delaygb: 'R', keysymbol: exchcd + symbol, exchcd, symbol },
+  });
+  const o = data.g3101OutBlock || {};
+  return { price: toNum(o.price), open: toNum(o.open), high: toNum(o.high), low: toNum(o.low), volume: toNum(o.volume) };
+}
+
+// ── 국내 15분봉 (t8412, ncnt=15) — OutBlock1: date/time/open/high/low/close/jdiff_vol ──
+// 반환: 확정봉(형성 중 마지막 봉 제외), 오름차순. 빈 응답이면 [].
+export async function getLSKR15Min(cfg: LSConfig, token: string, shcode: string, qrycnt = 60): Promise<LSCandle[]> {
+  const { data } = await lsPost(token, '/stock/chart', 't8412', {
+    // 공식 reqExample 필드 유지, ncnt(분)=15 / qrycnt(요청개수)만 조정. edate=99999999=최근.
+    t8412InBlock: { shcode, ncnt: 15, qrycnt, nday: '0', sdate: '', stime: '', edate: '99999999', etime: '', cts_date: '', cts_time: '', comp_yn: 'N' },
+  });
+  const rows: any[] = data.t8412OutBlock1 || [];
+  const candles: LSCandle[] = rows.map(r => ({
+    datetime: String(r.date) + String(r.time).padStart(6, '0'),
+    open: toNum(r.open), high: toNum(r.high), low: toNum(r.low), close: toNum(r.close), volume: toNum(r.jdiff_vol),
+  }));
+  return toConfirmed(candles);
+}
+
+// ── 해외 15분봉 (g3203, ncnt=15) — OutBlock1: date/loctime/open/high/low/close/exevol ──
+export async function getLSUS15Min(cfg: LSConfig, token: string, symbol: string, exchcd: string, sdateYYYYMMDD: string, qrycnt = 100): Promise<LSCandle[]> {
+  const { data } = await lsPost(token, '/overseas-stock/chart', 'g3203', {
+    // 공식 reqExample 필드 유지, ncnt(분)=15. sdate~edate 범위 내 최근 qrycnt.
+    g3203InBlock: { delaygb: 'R', keysymbol: exchcd + symbol, exchcd, symbol, ncnt: 15, qrycnt, comp_yn: 'N', sdate: sdateYYYYMMDD, edate: '' },
+  });
+  const rows: any[] = data.g3203OutBlock1 || [];
+  const candles: LSCandle[] = rows.map(r => ({
+    datetime: String(r.date) + String(r.loctime).padStart(6, '0'),
+    open: toNum(r.open), high: toNum(r.high), low: toNum(r.low), close: toNum(r.close), volume: toNum(r.exevol),
+  }));
+  return toConfirmed(candles);
 }
 
 // ─── 국내 계좌 잔고 (CSPAQ12200) ──────────────────────────────
