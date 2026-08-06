@@ -81,7 +81,24 @@ npm run ls:usws
 - GSC 체결로 **실시간 15분봉** 생성(초기 REST g3203 시드 + 이후 실시간 집계), GSH 로 최우선 매수/매도 호가 수집.
 - readiness gate: GSC 30초 이내 수신 + `lastPrice>0` + 15분봉 ≥20 이어야 신규매수 허용(아니면 stale → 신규매수 금지, 보유매도만 stale 표시로 허용).
 - **주문은 하지 않습니다**(`LS_LIVE_TRADING=false`, 시세/봉 생성 검증까지만).
-- Node 21+ 의 전역 WebSocket 사용(별도 패키지 불필요). 실행 시간은 `LS_WS_SECONDS`(기본 60초).
+- Node 21+ 의 전역 WebSocket 사용(별도 패키지 불필요).
+
+#### 15분봉 영구 저장·복원 (지속 실행형)
+
+`ls:usws` 는 **Ctrl+C 전까지 계속** 돌며, GSC 로 만든 15분 확정봉을 종목별 JSON
+(`local-runner/data/us-candles-<심볼>.json`)에 **즉시 영구 저장**합니다.
+
+- **버킷 기준 시각**: GSC `ovsdate`+`trdtm`(미국 현지=America/New_York 벽시계)로 15분 버킷팅 →
+  서머타임(EDT/EST) 자동 반영. 한국시간 문자열로 버킷팅하지 않습니다.
+- **확정 vs 형성**: 버킷이 바뀌면 직전 봉을 **확정**해 즉시 디스크에 저장(같은 timestamp 중복 저장 금지).
+  형성 중(최신) 봉은 정상 종료(Ctrl+C) 시에만 저장합니다.
+- **복원**: 시작 시 저장된 확정봉을 불러와 BB/RSI 계산에 사용(0개부터 다시 시작하지 않음).
+  REST g3203 시드가 0개여도 저장분으로 진행하며, REST 실패는 WebSocket 을 막지 않습니다.
+- **안전성**: 임시파일 write 후 rename(atomic). 파일 손상 시 `.corrupt` 백업 + **신규매수 차단**.
+  저장 파일에는 **OHLCV+timestamp 만** 담기며 앱키/토큰/계좌번호는 절대 저장하지 않습니다.
+- **전략 연결(관찰)**: 확정봉 ≥20 이면 BB(20,2)/RSI(14)/`getBBSignal` 로 신호를 계산해
+  `[OBSERVE ...]` 로그만 남깁니다. 신호가 나와도 **주문 함수는 호출하지 않습니다**.
+- `local-runner/data/` 는 `.gitignore` 로 커밋 차단됩니다(런타임 데이터).
 
 ## 4) Windows 작업 스케줄러 자동 시작
 

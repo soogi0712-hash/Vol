@@ -71,14 +71,27 @@ export function bucket15(localTs: string): string {
 
 export class RealtimeCandleBuilder {
   private map = new Map<string, RTCandle>();
-  /** REST g3203 확정봉으로 초기 시드(형성봉 제외분). */
+  private latest = '';   // 최신(형성 중) 버킷 키
+
+  /** 저장된 확정봉 + REST g3203 확정봉으로 초기 시드. datetime 키로 병합/중복제거(req 5). */
   seed(candles: RTCandle[]): void {
-    for (const c of candles) this.map.set(c.datetime, { ...c });
+    for (const c of candles) {
+      this.map.set(c.datetime, { ...c });     // 같은 datetime 은 덮어써 중복 제거
+      if (c.datetime > this.latest) this.latest = c.datetime;
+    }
   }
-  /** 체결 1건 반영. */
-  addTrade(price: number, qty: number, localTs: string): void {
-    if (!(price > 0) || localTs.length < 12) return;
+  /**
+   * 체결 1건 반영. 버킷이 새로 바뀌면 **직전(확정된)** 봉을 반환한다(req 3 — 확정 즉시 저장용).
+   * 같은 버킷 내 체결은 OHLCV 갱신만 하고 null 을 반환한다.
+   */
+  addTrade(price: number, qty: number, localTs: string): RTCandle | null {
+    if (!(price > 0) || localTs.length < 12) return null;
     const bk = bucket15(localTs);
+    let confirmed: RTCandle | null = null;
+    // 더 나중 버킷의 첫 체결 → 직전 최신 버킷은 이제 확정봉
+    if (this.latest && bk > this.latest && this.map.has(this.latest)) {
+      confirmed = { ...this.map.get(this.latest)! };
+    }
     const cur = this.map.get(bk);
     if (!cur) {
       this.map.set(bk, { datetime: bk, open: price, high: price, low: price, close: price, volume: Math.max(0, qty) });
@@ -88,11 +101,17 @@ export class RealtimeCandleBuilder {
       cur.close = price;
       cur.volume += Math.max(0, qty);
     }
+    if (bk > this.latest) this.latest = bk;
+    return confirmed;
   }
   /** 오름차순 정렬된 봉. dropForming=true 면 마지막(형성 중) 봉 제외. */
   candles(dropForming = false): RTCandle[] {
     const arr = [...this.map.values()].sort((a, b) => a.datetime.localeCompare(b.datetime));
     return dropForming && arr.length > 1 ? arr.slice(0, -1) : arr;
+  }
+  /** 현재 형성 중(최신 버킷) 봉 — 정상 종료 시 저장용(req 7). */
+  formingCandle(): RTCandle | null {
+    return this.latest && this.map.has(this.latest) ? { ...this.map.get(this.latest)! } : null;
   }
   get size(): number { return this.map.size; }
 }

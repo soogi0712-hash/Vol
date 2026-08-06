@@ -28,6 +28,9 @@ secrets.json
 # local-runner 캐시(토큰) — 커밋 금지 (로그는 아래 logs/ 규칙으로 무시됨)
 local-runner/.cache/
 
+# local-runner 15분봉 영구 저장 데이터 — 런타임 산출물, 커밋 금지(비밀값은 아니지만 사용자 데이터)
+local-runner/data/
+
 # logs
 logs/
 *.log
