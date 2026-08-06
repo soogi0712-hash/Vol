@@ -79,7 +79,11 @@ npm run ls:usws
 - `tr_key = exchcd+symbol` 을 **총 18자리 오른쪽 공백 패딩**(공식 예: `"81SOXL            "`). REST `keysymbol`(패딩 없음)과 **혼용 금지**.
 - 거래소코드: **82=NASDAQ, 81=NYSE/AMEX**(SOXL=81, 공식 GSH 예제로 확인).
 - GSC 체결로 **실시간 15분봉** 생성(초기 REST g3203 시드 + 이후 실시간 집계), GSH 로 최우선 매수/매도 호가 수집.
-- readiness gate: GSC 30초 이내 수신 + `lastPrice>0` + 15분봉 ≥20 이어야 신규매수 허용(아니면 stale → 신규매수 금지, 보유매도만 stale 표시로 허용).
+- readiness gate(신규매수): `wsConnected` + `bestBid>0` + `bestAsk>0` + **GSH 최근 30초** +
+  `lastPrice>0` + **GSC 최근 300초** + **확정봉 ≥20** + 저장 정상. 하나라도 어긋나면 신규매수 금지.
+  체결(GSC)이 뜸한 30초는 연결 장애가 아니므로 GSH 만 신선하면 stale 로 보지 않습니다.
+  GSC 300초 초과 시 신호 계산·신규매수만 중단하고, 보유 매도 허용은 별도 안전정책으로 유지합니다.
+- READY 로그는 상태를 항목별로 출력합니다: `confirmed=.. forming=.. gscAgeSec=.. gshAgeSec=.. wsConnected=.. bid=.. ask=..`.
 - **주문은 하지 않습니다**(`LS_LIVE_TRADING=false`, 시세/봉 생성 검증까지만).
 - Node 21+ 의 전역 WebSocket 사용(별도 패키지 불필요).
 

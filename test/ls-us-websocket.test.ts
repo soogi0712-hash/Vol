@@ -81,21 +81,38 @@ describe('실시간 15분봉 집계', () => {
   });
 });
 
-describe('readiness gate (req6)', () => {
+describe('readiness gate (req6, GSC/GSH 분리)', () => {
   const now = 1_000_000_000_000;
-  it('신선+가격>0+봉20 → ready, 신규매수 허용', () => {
-    const r = evaluateReadiness({ lastGSCatMs: now - 5000, lastPrice: 100, candleCount: 25 }, now);
-    expect(r.ready).toBe(true); expect(r.stale).toBe(false); expect(r.allowNewBuy).toBe(true);
+  const base = () => ({
+    websocketConnected: true, lastGSCatMs: now - 5000, lastGSHatMs: now - 5000,
+    lastPrice: 100, bestBid: 99, bestAsk: 101, confirmedCount: 25, storeCorrupted: false,
   });
-  it('GSC 30초 초과 → stale, 신규매수 금지, 보유매도는 허용', () => {
-    const r = evaluateReadiness({ lastGSCatMs: now - 31_000, lastPrice: 100, candleCount: 25 }, now);
-    expect(r.stale).toBe(true); expect(r.allowNewBuy).toBe(false); expect(r.allowSellExisting).toBe(true);
-    expect(r.reasons.some(x => x.includes('stale'))).toBe(true);
+  it('모든 조건 충족 → ready, 신규매수 허용', () => {
+    const r = evaluateReadiness(base(), now);
+    expect(r.ready).toBe(true); expect(r.allowNewBuy).toBe(true); expect(r.stale).toBe(false);
   });
-  it('봉 부족 → not ready', () => {
-    const r = evaluateReadiness({ lastGSCatMs: now, lastPrice: 100, candleCount: 5 }, now);
+  it('GSH 정상 + GSC 40초 경과 → stale 아님, 신규매수 유지(체결 없는 30초는 장애 아님)', () => {
+    const r = evaluateReadiness({ ...base(), lastGSCatMs: now - 40_000 }, now);
+    expect(r.stale).toBe(false); expect(r.gscFresh).toBe(true); expect(r.allowNewBuy).toBe(true);
+  });
+  it('GSC 300초 초과 → 신호계산·신규매수 중단, 보유매도는 허용', () => {
+    const r = evaluateReadiness({ ...base(), lastGSCatMs: now - 301_000 }, now);
+    expect(r.gscStale).toBe(true); expect(r.allowSignal).toBe(false); expect(r.allowNewBuy).toBe(false);
+    expect(r.allowSellExisting).toBe(true);
+  });
+  it('GSH 31초 경과 → 신규매수 금지', () => {
+    const r = evaluateReadiness({ ...base(), lastGSHatMs: now - 31_000 }, now);
+    expect(r.gshFresh).toBe(false); expect(r.allowNewBuy).toBe(false);
+  });
+  it('WS 미연결 → 신규매수 금지', () => {
+    const r = evaluateReadiness({ ...base(), websocketConnected: false }, now);
+    expect(r.allowNewBuy).toBe(false);
+    expect(r.reasons.some(x => x.includes('WS 미연결'))).toBe(true);
+  });
+  it('확정봉 부족 → not ready', () => {
+    const r = evaluateReadiness({ ...base(), confirmedCount: 5 }, now);
     expect(r.ready).toBe(false);
-    expect(r.reasons.some(x => x.includes('15분봉 부족'))).toBe(true);
+    expect(r.reasons.some(x => x.includes('확정봉 부족'))).toBe(true);
   });
 });
 

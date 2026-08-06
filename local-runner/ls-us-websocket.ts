@@ -69,72 +69,149 @@ export function bucket15(localTs: string): string {
   return `${date}${hh}${String(bmm).padStart(2, '0')}00`;
 }
 
+/**
+ * GSC 체결 → 15분 OHLCV 집계기.
+ * ⚠️ 확정봉(종료된 봉)과 형성봉(현재 열려 있는 봉)을 **명시적으로 분리**한다(req 1).
+ *   - confirmed: 버킷 전환이 실제 확인된 뒤에만 승격된, 종료된 봉만.
+ *   - forming:   현재 형성 중인 최신 버킷 1개(별도 상태). confirmed 개수/신호 계산에서 제외.
+ *   버킷 전환 전(첫 GSC ~ 15분 경과 전)에는 confirmedCount 가 0 이어야 한다.
+ */
 export class RealtimeCandleBuilder {
-  private map = new Map<string, RTCandle>();
-  private latest = '';   // 최신(형성 중) 버킷 키
+  private confirmed = new Map<string, RTCandle>();   // 종료된 봉만
+  private forming: RTCandle | null = null;           // 현재 형성 중 봉(별도 상태)
 
-  /** 저장된 확정봉 + REST g3203 확정봉으로 초기 시드. datetime 키로 병합/중복제거(req 5). */
-  seed(candles: RTCandle[]): void {
-    for (const c of candles) {
-      this.map.set(c.datetime, { ...c });     // 같은 datetime 은 덮어써 중복 제거
-      if (c.datetime > this.latest) this.latest = c.datetime;
-    }
+  private static make(bk: string, price: number, qty: number): RTCandle {
+    return { datetime: bk, open: price, high: price, low: price, close: price, volume: Math.max(0, qty) };
   }
+  private static apply(c: RTCandle, price: number, qty: number): void {
+    c.high = Math.max(c.high, price);
+    c.low = Math.min(c.low, price);
+    c.close = price;
+    c.volume += Math.max(0, qty);
+  }
+
+  /** 저장된 **확정봉**으로만 시드(형성봉은 절대 여기 넣지 않는다, req 2). datetime 키로 중복제거(req 5). */
+  seed(candles: RTCandle[]): void {
+    for (const c of candles) this.confirmed.set(c.datetime, { ...c });
+  }
+
   /**
-   * 체결 1건 반영. 버킷이 새로 바뀌면 **직전(확정된)** 봉을 반환한다(req 3 — 확정 즉시 저장용).
-   * 같은 버킷 내 체결은 OHLCV 갱신만 하고 null 을 반환한다.
+   * 체결 1건 반영. 버킷이 새로 바뀌면 직전 forming 을 **확정 승격**해 반환한다(req 3 — 확정 즉시 저장용).
+   * 같은 버킷 내 체결은 forming OHLCV 갱신만 하고 null 을 반환한다.
    */
   addTrade(price: number, qty: number, localTs: string): RTCandle | null {
     if (!(price > 0) || localTs.length < 12) return null;
     const bk = bucket15(localTs);
-    let confirmed: RTCandle | null = null;
-    // 더 나중 버킷의 첫 체결 → 직전 최신 버킷은 이제 확정봉
-    if (this.latest && bk > this.latest && this.map.has(this.latest)) {
-      confirmed = { ...this.map.get(this.latest)! };
+
+    if (this.forming) {
+      if (bk === this.forming.datetime) { RealtimeCandleBuilder.apply(this.forming, price, qty); return null; }
+      if (bk > this.forming.datetime) {
+        // 버킷 전환이 확인됨 → 직전 forming 을 confirmed 로 승격, 새 forming 시작
+        const justConfirmed = { ...this.forming };
+        this.confirmed.set(justConfirmed.datetime, justConfirmed);
+        this.forming = RealtimeCandleBuilder.make(bk, price, qty);
+        return { ...justConfirmed };
+      }
+      // bk < forming.datetime : 이미 지난 버킷의 지연 체결 → 해당 확정봉만 갱신(있으면)
+      const past = this.confirmed.get(bk);
+      if (past) RealtimeCandleBuilder.apply(past, price, qty);
+      return null;
     }
-    const cur = this.map.get(bk);
-    if (!cur) {
-      this.map.set(bk, { datetime: bk, open: price, high: price, low: price, close: price, volume: Math.max(0, qty) });
-    } else {
-      cur.high = Math.max(cur.high, price);
-      cur.low = Math.min(cur.low, price);
-      cur.close = price;
-      cur.volume += Math.max(0, qty);
-    }
-    if (bk > this.latest) this.latest = bk;
-    return confirmed;
+
+    // 아직 forming 없음(시작 직후 첫 체결)
+    const seeded = this.confirmed.get(bk);
+    if (seeded) { RealtimeCandleBuilder.apply(seeded, price, qty); return null; }   // 시드된 버킷 갱신
+    this.forming = RealtimeCandleBuilder.make(bk, price, qty);   // 첫 형성봉 — confirmed 는 여전히 0
+    return null;
   }
-  /** 오름차순 정렬된 봉. dropForming=true 면 마지막(형성 중) 봉 제외. */
+
+  /** 종료된 확정봉만, 오름차순. **형성봉 제외**(BB/RSI/신호 입력용, req 9). */
+  confirmedCandles(): RTCandle[] {
+    return [...this.confirmed.values()].sort((a, b) => a.datetime.localeCompare(b.datetime));
+  }
+  get confirmedCount(): number { return this.confirmed.size; }
+
+  /** 현재 형성 중 봉(별도 상태). 정상 종료 시 confirmed:false 로 저장(req 7). */
+  formingCandle(): RTCandle | null { return this.forming ? { ...this.forming } : null; }
+  get hasForming(): boolean { return this.forming != null; }
+
+  /** 전체(확정 + 형성) 오름차순. dropForming=true 면 확정봉만. (호환용) */
   candles(dropForming = false): RTCandle[] {
-    const arr = [...this.map.values()].sort((a, b) => a.datetime.localeCompare(b.datetime));
-    return dropForming && arr.length > 1 ? arr.slice(0, -1) : arr;
+    const arr = this.confirmedCandles();
+    if (!dropForming && this.forming) arr.push({ ...this.forming });
+    return arr.sort((a, b) => a.datetime.localeCompare(b.datetime));
   }
-  /** 현재 형성 중(최신 버킷) 봉 — 정상 종료 시 저장용(req 7). */
-  formingCandle(): RTCandle | null {
-    return this.latest && this.map.has(this.latest) ? { ...this.map.get(this.latest)! } : null;
-  }
-  get size(): number { return this.map.size; }
+  get size(): number { return this.confirmed.size + (this.forming ? 1 : 0); }
 }
 
-// ── readiness gate (req 6) ──────────────────────────────────────
-export interface ReadinessState { lastGSCatMs: number | null; lastPrice: number; candleCount: number; }
-export interface Readiness { ready: boolean; stale: boolean; allowNewBuy: boolean; allowSellExisting: boolean; reasons: string[]; }
-export const GSC_STALE_MS = 30_000;      // GSC 최근 수신 30초 이내
-export const MIN_RT_CANDLES = 20;        // 15분봉 최소 20개
+// ── readiness gate (req 6, 개선) ────────────────────────────────
+// GSC(체결)와 GSH(호가) 의 신선도 기준을 분리한다.
+//   - GSH(호가)는 장중 계속 흐르므로 30초 기준.
+//   - GSC(체결)는 종목별 체결 간격이 길 수 있으므로 300초 기준(체결 없는 30초는 장애가 아님).
+export const GSH_FRESH_MS = 30_000;       // 호가 최근 수신 30초 이내
+export const GSC_FRESH_MS = 300_000;      // 체결 최근 수신 300초 이내
+export const MIN_RT_CANDLES = 20;         // 확정 15분봉 최소 20개
+
+export interface ReadinessState {
+  websocketConnected: boolean;
+  lastGSCatMs: number | null;
+  lastGSHatMs: number | null;
+  lastPrice: number;
+  bestBid: number;
+  bestAsk: number;
+  confirmedCount: number;     // 형성봉 제외 확정봉 개수
+  storeCorrupted: boolean;
+}
+export interface Readiness {
+  ready: boolean;             // = allowNewBuy
+  allowNewBuy: boolean;
+  allowSignal: boolean;       // BB/RSI/신호 계산 허용 (GSC 신선 + 확정봉 충분)
+  allowSellExisting: boolean; // 보유 매도(별도 안전정책) — 항상 허용
+  stale: boolean;             // GSC 또는 GSH 신선도 문제
+  gscFresh: boolean;
+  gshFresh: boolean;
+  gscStale: boolean;          // GSC 300초 초과 → 신호/신규매수 중단
+  gscAgeSec: number | null;
+  gshAgeSec: number | null;
+  reasons: string[];
+}
+
+const ageSec = (ageMs: number | null) => (ageMs == null ? '없음' : Math.round(ageMs / 1000) + 's');
 
 export function evaluateReadiness(s: ReadinessState, nowMs: number): Readiness {
+  const gscAgeMs = s.lastGSCatMs == null ? null : nowMs - s.lastGSCatMs;
+  const gshAgeMs = s.lastGSHatMs == null ? null : nowMs - s.lastGSHatMs;
+  const gscFresh = gscAgeMs != null && gscAgeMs <= GSC_FRESH_MS;
+  const gshFresh = gshAgeMs != null && gshAgeMs <= GSH_FRESH_MS;
+  const enough = s.confirmedCount >= MIN_RT_CANDLES;
+
   const reasons: string[] = [];
-  const fresh = s.lastGSCatMs != null && (nowMs - s.lastGSCatMs) <= GSC_STALE_MS;
-  if (!fresh) reasons.push(`GSC stale(마지막 수신 ${s.lastGSCatMs == null ? '없음' : Math.round((nowMs - s.lastGSCatMs) / 1000) + 's'})`);
+  if (!s.websocketConnected) reasons.push('WS 미연결');
+  if (!(s.bestBid > 0)) reasons.push('bestBid<=0');
+  if (!(s.bestAsk > 0)) reasons.push('bestAsk<=0');
+  if (!gshFresh) reasons.push(`GSH stale(${ageSec(gshAgeMs)})`);
   if (!(s.lastPrice > 0)) reasons.push('lastPrice<=0');
-  if (s.candleCount < MIN_RT_CANDLES) reasons.push(`15분봉 부족(${s.candleCount}<${MIN_RT_CANDLES})`);
-  const stale = !fresh;
-  const ready = fresh && s.lastPrice > 0 && s.candleCount >= MIN_RT_CANDLES;
+  if (!gscFresh) reasons.push(`GSC stale(${ageSec(gscAgeMs)})`);
+  if (!enough) reasons.push(`확정봉 부족(${s.confirmedCount}<${MIN_RT_CANDLES})`);
+  if (s.storeCorrupted) reasons.push('저장손상→신규매수 차단');
+
+  // 신규매수: WS연결 + 양방향 호가>0 + GSH 30초 + lastPrice>0 + GSC 300초 + 확정봉≥20 + 저장정상
+  const allowNewBuy = s.websocketConnected && s.bestBid > 0 && s.bestAsk > 0 && gshFresh
+    && s.lastPrice > 0 && gscFresh && enough && !s.storeCorrupted;
+  // 신호 계산: GSC 신선 + 확정봉 충분 (GSC 300초 초과 시 신호 계산 중단)
+  const allowSignal = gscFresh && enough;
+
   return {
-    ready,
-    stale,
-    allowNewBuy: ready && !stale,               // stale 이면 신규 매수 금지
-    allowSellExisting: true,                    // 보유 매도는 허용(마지막 유효가 + stale 로그)
+    ready: allowNewBuy,
+    allowNewBuy,
+    allowSignal,
+    allowSellExisting: true,          // 보유 매도는 별도 안전정책으로 유지
+    stale: !gscFresh || !gshFresh,
+    gscFresh,
+    gshFresh,
+    gscStale: gscAgeMs != null && gscAgeMs > GSC_FRESH_MS,
+    gscAgeSec: gscAgeMs == null ? null : Math.round(gscAgeMs / 1000),
+    gshAgeSec: gshAgeMs == null ? null : Math.round(gshAgeMs / 1000),
     reasons,
   };
 }
@@ -174,6 +251,7 @@ export class LSUSRealtimeClient {
   private ws: WsLike | null = null;
   private subs: SymbolSub[] = [];
   private closedByUser = false;
+  private isConnected = false;   // onopen~onclose 사이 true (readiness 의 websocketConnected)
   private lastMsgAt = 0;
   private staleTimer: ReturnType<typeof setInterval> | null = null;
   private attempt = 0;
@@ -193,6 +271,9 @@ export class LSUSRealtimeClient {
     this.now = opts.now ?? (() => Date.now());
   }
 
+  /** 현재 WS 연결 상태(readiness.websocketConnected 입력용). */
+  get connected(): boolean { return this.isConnected; }
+
   connect(subs: SymbolSub[]): void {
     this.subs = subs;
     this.closedByUser = false;
@@ -205,6 +286,7 @@ export class LSUSRealtimeClient {
     this.ws = ws;
     ws.onopen = () => {
       this.attempt = 0;
+      this.isConnected = true;
       this.lastMsgAt = this.now();
       this.hooks.onStatus?.('WS 연결됨 → 종목 등록');
       this.registerAll();
@@ -213,6 +295,7 @@ export class LSUSRealtimeClient {
     ws.onmessage = (ev) => { this.lastMsgAt = this.now(); this.handleMessage(ev.data); };
     ws.onerror = () => { this.hooks.onStatus?.('WS 오류'); };
     ws.onclose = () => {
+      this.isConnected = false;
       this.stopStaleWatch();
       if (this.closedByUser) { this.hooks.onStatus?.('WS 종료(사용자)'); return; }
       void this.reconnect();
@@ -260,6 +343,7 @@ export class LSUSRealtimeClient {
 
   close(): void {
     this.closedByUser = true;
+    this.isConnected = false;
     this.stopStaleWatch();
     try { this.ws?.close(); } catch { /* noop */ }
   }

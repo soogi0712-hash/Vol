@@ -29,12 +29,16 @@ interface SymCtx {
   builder: RealtimeCandleBuilder;
   store: CandleStore;
   lastGSCat: number | null;
+  lastGSHat: number | null;
   lastPrice: number;
+  bestBid: number;
+  bestAsk: number;
 }
 
-// 확정봉 ≥20 이면 BB(20,2)/RSI(14)/getBBSignal 로 신호 계산 → OBSERVE 로그만(주문 금지, req 9).
+// 확정봉 ≥20 + GSC 신선(allowSignal) 이면 BB(20,2)/RSI(14)/getBBSignal → OBSERVE 로그만(주문 금지, req 9).
+// ⚠️ 형성봉은 입력에서 제외한다(confirmedCandles). GSC 300초 초과 시 신호 계산을 중단한다.
 function observeSignal(log: Logger, ctx: SymCtx): void {
-  const confirmed = ctx.builder.candles(true);   // 형성봉 제외
+  const confirmed = ctx.builder.confirmedCandles();   // 확정봉만(형성봉 제외)
   if (confirmed.length < MIN_RT_CANDLES) return;
   const closes = confirmed.map(c => c.close);
   const qv = validateCandleData(closes, MIN_RT_CANDLES, 20, 0.001);
@@ -73,7 +77,7 @@ async function main() {
     const store = new CandleStore(s.symbol);
     store.load();
     const builder = new RealtimeCandleBuilder();
-    const ctx: SymCtx = { symbol: s.symbol, exchange: s.exchange, exchcd: s.exchcd, builder, store, lastGSCat: null, lastPrice: 0 };
+    const ctx: SymCtx = { symbol: s.symbol, exchange: s.exchange, exchcd: s.exchcd, builder, store, lastGSCat: null, lastGSHat: null, lastPrice: 0, bestBid: 0, bestAsk: 0 };
     ctxs.set(s.symbol, ctx);
 
     const trKey = buildWsTrKey(s.exchcd, s.symbol);
@@ -92,11 +96,11 @@ async function main() {
       try {
         const r = await getLSUS15Min(cfg, token, s.symbol, s.exchcd, quote.delaygb, sdate, 120);
         builder.seed(r.candles.map(c => ({ datetime: c.datetime, open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume })));
-        log.info(`[US:${s.symbol}] REST g3203 시드 ${r.candles.length}개 (rsp_cd='${r.rspCd}') → 병합 후 확정봉=${builder.candles(true).length}`);
-        // REST 로 새로 확보된 확정봉도 저장(손상 아니면). 형성봉 제외.
+        log.info(`[US:${s.symbol}] REST g3203 시드 ${r.candles.length}개 (rsp_cd='${r.rspCd}') → 병합 후 확정봉=${builder.confirmedCount}`);
+        // REST 로 새로 확보된 확정봉도 저장(손상 아니면). 형성봉은 아직 없음(GSC 전).
         if (!store.corrupt) {
           let dirty = false;
-          for (const c of builder.candles(true)) if (store.upsertConfirmed(toStored(c))) dirty = true;
+          for (const c of builder.confirmedCandles()) if (store.upsertConfirmed(toStored(c))) dirty = true;
           if (dirty) store.flush();
         }
       } catch (e) { log.warn(`[US:${s.symbol}] REST 시드 실패(무시, WS 로 진행): ${scrub(String(e))}`); }
@@ -123,21 +127,41 @@ async function main() {
         }
       }
     },
-    onGSH: (q) => log.info(`[GSH ${q.symbol}] bid=${q.bestBid}(${q.bidRem}) ask=${q.bestAsk}(${q.askRem})`),
+    onGSH: (q) => {
+      const ctx = ctxs.get(q.symbol);
+      if (!ctx) return;
+      ctx.lastGSHat = Date.now();
+      ctx.bestBid = q.bestBid;
+      ctx.bestAsk = q.bestAsk;
+      log.info(`[GSH ${q.symbol}] bid=${q.bestBid}(${q.bidRem}) ask=${q.bestAsk}(${q.askRem})`);
+    },
     onStatus: (m) => log.info(`[WS] ${scrub(m)}`),
   });
   client.connect(us.ok.map(s => ({ exchcd: s.exchcd, symbol: s.symbol })));
 
-  // ── 10초마다 readiness + OBSERVE ──
+  // ── 10초마다 readiness + OBSERVE (상태를 항목별로 분리 출력, req 3) ──
   const iv = setInterval(() => {
     for (const ctx of ctxs.values()) {
-      const confirmedCount = ctx.builder.candles(true).length;
-      const r = evaluateReadiness({ lastGSCatMs: ctx.lastGSCat, lastPrice: ctx.lastPrice, candleCount: confirmedCount }, Date.now());
-      // 저장 파일 손상 시 신규매수 금지(req 4) — readiness 와 별개로 강제 차단.
-      const allowNewBuy = r.allowNewBuy && !ctx.store.corrupt;
-      const extra = ctx.store.corrupt ? ' [저장손상→신규매수 차단]' : '';
-      log.info(`[READY ${ctx.symbol}] ready=${r.ready} stale=${r.stale} 신규매수허용=${allowNewBuy} 보유매도허용=${r.allowSellExisting} 확정봉=${confirmedCount}${extra} ${r.reasons.join(', ')}`);
-      observeSignal(log, ctx);
+      const now = Date.now();
+      const r = evaluateReadiness({
+        websocketConnected: client.connected,
+        lastGSCatMs: ctx.lastGSCat,
+        lastGSHatMs: ctx.lastGSHat,
+        lastPrice: ctx.lastPrice,
+        bestBid: ctx.bestBid,
+        bestAsk: ctx.bestAsk,
+        confirmedCount: ctx.builder.confirmedCount,
+        storeCorrupted: ctx.store.corrupt,
+      }, now);
+      log.info(
+        `[READY ${ctx.symbol}] confirmed=${ctx.builder.confirmedCount} forming=${ctx.builder.hasForming}`
+        + ` gscAgeSec=${r.gscAgeSec ?? '-'} gshAgeSec=${r.gshAgeSec ?? '-'} wsConnected=${client.connected}`
+        + ` bid=${ctx.bestBid || '-'} ask=${ctx.bestAsk || '-'} lastPrice=${ctx.lastPrice || '-'}`
+        + ` 신규매수허용=${r.allowNewBuy} 신호계산허용=${r.allowSignal} 보유매도허용=${r.allowSellExisting}`
+        + (r.reasons.length ? ` | ${r.reasons.join(', ')}` : ''),
+      );
+      // 신호 계산은 GSC 신선 + 확정봉 충분(allowSignal) 일 때만 — 형성봉 제외(req 9).
+      if (r.allowSignal) observeSignal(log, ctx);
     }
   }, 10_000);
 

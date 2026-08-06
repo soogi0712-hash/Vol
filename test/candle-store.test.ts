@@ -4,8 +4,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CandleStore, type StoredCandle } from '../local-runner/candle-store';
 import {
-  RealtimeCandleBuilder, bucket15, evaluateReadiness, GSC_STALE_MS, MIN_RT_CANDLES,
-  type RTCandle,
+  RealtimeCandleBuilder, bucket15, evaluateReadiness, GSC_FRESH_MS, GSH_FRESH_MS, MIN_RT_CANDLES,
+  type ReadinessState,
 } from '../local-runner/ls-us-websocket';
 
 let dir: string;
@@ -94,37 +94,67 @@ describe('req10-4: 같은 timestamp 중복 저장 금지', () => {
   });
 });
 
-describe('req10-5: 형성봉 제외', () => {
-  it('candles(true) 는 마지막(형성 중) 봉을 제외한다', () => {
+describe('req10-5: 형성봉은 BB/RSI 입력(확정봉)에서 제외', () => {
+  it('시드된 봉은 전부 확정, 실시간 형성봉만 confirmedCandles 에서 제외', () => {
     const b = new RealtimeCandleBuilder();
+    // 저장 복원: 3개 모두 확정봉(종료된 봉)
     b.seed([sc('20260703090000', 1, 1, 1, 1, 1), sc('20260703091500', 2, 2, 2, 2, 2), sc('20260703093000', 3, 3, 3, 3, 3)]);
-    expect(b.candles(false).length).toBe(3);
-    expect(b.candles(true).length).toBe(2);
-    expect(b.candles(true).at(-1)?.datetime).toBe('20260703091500');
+    expect(b.confirmedCount).toBe(3);
+    expect(b.hasForming).toBe(false);
+    // 실시간 체결 1건 → 다음 버킷 형성봉 생성(확정봉 개수는 그대로)
+    b.addTrade(4, 1, '20260703094600');   // 0945 형성 시작
+    expect(b.hasForming).toBe(true);
+    expect(b.confirmedCount).toBe(3);                                  // 형성봉은 확정에 포함 안 됨
+    expect(b.confirmedCandles().map(c => c.datetime)).toEqual(['20260703090000', '20260703091500', '20260703093000']);
+    expect(b.formingCandle()?.datetime).toBe('20260703094500');
+    expect(b.candles(false).length).toBe(4);                          // 전체 = 확정3 + 형성1
+    expect(b.candles(true).length).toBe(3);                           // 확정봉만
   });
 });
 
-describe('req10-6/7: readiness 게이트', () => {
-  const fresh = () => 1_000_000;
+const NOW = 1_000_000_000;
+const goodState = (over: Partial<ReadinessState> = {}): ReadinessState => ({
+  websocketConnected: true, lastGSCatMs: NOW - 5000, lastGSHatMs: NOW - 5000,
+  lastPrice: 100, bestBid: 99, bestAsk: 101, confirmedCount: MIN_RT_CANDLES, storeCorrupted: false, ...over,
+});
+
+describe('req10-6/7: readiness 게이트(확정봉 기준)', () => {
   it('확정봉 <20 → readiness=false, 신규매수 금지', () => {
-    const r = evaluateReadiness({ lastGSCatMs: fresh(), lastPrice: 100, candleCount: 19 }, fresh());
+    const r = evaluateReadiness(goodState({ confirmedCount: 19 }), NOW);
     expect(r.ready).toBe(false);
     expect(r.allowNewBuy).toBe(false);
-    expect(r.reasons.join(' ')).toMatch(/15분봉 부족/);
+    expect(r.reasons.join(' ')).toMatch(/확정봉 부족/);
   });
-  it('확정봉 ≥20 + GSC 신선 + lastPrice>0 → readiness=true, 신규매수 허용', () => {
-    const now = fresh();
-    const r = evaluateReadiness({ lastGSCatMs: now - (GSC_STALE_MS - 1000), lastPrice: 100, candleCount: MIN_RT_CANDLES }, now);
+  it('확정봉 ≥20 + 모두 신선 → readiness=true, 신규매수 허용', () => {
+    const r = evaluateReadiness(goodState(), NOW);
     expect(r.ready).toBe(true);
     expect(r.stale).toBe(false);
     expect(r.allowNewBuy).toBe(true);
   });
-  it('GSC 오래됨(stale) → 신규매수 금지, 보유매도는 허용', () => {
-    const now = fresh();
-    const r = evaluateReadiness({ lastGSCatMs: now - (GSC_STALE_MS + 5000), lastPrice: 100, candleCount: 30 }, now);
-    expect(r.stale).toBe(true);
+});
+
+describe('GSC/GSH 신선도 분리 (이번 수정)', () => {
+  it('GSH fresh + GSC age 40초 → stale=false, 신규매수 유지', () => {
+    const r = evaluateReadiness(goodState({ lastGSCatMs: NOW - 40_000 }), NOW);
+    expect(r.stale).toBe(false);
+    expect(r.gscFresh).toBe(true);
+    expect(r.allowNewBuy).toBe(true);
+  });
+  it('GSC age 301초 → 신규매수 금지(+신호계산 중단), 보유매도 허용', () => {
+    const r = evaluateReadiness(goodState({ lastGSCatMs: NOW - 301_000 }), NOW);
+    expect(r.gscStale).toBe(true);
     expect(r.allowNewBuy).toBe(false);
+    expect(r.allowSignal).toBe(false);
     expect(r.allowSellExisting).toBe(true);
+  });
+  it('GSH age 31초 → 신규매수 금지', () => {
+    const r = evaluateReadiness(goodState({ lastGSHatMs: NOW - 31_000 }), NOW);
+    expect(r.gshFresh).toBe(false);
+    expect(r.allowNewBuy).toBe(false);
+  });
+  it('임계값 상수 확인: GSH 30초 / GSC 300초', () => {
+    expect(GSH_FRESH_MS).toBe(30_000);
+    expect(GSC_FRESH_MS).toBe(300_000);
   });
 });
 
@@ -162,16 +192,54 @@ describe('req10-9: 파일 손상 → 신규매수 차단', () => {
     expect(existsSync(s.file)).toBe(false);   // 손상본은 .corrupt 로 이동, 원본은 재생성 안 함
   });
 
-  it('손상 상태면 readiness 가 ready 여도 신규매수는 차단된다', () => {
-    // 러너 규칙: allowNewBuy = readiness.allowNewBuy && !store.corrupt
+  it('저장 손상(storeCorrupted=true) → 시세가 준비돼도 신규매수 차단', () => {
     const s = new CandleStore('AAPL', dir);
     writeFileSync(s.file, 'corrupt!!!', 'utf8');
     s.load();
-    const now = 1_000_000;
-    const r = evaluateReadiness({ lastGSCatMs: now - 1000, lastPrice: 100, candleCount: 50 }, now);
-    expect(r.allowNewBuy).toBe(true);            // 시세 자체는 준비됨
-    const allowNewBuy = r.allowNewBuy && !s.corrupt;
-    expect(allowNewBuy).toBe(false);             // 그러나 저장 손상 → 신규매수 차단
+    expect(s.corrupt).toBe(true);
+    // 시세는 모두 준비됐지만 저장 손상 → 신규매수 금지
+    const ok = evaluateReadiness(goodState({ confirmedCount: 50, storeCorrupted: false }), NOW);
+    expect(ok.allowNewBuy).toBe(true);
+    const blocked = evaluateReadiness(goodState({ confirmedCount: 50, storeCorrupted: s.corrupt }), NOW);
+    expect(blocked.allowNewBuy).toBe(false);
+    expect(blocked.reasons.some(x => x.includes('저장손상'))).toBe(true);
+  });
+});
+
+describe('확정/형성 분리 수명주기 (이번 수정)', () => {
+  it('첫 GSC 수신 후 버킷 전환 전에는 confirmed=0, forming=true', () => {
+    const b = new RealtimeCandleBuilder();
+    expect(b.addTrade(100, 1, ts('20260703', '093012'))).toBeNull();   // 첫 체결 → 형성만
+    expect(b.confirmedCount).toBe(0);                                   // 아직 확정봉 없음
+    expect(b.hasForming).toBe(true);
+    b.addTrade(101, 1, ts('20260703', '094000'));                       // 같은 0930 버킷
+    expect(b.confirmedCount).toBe(0);                                   // 여전히 0
+  });
+  it('버킷 전환이 확인된 뒤에만 confirmed=1 로 승격', () => {
+    const b = new RealtimeCandleBuilder();
+    b.addTrade(100, 1, ts('20260703', '093012'));   // 0930 형성
+    const confirmed = b.addTrade(110, 1, ts('20260703', '094600'));   // 0945 시작 → 0930 확정
+    expect(confirmed?.datetime).toBe('20260703093000');
+    expect(b.confirmedCount).toBe(1);
+    expect(b.formingCandle()?.datetime).toBe('20260703094500');
+  });
+  it('종료 시 forming 저장 → 재시작 복원 시 confirmed 로 오인하지 않는다', () => {
+    // 종료: 확정봉 2개 + 형성봉 1개 저장
+    const s1 = new CandleStore('AAPL', dir);
+    s1.upsertConfirmed(sc('20260703090000', 1, 1, 1, 1, 1));
+    s1.upsertConfirmed(sc('20260703091500', 2, 2, 2, 2, 2));
+    s1.setForming(sc('20260703093000', 3, 3, 3, 3, 3));   // confirmed:false 로 별도 저장
+    s1.flush();
+
+    // 재시작: 저장 확정봉만 빌더에 시드(형성봉은 넣지 않음, 러너 규칙)
+    const s2 = new CandleStore('AAPL', dir); s2.load();
+    expect(s2.confirmedCount).toBe(2);                    // 형성봉은 confirmed 에 포함 안 됨
+    expect(s2.forming?.datetime).toBe('20260703093000');  // 형성봉은 별도 상태로 복원
+    const b = new RealtimeCandleBuilder();
+    b.seed(s2.confirmedSorted().map(c => ({ ...c })));    // 확정봉만 시드
+    expect(b.confirmedCount).toBe(2);
+    expect(b.hasForming).toBe(false);                     // 복원 직후 형성봉 없음
+    expect(b.confirmedCandles().some(c => c.datetime === '20260703093000')).toBe(false);   // 형성봉 오인 없음
   });
 });
 
