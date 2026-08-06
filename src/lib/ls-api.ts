@@ -532,3 +532,81 @@ export async function getLSUSBalance(cfg: LSConfig, token: string, baseDateYYYYM
     empty,
   };
 }
+
+// ══════════════════════════════════════════════════════════════════
+//  해외주식 주문/체결/예수금 (Phase 3 준비 — 공식 필드만 사용, 추측 금지)
+//  ⚠️ 이 함수들은 LS_LIVE_TRADING='true' + 전 조건 충족 시에만 러너가 호출한다.
+//     기본(observe/ARMED)에서는 절대 호출되지 않는다.
+// ══════════════════════════════════════════════════════════════════
+
+// ── 미국 지정가 매수 주문 (COSAT00301, /overseas-stock/order) ──
+// InBlock1(공식): RecCnt/OrdPtnCode/OrdMktCode/IsuNo/OrdQty/OvrsOrdPrc/OrdprcPtnCode/BrkTpCode
+//   OrdPtnCode='02'(매수), OrdprcPtnCode='00'(지정가) — 공식 reqExample + COSAQ00102 OutBlock3
+//   (OrdPtnCode '02'→'매수', OrdprcPtnCode '00'→'지정가')로 확인.
+//   OrdMktCode=거래소코드(exchcd), IsuNo=심볼, OvrsOrdPrc=해외주문가(지정가).
+export interface LSOrderResult { rspCd: string; rspMsg: string; ordNo: string | null; raw: any; diag: LSHttpDiag; }
+export async function placeLSUSBuyOrder(
+  cfg: LSConfig, token: string, p: { exchcd: string; symbol: string; qty: number; price: number },
+): Promise<LSOrderResult> {
+  const inb = {
+    COSAT00301InBlock1: {
+      RecCnt: 1, OrdPtnCode: '02', OrdMktCode: p.exchcd, IsuNo: p.symbol,
+      OrdQty: p.qty, OvrsOrdPrc: p.price, OrdprcPtnCode: '00', BrkTpCode: '',
+    },
+  };
+  const { data, rspCd, rspMsg, diag } = await lsPost(token, '/overseas-stock/order', 'COSAT00301', inb);
+  // 응답 주문번호 필드는 공식 카탈로그 resExample 이 비어 있어 미확정 → 있으면 OrdNo 사용, 없으면 null.
+  // 확정 주문번호/체결/미체결은 COSAQ00102(계좌주문체결내역조회)로 재조회한다.
+  const ob = data.COSAT00301OutBlock1 || data.COSAT00301OutBlock2 || {};
+  const ordNo = ob.OrdNo != null ? String(ob.OrdNo) : null;
+  return { rspCd, rspMsg, ordNo, raw: data, diag };
+}
+
+// ── 계좌 주문체결내역 조회 (COSAQ00102, /overseas-stock/accno) — 체결/미체결 확인 ──
+// InBlock1(공식): RecCnt/QryTpCode/BkseqTpCode/OrdMktCode/BnsTpCode/IsuNo/SrtOrdNo/OrdDt/
+//                 ExecYn/CrcyCode/ThdayBnsAppYn/LoanBalHldYn
+// OutBlock3(리스트): OrdNo/OrgOrdNo/ShtnIsuNo/OrdQty/ExecQty/UnercQty/OvrsOrdPrc/OrdPtnCode/OrdprcPtnCode ...
+export interface LSOrderExec { ordNo: string; orgOrdNo: string; symbol: string; ordQty: number; execQty: number; unfilledQty: number; ordPrc: number; ordPtnCode: string; trxNm: string; }
+export interface LSOrderExecResult { rspCd: string; rspMsg: string; rows: LSOrderExec[]; diag: LSHttpDiag; }
+export async function queryLSUSOrderExec(
+  cfg: LSConfig, token: string, p: { exchcd: string; symbol?: string; ordDate: string; execYn?: '0' | '1' | '2' },
+): Promise<LSOrderExecResult> {
+  // ExecYn: 0=전체, 1=체결, 2=미체결 (공식 InBlock 필드). SrtOrdNo=999999999(전체). QryTpCode/BkseqTpCode=1.
+  const inb = {
+    COSAQ00102InBlock1: {
+      RecCnt: 1, QryTpCode: '1', BkseqTpCode: '1', OrdMktCode: p.exchcd, BnsTpCode: '0',
+      IsuNo: p.symbol ?? '', SrtOrdNo: 999999999, OrdDt: p.ordDate, ExecYn: p.execYn ?? '0',
+      CrcyCode: '000', ThdayBnsAppYn: '0', LoanBalHldYn: '0',
+    },
+  };
+  const { data, rspCd, rspMsg, diag } = await lsPost(token, '/overseas-stock/accno', 'COSAQ00102', inb);
+  const rows: LSOrderExec[] = (data.COSAQ00102OutBlock3 || []).map((r: any) => ({
+    ordNo: String(r.OrdNo ?? ''), orgOrdNo: String(r.OrgOrdNo ?? ''),
+    symbol: String(r.ShtnIsuNo ?? r.IsuNo ?? ''),
+    ordQty: toNum(r.OrdQty), execQty: toNum(r.ExecQty), unfilledQty: toNum(r.UnercQty),
+    ordPrc: toNum(r.OvrsOrdPrc), ordPtnCode: String(r.OrdPtnCode ?? ''), trxNm: String(r.OrdTrxPtnNm ?? ''),
+  }));
+  return { rspCd, rspMsg, rows, diag };
+}
+
+// ── USD 예수금 조회 (COSOQ02701, /overseas-stock/accno) — 주문가능 판정용 ──
+// InBlock1(공식): RecCnt/CrcyCode. OutBlock2(통화별 리스트): CrcyCode/PrsmptFcurrDps1(추정 외화예수금) 등.
+// ⚠️ '주문가능금액' 정확한 필드는 공식 문서에 단일 확정값이 없어 PrsmptFcurrDps1(추정 예수금)을 사용한다.
+//     실주문 전 사용자 검증 필요(README 참고).
+export interface LSUSDeposit { rspCd: string; rspMsg: string; usdDeposit: number; found: boolean; diag: LSHttpDiag; }
+export async function getLSUSDeposit(cfg: LSConfig, token: string): Promise<LSUSDeposit> {
+  const { data, rspCd, rspMsg, diag } = await lsPost(token, '/overseas-stock/accno', 'COSOQ02701', {
+    COSOQ02701InBlock1: { RecCnt: 1, CrcyCode: 'ALL' },
+  });
+  const rows: any[] = data.COSOQ02701OutBlock2 || [];
+  const usd = rows.find(r => String(r.CrcyCode).toUpperCase() === 'USD');
+  return { rspCd, rspMsg, usdDeposit: usd ? toNum(usd.PrsmptFcurrDps1) : 0, found: !!usd, diag };
+}
+
+// ── 미체결 취소 (COSAT00311) — ⚠️ 공식 카탈로그에 필드(reqExample/InBlock) 미수록 ──
+// 추측 금지 원칙상 요청 필드를 임의로 만들지 않는다. 사용자가 공식 취소 TR 스펙을 제공하기 전까지
+// 이 함수는 호출 시 예외를 던지고, 실주문 게이트는 '취소 미확인'으로 LIVE 를 차단한다.
+export const LS_CANCEL_TR_CONFIRMED = false;   // 공식 취소 필드 확인 시 true 로 전환
+export async function cancelLSUSOrder(_cfg: LSConfig, _token: string, _p: { exchcd: string; symbol: string; ordNo: string; qty: number }): Promise<never> {
+  throw new LSApiError('INVALID_RESPONSE', 'COSAT00311(미국 취소/정정) 공식 요청 필드 미확인 — 구현 보류(추측 금지). 공식 스펙 확보 후 구현 필요.');
+}

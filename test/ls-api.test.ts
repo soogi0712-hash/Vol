@@ -3,6 +3,7 @@ import {
   getLSAccessToken, getLSKRBalance, getLSUSBalance,
   getLSKRPrice, getLSUSPrice, getLSKR15Min, getLSUS15Min, getLSUS15MinPaged,
   getLSUSTicks, getLSUSTicksPaged, lsOverseasChartRaw,
+  placeLSUSBuyOrder, queryLSUSOrderExec, getLSUSDeposit, cancelLSUSOrder, LS_CANCEL_TR_CONFIRMED,
   toLSOverseasExchcd, LSApiError, configureLSRateLimiter, classifyChart,
   LS_G3203_MAX_QRYCNT_UNCOMPRESSED,
 } from '../src/lib/ls-api';
@@ -443,6 +444,55 @@ describe('g3202 NTICK 과거 틱 (15분 재집계 fallback)', () => {
     }));
     const r = await getLSUSTicksPaged(cfg, 'T', 'AAPL', '82', 'R', { target: 21, maxCalls: 40 });
     expect(r.calls).toBe(1);
+  });
+});
+
+describe('해외 주문/체결/예수금 (공식 필드)', () => {
+  it('COSAT00301 지정가 매수 — 공식 InBlock 필드 전송(OrdPtnCode=02, OrdprcPtnCode=00)', async () => {
+    let sent: any = null;
+    stubFetch((url, init) => {
+      expect(url).toBe('https://openapi.ls-sec.co.kr:8080/overseas-stock/order');
+      expect(init.headers['tr_cd']).toBe('COSAT00301');
+      sent = JSON.parse(init.body).COSAT00301InBlock1;
+      return { json: { rsp_cd: '00000', rsp_msg: '정상', COSAT00301OutBlock1: { OrdNo: 141 } } };
+    });
+    const r = await placeLSUSBuyOrder(cfg, 'T', { exchcd: '82', symbol: 'AAPL', qty: 1, price: 190.5 });
+    expect(sent).toMatchObject({ RecCnt: 1, OrdPtnCode: '02', OrdMktCode: '82', IsuNo: 'AAPL', OrdQty: 1, OvrsOrdPrc: 190.5, OrdprcPtnCode: '00', BrkTpCode: '' });
+    expect(r.rspCd).toBe('00000');
+    expect(r.ordNo).toBe('141');
+  });
+
+  it('COSAQ00102 체결/미체결 조회 — OutBlock3 파싱(OrdNo/ExecQty/UnercQty)', async () => {
+    stubFetch((url, init) => {
+      expect(url).toBe('https://openapi.ls-sec.co.kr:8080/overseas-stock/accno');
+      expect(init.headers['tr_cd']).toBe('COSAQ00102');
+      const b = JSON.parse(init.body).COSAQ00102InBlock1;
+      expect(b.ExecYn).toBe('0'); expect(b.OrdMktCode).toBe('82');
+      return { json: { rsp_cd: '00000', COSAQ00102OutBlock3: [
+        { OrdNo: 141, OrgOrdNo: 0, ShtnIsuNo: 'TSLA', OrdQty: 10, ExecQty: 4, UnercQty: 6, OvrsOrdPrc: '200.00', OrdPtnCode: '02', OrdTrxPtnNm: '접수' },
+      ] } };
+    });
+    const r = await queryLSUSOrderExec(cfg, 'T', { exchcd: '82', symbol: 'TSLA', ordDate: '20260706' });
+    expect(r.rows).toHaveLength(1);
+    expect(r.rows[0]).toMatchObject({ ordNo: '141', symbol: 'TSLA', ordQty: 10, execQty: 4, unfilledQty: 6, ordPtnCode: '02' });
+  });
+
+  it('COSOQ02701 USD 예수금 조회 — USD 행의 PrsmptFcurrDps1', async () => {
+    stubFetch((url, init) => {
+      expect(init.headers['tr_cd']).toBe('COSOQ02701');
+      return { json: { rsp_cd: '00000', COSOQ02701OutBlock2: [
+        { CrcyCode: 'JPY', PrsmptFcurrDps1: '0.0000' },
+        { CrcyCode: 'USD', PrsmptFcurrDps1: '3300.5000' },
+      ] } };
+    });
+    const r = await getLSUSDeposit(cfg, 'T');
+    expect(r.found).toBe(true);
+    expect(r.usdDeposit).toBeCloseTo(3300.5);
+  });
+
+  it('cancelLSUSOrder — 공식 취소 필드 미확인 → 예외(추측 금지)', async () => {
+    expect(LS_CANCEL_TR_CONFIRMED).toBe(false);
+    await expect(cancelLSUSOrder(cfg, 'T', { exchcd: '82', symbol: 'AAPL', ordNo: '1', qty: 1 })).rejects.toThrow(/COSAT00311/);
   });
 });
 

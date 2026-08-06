@@ -4,15 +4,21 @@
 // ⚠️ 주문 없음(관찰 전용). LS_LIVE_TRADING 과 무관하게 주문 함수는 호출하지 않는다(Phase 3 금지).
 import { loadEnvLocal } from './env';
 import { createLogger, type Logger } from './logger';
-import { loadConfig, getTokenCached, resolveUSQuote } from './ls-client';
+import { loadConfig, getTokenCached, resolveUSQuote, type LocalLSConfig } from './ls-client';
 import { loadUSSymbols } from './universe';
 import { makeScrubber } from './mask';
-import { getLSUS15MinPaged, getLSUSTicksPaged } from '../src/lib/ls-api';
+import {
+  getLSUS15MinPaged, getLSUSTicksPaged, getLSUSDeposit,
+  placeLSUSBuyOrder, queryLSUSOrderExec, cancelLSUSOrder,
+} from '../src/lib/ls-api';
 import {
   LSUSRealtimeClient, RealtimeCandleBuilder, buildWsTrKey, evaluateReadiness, MIN_RT_CANDLES,
   aggregateTicksTo15Min, type RTCandle,
 } from './ls-us-websocket';
 import { CandleStore, type StoredCandle } from './candle-store';
+import { OrderStore } from './order-store';
+import { evaluateTradeGate, canExecuteLive, etDateStr, isUSRegularSession, type GateState } from './trade-gate';
+import { executeBuyOrder } from './trader';
 import { calcBB, calcRSI, getBBSignal, validateCandleData } from '../src/lib/bollinger';
 
 function kstYmd(offsetDays = 0): string {
@@ -28,6 +34,7 @@ interface SymCtx {
   exchcd: string;
   builder: RealtimeCandleBuilder;
   store: CandleStore;
+  orders: OrderStore;
   lastGSCat: number | null;
   lastGSHat: number | null;
   lastPrice: number;
@@ -35,27 +42,28 @@ interface SymCtx {
   bestAsk: number;
 }
 
-// 확정봉 ≥20 + GSC 신선(allowSignal) 이면 BB(20,2)/RSI(14)/getBBSignal → OBSERVE 로그만(주문 금지, req 9).
-// ⚠️ 형성봉은 입력에서 제외한다(confirmedCandles). GSC 300초 초과 시 신호 계산을 중단한다.
-function observeSignal(log: Logger, ctx: SymCtx): void {
+// 확정봉 ≥20 + GSC 신선(allowSignal) 이면 BB(20,2)/RSI(14)/getBBSignal → OBSERVE 로그.
+// 신호 action + 신호 기준이 된 최신 확정봉 datetime 을 반환(게이트 dedup 키). 형성봉 제외(req 9).
+function observeSignal(log: Logger, ctx: SymCtx): { action: string; candleDatetime: string } | null {
   const confirmed = ctx.builder.confirmedCandles();   // 확정봉만(형성봉 제외)
-  if (confirmed.length < MIN_RT_CANDLES) return;
+  if (confirmed.length < MIN_RT_CANDLES) return null;
   const closes = confirmed.map(c => c.close);
   const qv = validateCandleData(closes, MIN_RT_CANDLES, 20, 0.001);
-  if (!qv.valid) { log.warn(`[US:${ctx.symbol}] 신호검증 스킵 — ${qv.reason} (${qv.detail})`); return; }
+  if (!qv.valid) { log.warn(`[US:${ctx.symbol}] 신호검증 스킵 — ${qv.reason} (${qv.detail})`); return null; }
   const bands = calcBB(closes, confirmed.map(c => c.datetime), 20, 2);
   const rsi = calcRSI(closes, 14);
   const sig = getBBSignal(bands, false, false, rsi);   // 관찰: 보유/상단돌파 상태 없음
   // ⚠️ 신호가 BUY/SELL 이어도 주문 함수는 호출하지 않는다 — 로그만.
   log.info(`[OBSERVE US:${ctx.exchange}:${ctx.symbol}] signal=${sig.action} reason=${sig.reason} 확정봉=${confirmed.length} 현재가=${ctx.lastPrice || '-'} rsi=${rsi.at(-1)?.toFixed(1) ?? '-'} (주문 없음)`);
+  return { action: sig.action, candleDatetime: confirmed[confirmed.length - 1].datetime };
 }
 
 async function main() {
   loadEnvLocal();
   const log = createLogger('ls-usws');
-  log.info('===== LS 해외 실시간(WebSocket GSC/GSH) 관찰 — 지속 실행형, 주문 없음 =====');
+  log.info('===== LS 해외 실시간(WebSocket GSC/GSH) — 지속 실행형 · ARMED 감시(주문 없음) =====');
 
-  let cfg;
+  let cfg: LocalLSConfig;
   try { cfg = loadConfig(); } catch (e) { log.error(String(e)); process.exit(1); return; }
 
   const scrub0 = makeScrubber([cfg.appKey, cfg.appSecret]);
@@ -76,8 +84,11 @@ async function main() {
   for (const s of us.ok) {
     const store = new CandleStore(s.symbol);
     store.load();
+    const orders = new OrderStore(s.symbol);
+    orders.load();
+    if (orders.corrupt) log.error(`[US:${s.symbol}] 주문상태 파일 손상 → 실주문 차단 유지. 파일: ${orders.file}`);
     const builder = new RealtimeCandleBuilder();
-    const ctx: SymCtx = { symbol: s.symbol, exchange: s.exchange, exchcd: s.exchcd, builder, store, lastGSCat: null, lastGSHat: null, lastPrice: 0, bestBid: 0, bestAsk: 0 };
+    const ctx: SymCtx = { symbol: s.symbol, exchange: s.exchange, exchcd: s.exchcd, builder, store, orders, lastGSCat: null, lastGSHat: null, lastPrice: 0, bestBid: 0, bestAsk: 0 };
     ctxs.set(s.symbol, ctx);
 
     const trKey = buildWsTrKey(s.exchcd, s.symbol);
@@ -165,30 +176,89 @@ async function main() {
   });
   client.connect(us.ok.map(s => ({ exchcd: s.exchcd, symbol: s.symbol })));
 
-  // ── 10초마다 readiness + OBSERVE (상태를 항목별로 분리 출력, req 3) ──
-  const iv = setInterval(() => {
-    for (const ctx of ctxs.values()) {
-      const now = Date.now();
-      const r = evaluateReadiness({
-        websocketConnected: client.connected,
-        lastGSCatMs: ctx.lastGSCat,
-        lastGSHatMs: ctx.lastGSHat,
-        lastPrice: ctx.lastPrice,
-        bestBid: ctx.bestBid,
-        bestAsk: ctx.bestAsk,
-        confirmedCount: ctx.builder.confirmedCount,
-        storeCorrupted: ctx.store.corrupt,
-      }, now);
-      log.info(
-        `[READY ${ctx.symbol}] confirmed=${ctx.builder.confirmedCount} forming=${ctx.builder.hasForming}`
-        + ` gscAgeSec=${r.gscAgeSec ?? '-'} gshAgeSec=${r.gshAgeSec ?? '-'} wsConnected=${client.connected}`
-        + ` bid=${ctx.bestBid || '-'} ask=${ctx.bestAsk || '-'} lastPrice=${ctx.lastPrice || '-'}`
-        + ` 신규매수허용=${r.allowNewBuy} 신호계산허용=${r.allowSignal} 보유매도허용=${r.allowSellExisting}`
-        + (r.reasons.length ? ` | ${r.reasons.join(', ')}` : ''),
-      );
-      // 신호 계산은 GSC 신선 + 확정봉 충분(allowSignal) 일 때만 — 형성봉 제외(req 9).
-      if (r.allowSignal) observeSignal(log, ctx);
+  // ── ARMED 모드: 조건 충족 여부만 감시. 주문은 canExecuteLive.execute 일 때만(현재 항상 false) ──
+  const armedMode = process.env.LS_TRADING_ARMED === 'true';
+  log.info(`ARMED 모드=${armedMode} · LS_LIVE_TRADING=${cfg.liveTrading} · 취소TR확인=false → 실주문 ${armedMode ? '차단(조건만 감시)' : '비활성'}`);
+
+  // 예수금(주문가능) 조회 캐시 — 계좌 단위라 60초 캐시(불필요 네트워크 억제)
+  let depAt = 0; let depUsd = 0; let depOk = false;
+  async function orderableCheck(priceNeeded: number): Promise<boolean> {
+    const now = Date.now();
+    if (now - depAt >= 60_000) {
+      try { const d = await getLSUSDeposit(cfg, token); depOk = d.rspCd === '00000' && d.found; depUsd = d.usdDeposit; }
+      catch (e) { depOk = false; depUsd = 0; log.warn(`[ARMED] 예수금 조회 실패: ${scrub(String(e))}`); }
+      depAt = now;
     }
+    return depOk && depUsd >= priceNeeded;   // 1주 매수 가능 여부
+  }
+
+  async function evaluateArmed(ctx: SymCtx, sig: { action: string; candleDatetime: string }, now: number): Promise<void> {
+    const etDate = etDateStr(now);
+    const gscAgeSec = ctx.lastGSCat == null ? null : Math.round((now - ctx.lastGSCat) / 1000);
+    const gshAgeSec = ctx.lastGSHat == null ? null : Math.round((now - ctx.lastGSHat) / 1000);
+    // 동일 확정봉 중복/일일한도/손상 → 중복주문으로 간주(cond9), 미체결(cond10)
+    const dup = ctx.orders.corrupt || ctx.orders.hasOrderedCandle(sig.candleDatetime, 'buy') || !ctx.orders.canBuyToday(etDate);
+    const pending = ctx.orders.hasPending();
+    // 나머지 조건이 모두 통과할 때만 예수금 조회(불필요 네트워크 억제)
+    const priceNeeded = ctx.bestBid > 0 ? ctx.bestBid : ctx.lastPrice;
+    const worthQuery = sig.action === 'BUY' && ctx.builder.confirmedCount >= MIN_RT_CANDLES && client.connected
+      && isUSRegularSession(now) && ctx.bestBid > 0 && ctx.bestAsk > 0 && ctx.lastPrice > 0 && !dup && !pending;
+    const orderableQtyOk = worthQuery ? await orderableCheck(priceNeeded) : false;
+
+    const state: GateState = {
+      confirmedCount: ctx.builder.confirmedCount, signalAction: sig.action, wsConnected: client.connected,
+      gscAgeSec, gshAgeSec, bid: ctx.bestBid, ask: ctx.bestAsk, lastPrice: ctx.lastPrice, nowMs: now,
+      orderableQtyOk, duplicateCandleOrdered: dup, hasPendingOrder: pending,
+    };
+    const g = evaluateTradeGate(state);
+    log.info(`[ARMED ${ctx.symbol}] armed=${g.armed} 통과=${g.passed.length}/10${g.blockedBy.length ? ` 차단=[${g.blockedBy.join(', ')}]` : ''}`);
+    if (!g.armed) return;
+
+    const live = canExecuteLive(g.armed, cfg.liveTrading);
+    if (!live.execute) { log.info(`[ARMED-READY ${ctx.symbol}] 전 10개 조건 충족 · 주문 없음 — ${live.reason}`); return; }
+    // ↓ 현재 도달 불가(LIVE off 또는 취소 TR 미확인). 도달 시에도 trader 가 한도/중복/미체결 재검증.
+    const outcome = await executeBuyOrder(
+      {
+        place: (pp) => placeLSUSBuyOrder(cfg, token, pp),
+        query: (pp) => queryLSUSOrderExec(cfg, token, pp),
+        cancel: (pp) => cancelLSUSOrder(cfg, token, pp),
+        log: (m) => log.info(scrub(m)),
+      },
+      { orders: ctx.orders, exchcd: ctx.exchcd, symbol: ctx.symbol, candleDatetime: sig.candleDatetime, qty: 1, price: priceNeeded, etDate },
+    );
+    log.info(`[ORDER-RESULT ${ctx.symbol}] status=${outcome.status} ordNo=${outcome.ordNo ?? '-'} ${outcome.reason}`);
+  }
+
+  // ── 10초마다 readiness + OBSERVE + ARMED (상태 항목별 출력) ──
+  let ticking = false;
+  const iv = setInterval(async () => {
+    if (ticking) return;   // 이전 틱(예수금 조회 등) 진행 중이면 건너뜀
+    ticking = true;
+    try {
+      for (const ctx of ctxs.values()) {
+        const now = Date.now();
+        const r = evaluateReadiness({
+          websocketConnected: client.connected,
+          lastGSCatMs: ctx.lastGSCat,
+          lastGSHatMs: ctx.lastGSHat,
+          lastPrice: ctx.lastPrice,
+          bestBid: ctx.bestBid,
+          bestAsk: ctx.bestAsk,
+          confirmedCount: ctx.builder.confirmedCount,
+          storeCorrupted: ctx.store.corrupt,
+        }, now);
+        log.info(
+          `[READY ${ctx.symbol}] confirmed=${ctx.builder.confirmedCount} forming=${ctx.builder.hasForming}`
+          + ` gscAgeSec=${r.gscAgeSec ?? '-'} gshAgeSec=${r.gshAgeSec ?? '-'} wsConnected=${client.connected}`
+          + ` bid=${ctx.bestBid || '-'} ask=${ctx.bestAsk || '-'} lastPrice=${ctx.lastPrice || '-'}`
+          + ` 신규매수허용=${r.allowNewBuy} 신호계산허용=${r.allowSignal} 보유매도허용=${r.allowSellExisting}`
+          + (r.reasons.length ? ` | ${r.reasons.join(', ')}` : ''),
+        );
+        // 신호 계산은 GSC 신선 + 확정봉 충분(allowSignal) 일 때만 — 형성봉 제외(req 9).
+        const sig = r.allowSignal ? observeSignal(log, ctx) : null;
+        if (armedMode && sig) await evaluateArmed(ctx, sig, Date.now());
+      }
+    } finally { ticking = false; }
   }, 10_000);
 
   // ── 정상 종료(SIGINT/SIGTERM): 형성봉 저장 후 종료 ──
@@ -210,7 +280,7 @@ async function main() {
   process.on('SIGINT', () => shutdown('SIGINT'));
   process.on('SIGTERM', () => shutdown('SIGTERM'));
 
-  log.info('지속 실행 중 — 종료하려면 Ctrl+C. READY/OBSERVE 는 10초마다 기록됩니다.');
+  log.info(`지속 실행 중 — 종료하려면 Ctrl+C. READY/OBSERVE/ARMED 는 10초마다 기록됩니다.${armedMode ? ' (ARMED=조건 감시만, 주문 없음)' : ''}`);
   await new Promise(() => { /* SIGINT 까지 유지 */ });
 }
 main();
