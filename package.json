@@ -10,6 +10,8 @@
     "deploy": "npm run build && wrangler deploy",
     "deploy:dry": "npm run build && wrangler deploy --dry-run",
     "dev:local": "wrangler dev --test-scheduled --local",
+    "ls:diag": "tsx local-runner/ls-diag.ts",
+    "ls:trade": "tsx local-runner/ls-trade.ts",
     "db:create": "wrangler d1 create bollinger-trader-production",
     "db:migrate:local": "wrangler d1 migrations apply bollinger-trader-production --local",
     "db:migrate:prod": "wrangler d1 migrations apply bollinger-trader-production --remote",
@@ -24,6 +26,7 @@
     "@cloudflare/workers-types": "^4.20260623.1",
     "@hono/vite-build": "^1.2.0",
     "@hono/vite-dev-server": "^0.25.2",
+    "tsx": "^4.19.0",
     "vite": "^6.3.5",
     "vitest": "^4.1.10",
     "wrangler": "^4.4.0"

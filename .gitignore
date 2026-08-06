@@ -18,11 +18,15 @@ node_modules/
 # env — 비밀정보 (절대 커밋 금지)
 .env
 .env.*
+!.env.local.example
 .dev.vars
 *.vars
 secrets.json
 *secret*
 *credential*
+
+# local-runner 캐시(토큰) — 커밋 금지 (로그는 아래 logs/ 규칙으로 무시됨)
+local-runner/.cache/
 
 # logs
 logs/
