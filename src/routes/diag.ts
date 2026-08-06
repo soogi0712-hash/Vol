@@ -9,12 +9,16 @@ import {
 import { collectKR15Min } from '../lib/kr-candles';
 import { makeKisRateLimiter } from '../lib/kis-rate-limit';
 import { CANDLE_HISTORY_UPSERT_SQL, candleHistoryBindings } from '../lib/indicators';
+import { getLSAccessToken, getLSKRBalance, getLSUSBalance } from '../lib/ls-api';
 
 type Bindings = {
   DB: D1Database; KV: KVNamespace;
   KIS_APP_KEY: string; KIS_APP_SECRET: string;
   KIS_ACCOUNT_NO: string; KIS_ACCOUNT_SUFFIX: string;
   DIAG_SECRET?: string;   // 진단 경로 보호용 시크릿 (wrangler secret put DIAG_SECRET)
+  // LS증권 Open API (wrangler secret put) — Phase 1 잔고 점검용
+  LS_APP_KEY?: string; LS_APP_SECRET?: string;
+  LS_ACCOUNT_NO?: string; LS_ACCOUNT_SUFFIX?: string;
 };
 
 const diag = new Hono<{ Bindings: Bindings }>();
@@ -28,6 +32,75 @@ diag.use('*', async (c, next) => {
     return c.json({ success: false, message: 'forbidden' }, 403);
   }
   await next();
+});
+
+// GET /api/diag/ls-account — LS증권 계좌/잔고 조회 점검 (Phase 1, 관찰 전용)
+// 민감정보 절대 미출력: APP KEY/SECRET, 토큰 원문, 전체 계좌번호는 응답·로그에 넣지 않는다.
+diag.get('/ls-account', async (c) => {
+  if (!c.env.LS_APP_KEY || !c.env.LS_APP_SECRET) {
+    return c.json({ success: false, message: 'LS API 키 미설정 (LS_APP_KEY/LS_APP_SECRET)' }, 400);
+  }
+  const cfg = {
+    appKey: c.env.LS_APP_KEY, appSecret: c.env.LS_APP_SECRET,
+    accountNo: c.env.LS_ACCOUNT_NO, accountSuffix: c.env.LS_ACCOUNT_SUFFIX,
+  };
+  const suffix = c.env.LS_ACCOUNT_SUFFIX || '';
+  const sensitive: string[] = [cfg.appKey, cfg.appSecret, c.env.LS_ACCOUNT_NO].filter(Boolean) as string[];
+  const scrub = (s: string) => {
+    let out = s;
+    for (const x of sensitive) out = out.split(x).join('***');
+    return out.slice(0, 200);
+  };
+  const maskAcct = (acc: string | null | undefined): string | null => {
+    if (!acc) return null;
+    return '*'.repeat(Math.max(0, acc.length - 4)) + acc.slice(-4) + (suffix ? '-' + suffix : '');
+  };
+
+  let token: string;
+  try {
+    token = await getLSAccessToken(cfg, c.env.KV);   // 토큰은 사용만, 절대 출력 금지
+    if (token) sensitive.push(token);
+  } catch (e) {
+    return c.json({ success: false, token_ok: false, observe_only: true, orders_submitted: 0, message: scrub(String(e)) }, 200);
+  }
+
+  // 해외 잔고 기준일 = KST 오늘 (YYYYMMDD)
+  const k = new Date(Date.now() + 9 * 3600 * 1000);
+  const baseDt = `${k.getUTCFullYear()}${String(k.getUTCMonth() + 1).padStart(2, '0')}${String(k.getUTCDate()).padStart(2, '0')}`;
+
+  let acctFromApi: string | null = null;
+  let kr_balance_ok = false, kr_total_eval: number | null = null, kr_orderable_cash: number | null = null;
+  let kr_err: string | null = null;
+  try {
+    const b = await getLSKRBalance(cfg, token);
+    kr_balance_ok = true; kr_total_eval = b.totalEval; kr_orderable_cash = b.orderableCash;
+    acctFromApi = b.accountNo;
+  } catch (e) { kr_err = String(e); }
+
+  let us_balance_ok = false, us_total_eval_krw: number | null = null;
+  let us_err: string | null = null;
+  try {
+    const b = await getLSUSBalance(cfg, token, baseDt);
+    us_balance_ok = true; us_total_eval_krw = b.totalEvalKRW;
+    if (!acctFromApi) acctFromApi = b.accountNo;
+  } catch (e) { us_err = String(e); }
+
+  // 응답 계좌번호(에코)는 전체 노출 금지 → 스크럽 목록에 추가 후 마스킹만 반환
+  if (acctFromApi) sensitive.push(acctFromApi);
+  const masked = maskAcct(c.env.LS_ACCOUNT_NO || acctFromApi);
+
+  return c.json({
+    success: true,
+    broker: 'LS',
+    observe_only: true,          // Phase 1: 주문 미실행
+    orders_submitted: 0,
+    account_masked: masked,
+    account_suffix: suffix,
+    token_ok: true,
+    kr_balance_ok, kr_total_eval, kr_orderable_cash,
+    us_balance_ok, us_total_eval_krw,
+    ...(kr_err || us_err ? { errors: { kr: kr_err ? scrub(kr_err) : null, us: us_err ? scrub(us_err) : null } } : {}),
+  });
 });
 
 // GET /api/diag/account — 계좌/잔고 조회 점검 (실주문 전 사전 확인용)
