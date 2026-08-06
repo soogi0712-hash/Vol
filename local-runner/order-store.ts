@@ -3,6 +3,7 @@
 // ⚠️ 앱키/토큰/계좌번호는 저장하지 않는다.
 import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync } from 'node:fs';
 import { resolve, join } from 'node:path';
+import type { TrackedOrder } from './order-events';
 
 export interface PendingOrder {
   ordNo: string; symbol: string; candleKey: string; qty: number; price: number; etDate: string;
@@ -17,6 +18,7 @@ interface OrderStoreBody {
   orderedCandles: string[];            // 주문한 확정봉 키(symbol|candleDatetime|side)
   pending: PendingOrder[];             // 미체결(체결확인/취소 대상)
   responses: RespAudit[];              // LS 원문 rsp_cd/rsp_msg 감사(req 18)
+  tracked: TrackedOrder[];             // 계좌 이벤트(AS0~AS4) 기반 주문상태 — 재시작 복원용
 }
 
 const DEFAULT_DIR = resolve(process.cwd(), 'local-runner', 'data');
@@ -36,7 +38,7 @@ export class OrderStore {
     const safe = symbol.replace(/[^A-Za-z0-9_.-]/g, '_');
     this.file = join(dir, `us-orders-${safe}.json`);
     this.tmp = this.file + '.tmp';
-    this.body = { version: VERSION, symbol, days: {}, orderedCandles: [], pending: [], responses: [] };
+    this.body = { version: VERSION, symbol, days: {}, orderedCandles: [], pending: [], responses: [], tracked: [] };
   }
 
   load(): void {
@@ -51,6 +53,7 @@ export class OrderStore {
         orderedCandles: Array.isArray(d.orderedCandles) ? d.orderedCandles : [],
         pending: Array.isArray(d.pending) ? d.pending : [],
         responses: Array.isArray(d.responses) ? d.responses : [],
+        tracked: Array.isArray(d.tracked) ? d.tracked : [],
       };
     } catch {
       this.corrupt = true;
@@ -89,6 +92,16 @@ export class OrderStore {
     this.body.responses.push(a);
     if (this.body.responses.length > MAX_AUDIT) this.body.responses = this.body.responses.slice(-MAX_AUDIT);
   }
+
+  /** 계좌이벤트 추적 주문 맵(ordNo 키) — 재시작 시 원주문번호 기준 상태 복원. */
+  trackedMap(): Map<string, TrackedOrder> {
+    const m = new Map<string, TrackedOrder>();
+    for (const o of this.body.tracked) m.set(o.ordNo, o);
+    return m;
+  }
+  /** 추적 맵 저장(메모리). flush 로 디스크 반영. */
+  saveTracked(map: Map<string, TrackedOrder>): void { this.body.tracked = [...map.values()]; }
+  get tracked(): TrackedOrder[] { return [...this.body.tracked]; }
 
   flush(): void {
     if (this.corrupt) return;

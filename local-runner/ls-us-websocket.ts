@@ -26,10 +26,16 @@ export function buildWsTrKey(exchcd: string, symbol: string): string {
   return `${exchcd}${symbol}`.padEnd(TR_KEY_LEN, ' ');
 }
 
-/** 실시간 등록/해제 메시지. tr_type: "3"=등록, "4"=해제. */
-export function buildRegisterMessage(token: string, trCd: 'GSC' | 'GSH', trKey: string, trType: '3' | '4' = '3') {
+/**
+ * 등록/해제 메시지. tr_type: "1"=계좌등록, "2"=계좌해제, "3"=실시간 시세등록, "4"=시세해제.
+ * GSC/GSH 는 "3"(시세), AS0~AS4 는 "1"(계좌) 로 등록한다.
+ */
+export function buildRegisterMessage(token: string, trCd: string, trKey: string, trType: '1' | '2' | '3' | '4' = '3') {
   return { header: { token, tr_type: trType }, body: { tr_cd: trCd, tr_key: trKey } };
 }
+
+// 계좌 주문이벤트 TR (공식): AS0 접수 / AS1 체결 / AS2 정정 / AS3 취소 / AS4 거부.
+export const LS_ACCOUNT_EVENT_TRS = ['AS0', 'AS1', 'AS2', 'AS3', 'AS4'] as const;
 
 // ── 파서 ────────────────────────────────────────────────────────
 export interface GSCTick { symbol: string; lastPrice: number; tradeQty: number; cumulativeVolume: number; localTs: string; }
@@ -260,6 +266,8 @@ export interface SymbolSub { exchcd: string; symbol: string; }
 export interface ClientHooks {
   onGSC?: (t: GSCTick) => void;
   onGSH?: (q: GSHQuote) => void;
+  onAccountEvent?: (trCd: string, body: any) => void;         // AS0~AS4 주문 이벤트 원문 body
+  onRegisterAck?: (trCd: string, rspCd: string, rspMsg: string) => void;   // 등록 성공/실패 응답
   onStatus?: (msg: string) => void;
 }
 export interface ClientOpts {
@@ -267,6 +275,7 @@ export interface ClientOpts {
   wsFactory?: WsFactory;
   staleTimeoutMs?: number;      // 무수신 시 재연결 (기본 45s)
   backoffMs?: number[];         // 재연결 백오프 (기본 1s,2s,4s,8s,16s)
+  accountEvents?: boolean;      // AS0~AS4 계좌이벤트 등록(tr_type=1). 기본 false.
   sleep?: (ms: number) => Promise<void>;
   now?: () => number;
 }
@@ -289,6 +298,7 @@ export class LSUSRealtimeClient {
   private readonly factory: WsFactory;
   private readonly staleTimeoutMs: number;
   private readonly backoff: number[];
+  private readonly accountEvents: boolean;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly now: () => number;
 
@@ -297,6 +307,7 @@ export class LSUSRealtimeClient {
     this.factory = opts.wsFactory ?? defaultWsFactory;
     this.staleTimeoutMs = opts.staleTimeoutMs ?? 45_000;
     this.backoff = opts.backoffMs ?? [1000, 2000, 4000, 8000, 16000];
+    this.accountEvents = opts.accountEvents ?? false;
     this.sleep = opts.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
     this.now = opts.now ?? (() => Date.now());
   }
@@ -333,10 +344,17 @@ export class LSUSRealtimeClient {
   }
 
   private registerAll(): void {
+    // 시세(GSC/GSH) 등록 — tr_type="3", 종목별 tr_key(18자리 패딩)
     for (const s of this.subs) {
       const trKey = buildWsTrKey(s.exchcd, s.symbol);
       for (const tr of ['GSC', 'GSH'] as const) {
-        this.ws?.send(JSON.stringify(buildRegisterMessage(this.token, tr, trKey)));
+        this.ws?.send(JSON.stringify(buildRegisterMessage(this.token, tr, trKey, '3')));
+      }
+    }
+    // 계좌 주문이벤트(AS0~AS4) 등록 — tr_type="1", tr_key="" (재연결 시에도 자동 재등록)
+    if (this.accountEvents) {
+      for (const tr of LS_ACCOUNT_EVENT_TRS) {
+        this.ws?.send(JSON.stringify(buildRegisterMessage(this.token, tr, '', '1')));
       }
     }
   }
@@ -345,11 +363,19 @@ export class LSUSRealtimeClient {
     let msg: any;
     try { msg = typeof data === 'string' ? JSON.parse(data) : JSON.parse(String(data)); }
     catch { return; }
-    const trCd = msg?.header?.tr_cd;
+    const trCd = String(msg?.header?.tr_cd ?? '');
     if (trCd === 'PINGPONG') { this.ws?.send(JSON.stringify(msg)); return; }   // heartbeat echo
+    // 등록 성공/실패 응답(헤더에 rsp_cd/rsp_msg) — 데이터가 아닌 ack
+    if (msg?.header?.rsp_cd !== undefined || msg?.header?.rsp_msg !== undefined) {
+      const rspCd = String(msg.header.rsp_cd ?? ''); const rspMsg = String(msg.header.rsp_msg ?? '');
+      this.hooks.onStatus?.(`등록응답 tr_cd=${trCd} rsp_cd=${rspCd} rsp_msg=${rspMsg}`);
+      if ((LS_ACCOUNT_EVENT_TRS as readonly string[]).includes(trCd)) this.hooks.onRegisterAck?.(trCd, rspCd, rspMsg);
+      return;
+    }
     if (!msg?.body) return;
     if (trCd === 'GSC') this.hooks.onGSC?.(parseGSC(msg.body));
     else if (trCd === 'GSH') this.hooks.onGSH?.(parseGSH(msg.body));
+    else if ((LS_ACCOUNT_EVENT_TRS as readonly string[]).includes(trCd)) this.hooks.onAccountEvent?.(trCd, msg.body);   // AS0~AS4
   }
 
   private startStaleWatch(): void {

@@ -17,6 +17,7 @@ import {
 } from './ls-us-websocket';
 import { CandleStore, type StoredCandle } from './candle-store';
 import { OrderStore } from './order-store';
+import { parseAccountEvent, applyOrderEvent } from './order-events';
 import { evaluateTradeGate, canExecuteLive, etDateStr, isUSRegularSession, type GateState } from './trade-gate';
 import { executeBuyOrder, reconcilePending, type TraderDeps } from './trader';
 import { loadLiveConfig, isLiveSymbol, type LiveConfig } from './live-config';
@@ -147,8 +148,27 @@ async function main() {
     }
   }
 
-  // ── WebSocket 연결 ──
+  // ── 계좌 주문이벤트(AS0~AS4) 추적 저장 — 계좌 단위(전 종목). 재시작 시 원주문번호 기준 복원 ──
+  const evStore = new OrderStore('__account_events__');
+  evStore.load();
+  const tracker = evStore.trackedMap();
+  if (evStore.corrupt) log.error('[ACCT] 주문이벤트 저장 파일 손상 → 상태추적 복원 실패, 새로 시작');
+  else if (tracker.size) log.info(`[ACCT] 주문상태 ${tracker.size}건 복원(원주문번호 기준)`);
+
+  // ── WebSocket 연결 (시세 GSC/GSH + 계좌 AS0~AS4) ──
   const client = new LSUSRealtimeClient(token, {
+    // 계좌 주문이벤트: 상태머신 반영 + 영구저장(민감정보 미저장/미출력). ⚠️ AS3 는 취소 결과 확인 이벤트일 뿐,
+    // 취소 "요청"이 아니다. LIVE 취소 완료는 REST 취소 성공 + AS3 둘 다 필요(현재 REST 취소 미구현).
+    onAccountEvent: (trCd, body) => {
+      const ev = parseAccountEvent(trCd, body);
+      if (!ev) return;
+      const res = applyOrderEvent(tracker, ev, Date.now());
+      evStore.saveTracked(tracker);
+      evStore.recordResponse({ atMs: Date.now(), tr: trCd, rspCd: (ev as any).rejectReason || '', rspMsg: res.changed ? res.transition : `무시:${res.reason}`, ordNo: ev.ordNo || null, note: res.order?.status });
+      evStore.flush();
+      log.info(`[ACCT ${trCd}] ordNo=${ev.ordNo || '-'} org=${ev.orgOrdNo || '-'} ${res.changed ? res.transition : `무시(${res.reason})`} status=${res.order?.status ?? '-'}${trCd === 'AS3' ? ' (취소 결과확인 이벤트 · REST 취소요청 아님)' : ''}`);
+    },
+    onRegisterAck: (trCd, rspCd, rspMsg) => log.info(`[ACCT-REG] ${trCd} 등록응답 rsp_cd=${rspCd} rsp_msg=${scrub(rspMsg)}`),
     onGSC: (t) => {
       const ctx = ctxs.get(t.symbol);
       if (!ctx) return;
@@ -174,7 +194,7 @@ async function main() {
       log.info(`[GSH ${q.symbol}] bid=${q.bestBid}(${q.bidRem}) ask=${q.bestAsk}(${q.askRem})`);
     },
     onStatus: (m) => log.info(`[WS] ${scrub(m)}`),
-  });
+  }, { accountEvents: true });   // AS0~AS4 계좌 이벤트 등록(tr_type=1) — 재연결 시 자동 재등록
   client.connect(us.ok.map(s => ({ exchcd: s.exchcd, symbol: s.symbol })));
 
   // ── Phase 3A 실전 설정(1종목/1주/지정가/하루 1회) + ARMED 감시 ──

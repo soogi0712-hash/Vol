@@ -145,6 +145,30 @@ Phase 3A 완성을 위해 취소 TR 을 구현하려 했으나, **공식 필드�
 단위테스트로 검증**했습니다(`test/trader.test.ts`). 공식 `COSAT00311` 스펙(요청 InBlock 필드,
 원주문번호 필드명, 정정/취소 구분값, 응답 필드)을 주시면 즉시 실함수로 교체하고 상수를 켭니다.
 
+### 계좌 WebSocket 주문 이벤트 추적 (AS0~AS4)
+
+기존 시세 WebSocket 연결에서 **계좌 주문 이벤트**도 등록해 주문 상태를 실시간 통보받습니다.
+
+- 등록: `{header:{token, tr_type:"1"}, body:{tr_cd:"AS0"|"AS1"|"AS2"|"AS3"|"AS4", tr_key:""}}`.
+  `tr_type` — **1=계좌등록**, 2=계좌해제, 3=시세등록, 4=시세해제. GSC/GSH 는 `"3"` 유지, AS0~AS4 는 `"1"`.
+  재연결 시 GSC/GSH + AS0~AS4 **모두 자동 재등록**.
+- **AS0 접수** → `ACCEPTED` (sOrdNo/sOrgOrdNo/sOrdMktCode/sOrdPtnCode/sShtnIsuNo/sOrdQty/sOrdPrc/sUnercQty/sRjtRsn)
+- **AS1 체결** → `sUnercQty>0` 이면 `PARTIALLY_FILLED`, `==0` 이면 `FILLED`. 누적 체결수량·평균가 저장.
+  동일 `sExecNO`/`sAbrdExecId` 중복 이벤트 무시. FILLED 확인 전 체결 완료 처리 안 함.
+- **AS2 정정** → `MODIFIED` (확인 이벤트로만 처리, REST 정정 요청은 구현/호출 안 함)
+- **AS3 취소** → `sOrgOrdNo` 로 원주문을 찾아, 취소확인수량>0 & 거부사유 없음일 때만
+  `CANCELLED`(부분체결 후면 `PARTIALLY_FILLED_CANCELLED`). 중복 AS3 는 idempotent 무시.
+- **AS4 거부** → `REJECTED` (주문번호·원주문번호·거부사유 저장, 확인된 공통 필드만)
+- 상태 전이: `CREATED→SUBMITTED→ACCEPTED→PARTIALLY_FILLED/FILLED→MODIFIED→CANCELLED/PARTIALLY_FILLED_CANCELLED→REJECTED`.
+  **역방향 전이는 차단**합니다. 상태는 원주문번호 기준으로 디스크 저장 → 재시작 복원.
+- 보안: 계좌번호 전체 미출력, 앱키/시크릿/토큰 마스킹, 저장 시 민감정보 미포함(파싱된 안전 필드만).
+
+> ⚠️ **AS0~AS4 는 주문·정정·취소를 "실행"하는 API 가 아니라 상태 통보 이벤트입니다.**
+> 특히 **AS3 는 취소 "결과 확인" 이벤트**이지 취소 "요청" 이 아닙니다. 따라서 AS3 수신만으로
+> 취소 기능이 구현됐다고 판단하지 않습니다. LIVE 취소 완료는 **REST 취소(COSAT00311) 성공 AND
+> 해당 원주문번호 AS3 수신** 두 조건을 모두 만족해야 하며(`isCancelComplete`), REST 취소가
+> 미구현(공식 필드 미확인)이므로 `LS_CANCEL_TR_CONFIRMED=false` 와 실주문 하드 차단을 유지합니다.
+
 ### Phase 3A 오늘 실전 제한(코드로 강제)
 
 `LS_US_LIVE_SYMBOL`(기본 NASDAQ:AAPL) 1종목 · `LS_US_MAX_QTY=1`(상한 강제) · 지정가만 ·

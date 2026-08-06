@@ -126,7 +126,7 @@ describe('LSUSRealtimeClient (fake socket)', () => {
     const client = new LSUSRealtimeClient('TOK', {}, { wsFactory: () => ws });
     client.connect([{ exchcd: '82', symbol: 'AAPL' }]);
     ws.onopen?.();
-    expect(ws.sent).toHaveLength(2);   // GSC + GSH
+    expect(ws.sent).toHaveLength(2);   // GSC + GSH (계좌이벤트 옵션 off)
     const regs = ws.sent.map((s) => JSON.parse(s));
     expect(regs.map(r => r.body.tr_cd).sort()).toEqual(['GSC', 'GSH']);
     for (const r of regs) {
@@ -134,6 +134,42 @@ describe('LSUSRealtimeClient (fake socket)', () => {
       expect(r.body.tr_key.length).toBe(18);
       expect(r.body.tr_key.startsWith('82AAPL')).toBe(true);
     }
+  });
+  it('accountEvents=true → GSC/GSH(tr_type=3) + AS0~AS4(tr_type=1, tr_key="") 등록', () => {
+    const ws = fakeWs();
+    const client = new LSUSRealtimeClient('TOK', {}, { wsFactory: () => ws, accountEvents: true });
+    client.connect([{ exchcd: '82', symbol: 'AAPL' }]);
+    ws.onopen?.();
+    const regs = ws.sent.map((s) => JSON.parse(s));
+    const acct = regs.filter(r => r.header.tr_type === '1');
+    expect(acct.map(r => r.body.tr_cd).sort()).toEqual(['AS0', 'AS1', 'AS2', 'AS3', 'AS4']);
+    for (const r of acct) { expect(r.body.tr_key).toBe(''); expect(r.header.tr_type).toBe('1'); }
+    // 시세는 여전히 tr_type=3
+    expect(regs.filter(r => r.header.tr_type === '3').map(r => r.body.tr_cd).sort()).toEqual(['GSC', 'GSH']);
+  });
+  it('AS 이벤트 라우팅 + 등록응답(ack) 콜백', () => {
+    const ws = fakeWs();
+    const events: any[] = []; const acks: any[] = [];
+    const client = new LSUSRealtimeClient('TOK', { onAccountEvent: (tr, b) => events.push({ tr, b }), onRegisterAck: (tr, c, m) => acks.push({ tr, c, m }) }, { wsFactory: () => ws, accountEvents: true });
+    client.connect([{ exchcd: '82', symbol: 'AAPL' }]);
+    ws.onopen?.();
+    ws.onmessage?.({ data: JSON.stringify({ header: { tr_cd: 'AS0', rsp_cd: '0', rsp_msg: '정상등록' }, body: null }) });   // 등록 ack
+    ws.onmessage?.({ data: JSON.stringify({ header: { tr_cd: 'AS1' }, body: { sOrdNo: '141', sExecQty: '1', sUnercQty: '0' } }) });   // 체결 데이터
+    expect(acks[0]).toMatchObject({ tr: 'AS0', c: '0' });
+    expect(events[0]).toMatchObject({ tr: 'AS1' });
+    expect(events[0].b.sOrdNo).toBe('141');
+  });
+  it('재연결 시 GSC/GSH + AS0~AS4 모두 자동 재등록', async () => {
+    const sockets: any[] = [];
+    const client = new LSUSRealtimeClient('TOK', {}, { wsFactory: () => { const w = fakeWs(); sockets.push(w); return w; }, accountEvents: true, backoffMs: [1], sleep: async () => {} });
+    client.connect([{ exchcd: '82', symbol: 'AAPL' }]);
+    sockets[0].onopen?.();
+    expect(sockets[0].sent).toHaveLength(7);   // GSC+GSH+AS0~4
+    sockets[0].onclose?.();
+    await new Promise(r => setTimeout(r, 5));
+    sockets[1].onopen?.();
+    expect(sockets[1].sent).toHaveLength(7);   // 재등록
+    client.close();
   });
   it('GSC/GSH 메시지 라우팅 + PINGPONG 에코', () => {
     const ws = fakeWs();
