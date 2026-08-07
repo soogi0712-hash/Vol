@@ -169,7 +169,7 @@ async function main() {
     if (!force && now - depAt < 60_000) return;
     try {
       const d = await getLSUSDeposit(cfg, token);
-      depOk = d.rspCd === '00000' && d.found; depCash = d.usdDeposit; depRspCd = d.rspCd; depRspMsg = d.rspMsg;
+      depOk = d.ok; depCash = d.usdDeposit; depRspCd = d.rspCd; depRspMsg = d.rspMsg;   // ok = 성공코드(00000/00136) + 금액필드
     } catch (e) {
       depOk = false; depCash = 0;
       if (e instanceof LSApiError) { depRspCd = e.rspCd ?? `ERR(${e.kind})`; depRspMsg = e.message; }
@@ -251,7 +251,7 @@ async function main() {
     cancel: (pp) => cancelLSUSOrder(cfg, token, pp),
     // 현금(USD 예수금) 주문가능금액 — 신용/미수/증거금 미사용(cash-only). 부족하면 전송 금지.
     cashOrderable: async () => {
-      try { const d = await getLSUSDeposit(cfg, token); return { ok: d.rspCd === '00000' && d.found, cash: d.usdDeposit }; }
+      try { const d = await getLSUSDeposit(cfg, token); return { ok: d.ok, cash: d.usdDeposit }; }
       catch (e) { log.warn(`[US] 현금 주문가능금액 조회 실패: ${scrub(String(e))}`); return { ok: false, cash: 0 }; }
     },
     now: () => Date.now(),

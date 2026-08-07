@@ -484,7 +484,7 @@ describe('해외 주문/체결/예수금 (공식 필드)', () => {
     expect(r.rows[0]).toMatchObject({ ordNo: '141', symbol: 'TSLA', ordQty: 10, execQty: 4, unfilledQty: 6, ordPtnCode: '02' });
   });
 
-  it('COSOQ02701 USD 예수금 조회 — USD 행의 PrsmptFcurrDps1', async () => {
+  it('COSOQ02701 USD 예수금 조회(rsp_cd=00000) — ok=true, PrsmptFcurrDps1 파싱', async () => {
     stubFetch((url, init) => {
       expect(init.headers['tr_cd']).toBe('COSOQ02701');
       return { json: { rsp_cd: '00000', COSOQ02701OutBlock2: [
@@ -493,8 +493,33 @@ describe('해외 주문/체결/예수금 (공식 필드)', () => {
       ] } };
     });
     const r = await getLSUSDeposit(cfg, 'T');
+    expect(r.ok).toBe(true);
     expect(r.found).toBe(true);
     expect(r.usdDeposit).toBeCloseTo(3300.5);
+  });
+  it('P0-14: rsp_cd=00136(조회 완료) + 금액 존재 → ok=true (실계정 사고 수정)', async () => {
+    stubFetch(() => ({ json: { rsp_cd: '00136', rsp_msg: '조회가 완료되었습니다.', COSOQ02701OutBlock2: [
+      { CrcyCode: 'USD', PrsmptFcurrDps1: '5234.1500' },
+    ] } }));
+    const r = await getLSUSDeposit(cfg, 'T');
+    expect(r.ok).toBe(true);                 // 00136 도 정상(allow-list)
+    expect(r.rspCd).toBe('00136');
+    expect(r.usdDeposit).toBeCloseTo(5234.15);
+  });
+  it('P0-14: rsp_cd=00136 + OutBlock 없음 → ok=false(차단)', async () => {
+    stubFetch(() => ({ json: { rsp_cd: '00136', rsp_msg: '조회가 완료되었습니다.' } }));
+    const r = await getLSUSDeposit(cfg, 'T');
+    expect(r.ok).toBe(false);                // 금액필드 없음 → 차단
+    expect(r.usdDeposit).toBe(0);
+  });
+  it('P0-14: rsp_cd=00136 + USD 행에 금액필드 없음 → ok=false', async () => {
+    stubFetch(() => ({ json: { rsp_cd: '00136', COSOQ02701OutBlock2: [{ CrcyCode: 'USD' }] } }));
+    const r = await getLSUSDeposit(cfg, 'T');
+    expect(r.ok).toBe(false);
+  });
+  it('P0-14: 기타 코드(성공목록 아님) → lsPost throw → failure', async () => {
+    stubFetch(() => ({ json: { rsp_cd: 'IZAA999', rsp_msg: '오류', COSOQ02701OutBlock2: [{ CrcyCode: 'USD', PrsmptFcurrDps1: '100' }] } }));
+    await expect(getLSUSDeposit(cfg, 'T')).rejects.toThrow();
   });
 
   it('cancelLSUSOrder — 공식 취소 필드 미확인 → 예외(추측 금지)', async () => {

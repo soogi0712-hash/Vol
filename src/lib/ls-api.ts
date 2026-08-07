@@ -87,6 +87,8 @@ function lsHeaders(token: string, trCd: string, trCont = 'N', trContKey = ''): R
 export const LS_SUCCESS_CODES: Record<string, string[]> = {
   CSPAQ12200: ['00000', '00136'],
   COSOQ00201: ['00000', '02679'],
+  COSOQ02701: ['00000', '00136'],   // 해외 예수금 — 00136 "조회가 완료되었습니다."(실계정 확인) = 정상
+
   CSPAT00601: ['00000', '00040'],   // 현물주문 — 00040 "매수 주문이 완료되었습니다."(실계정 확인) = 정상
   CSPAT00801: ['00000', '00156'],   // 현물취소주문 — 00156(취소 접수) 도 정상(공식 resExample)
   COSAT00301: ['00000'],            // 미국시장주문 — 공식 확인 성공코드(00000). 그 외 코드+OrdNo 는 아래 isUSOrderSuccess 로 판정
@@ -603,14 +605,23 @@ export async function queryLSUSOrderExec(
 // InBlock1(공식): RecCnt/CrcyCode. OutBlock2(통화별 리스트): CrcyCode/PrsmptFcurrDps1(추정 외화예수금) 등.
 // ⚠️ '주문가능금액' 정확한 필드는 공식 문서에 단일 확정값이 없어 PrsmptFcurrDps1(추정 예수금)을 사용한다.
 //     실주문 전 사용자 검증 필요(README 참고).
-export interface LSUSDeposit { rspCd: string; rspMsg: string; usdDeposit: number; found: boolean; diag: LSHttpDiag; }
+// ok = 성공코드(00000/00136, allow-list 기준) AND USD 행에 금액필드(PrsmptFcurrDps1) 존재.
+//   OutBlock 없음/USD 행 없음/금액필드 없음 → ok=false(INVALID_RESPONSE 성격, LIVE 차단). 메시지 문자열로 판정하지 않는다.
+export interface LSUSDeposit { ok: boolean; rspCd: string; rspMsg: string; usdDeposit: number; found: boolean; diag: LSHttpDiag; }
 export async function getLSUSDeposit(cfg: LSConfig, token: string): Promise<LSUSDeposit> {
   const { data, rspCd, rspMsg, diag } = await lsPost(token, '/overseas-stock/accno', 'COSOQ02701', {
     COSOQ02701InBlock1: { RecCnt: 1, CrcyCode: 'ALL' },
   });
+  const codeOk = (LS_SUCCESS_CODES.COSOQ02701 ?? ['00000']).includes(rspCd);   // rsp_cd allow-list 기준(00136 포함)
   const rows: any[] = data.COSOQ02701OutBlock2 || [];
   const usd = rows.find(r => String(r.CrcyCode).toUpperCase() === 'USD');
-  return { rspCd, rspMsg, usdDeposit: usd ? toNum(usd.PrsmptFcurrDps1) : 0, found: !!usd, diag };
+  const hasAmount = !!usd && Object.prototype.hasOwnProperty.call(usd, 'PrsmptFcurrDps1');   // 금액필드 존재 여부
+  return {
+    ok: codeOk && hasAmount,   // 00136 이어도 OutBlock/금액필드 없으면 false(차단)
+    rspCd, rspMsg,
+    usdDeposit: hasAmount ? toNum(usd.PrsmptFcurrDps1) : 0,
+    found: !!usd, diag,
+  };
 }
 
 // ── 미체결 취소 (COSAT00311) — ⚠️ 공식 카탈로그에 필드(reqExample/InBlock) 미수록 ──
