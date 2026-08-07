@@ -10,7 +10,7 @@ import { makeScrubber } from './mask';
 import {
   getLSUS15MinPaged, getLSUSTicksPaged, getLSUSDeposit,
   placeLSUSBuyOrder, queryLSUSOrderExec, cancelLSUSOrder, LSApiError,
-  decideUSCashPayment, usCashOnlyUsdCap, usOrderableQty, LS_US_CROSS_WON_TR_CONFIRMED, type LSUSDeposit,
+  decideUSCashPayment, usCashOnlyUsdCap, usOrderableQty, formatCashOrderableLine, LS_US_CROSS_WON_TR_CONFIRMED, type LSUSDeposit,
 } from '../src/lib/ls-api';
 import {
   LSUSRealtimeClient, RealtimeCandleBuilder, buildWsTrKey, evaluateReadiness, MIN_RT_CANDLES,
@@ -309,20 +309,20 @@ async function main() {
     const pending = ctx.orders.hasPending();
     const buyPrice = ctx.bestAsk;   // 매수 지정가 = GSH ask
 
-    // ── cashOrderable 조회 (BUY 신호 + 확정봉≥20 이면 항상 조회해 금액/실패사유를 ARMED 로그에 출력, P0-12) ──
+    // ── cashOrderable (P0-17): 항상 STARTUP 예수금 캐시 사용. "미조회" 출력 금지. ──
+    //   · 비-BUY 틱: 60초 캐시 그대로 사용(만료 시에만 자동 재조회). BUY 신호(확정봉≥20): 직전 강제 재조회.
+    //   · ARMED 로그는 캐시 기준으로 cashOrderable=<금액> USD 또는 cashOrderable=조회실패 둘 중 하나만.
     let orderableQtyOk = false;
-    let cashLog = 'cashOrderable=미조회';
-    if (sig.action === 'BUY' && ctx.builder.confirmedCount >= MIN_RT_CANDLES) {
-      await refreshDeposit();
-      // P0-16 하드게이트: 실제 주문가(bestAsk≈311) 로 확정경로(USD현금)만 허용. 타통화+원화 경로는 실측확인 전 하드차단.
-      const g = usOrderAllowed(buyPrice);
-      orderableQtyOk = g.allowed;
-      const dec = g.dec;
-      cashLog = depOk && dec
-        ? `주문가=${buyPrice.toFixed(2)}USD 거래국가통화가능=${dec.qtyCountry} 타통화+원화가능(참고)=${dec.qtyCrossWon} crossWon확인=${liveCfg.crossWonVerified} mode=${dec.paymentMode} allowed=${orderableQtyOk}${orderableQtyOk ? '' : `:${g.reason}`} rsp_cd=${depRspCd}`
-        : `cashOrderable 조회실패 rsp_cd=${depRspCd} rsp_msg=${scrub(depRspMsg)}`;
-      logUSCashDiag('BUY-US-CASH', buyPrice);   // BUY 직전 재조회 진단(P0-16)
+    const isBuySignal = sig.action === 'BUY' && ctx.builder.confirmedCount >= MIN_RT_CANDLES;
+    if (isBuySignal) {
+      await refreshDeposit(true);          // BUY 직전 강제 재조회(P0-17 #4,#6)
+      orderableQtyOk = usOrderAllowed(buyPrice).allowed;   // 확정경로(USD현금)만 허용, 타통화+원화는 하드차단
+      logUSCashDiag('BUY-US-CASH', buyPrice);              // BUY 직전 상세 진단(P0-16)
+    } else {
+      await refreshDeposit();              // 60초 캐시 사용(만료 시에만 재조회) — 재조회 전엔 캐시 유지
     }
+    // 캐시 기준 cashLog — 성공이면 실제 금액, 실패면 rsp_cd/rsp_msg (절대 "미조회" 아님)
+    const cashLog = formatCashOrderableLine({ ok: depOk, cash: depCash, rspCd: depRspCd, rspMsg: scrub(depRspMsg) });
 
     const state: GateState = {
       confirmedCount: ctx.builder.confirmedCount, signalAction: sig.action, wsConnected: client.connected,

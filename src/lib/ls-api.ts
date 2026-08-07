@@ -710,6 +710,15 @@ export function decideUSCashPayment(dep: LSUSDeposit, priceUsd: number, qty: num
   return { ...base, paymentMode: 'NONE', orderAllowed: false, reason: 'ORDERABLE_QTY_INSUFFICIENT' };
 }
 
+// ── ARMED cashOrderable 한 줄 로그 (P0-17) — 항상 캐시 기준. "미조회" 는 절대 출력하지 않는다 ──
+// 성공(ok): `cashOrderable=<금액> USD (rsp_cd=...)`. 실패: `cashOrderable=조회실패 rsp_cd=... rsp_msg=...`.
+// rspMsg 는 호출측에서 마스킹(scrub) 후 넘긴다.
+export function formatCashOrderableLine(s: { ok: boolean; cash: number; rspCd: string; rspMsg: string }): string {
+  return s.ok
+    ? `cashOrderable=${s.cash.toFixed(2)} USD (rsp_cd=${s.rspCd})`
+    : `cashOrderable=조회실패 rsp_cd=${s.rspCd} rsp_msg=${s.rspMsg}`;
+}
+
 // ── 미체결 취소 (COSAT00311) — ⚠️ 공식 카탈로그에 필드(reqExample/InBlock) 미수록 ──
 // 추측 금지 원칙상 요청 필드를 임의로 만들지 않는다. 사용자가 공식 취소 TR 스펙을 제공하기 전까지
 // 이 함수는 호출 시 예외를 던지고, 실주문 게이트는 '취소 미확인'으로 LIVE 를 차단한다.

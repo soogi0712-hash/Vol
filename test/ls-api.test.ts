@@ -4,7 +4,7 @@ import {
   getLSKRPrice, getLSUSPrice, getLSKR15Min, getLSUS15Min, getLSUS15MinPaged,
   getLSUSTicks, getLSUSTicksPaged, lsOverseasChartRaw,
   placeLSUSBuyOrder, queryLSUSOrderExec, getLSUSDeposit, getLSUSHoldings, cancelLSUSOrder, LS_CANCEL_TR_CONFIRMED, isUSOrderSuccess,
-  decideUSCashPayment, usCashOnlyUsdCap, usOrderableQty, LS_US_CROSS_WON_TR_CONFIRMED, type LSUSDeposit,
+  decideUSCashPayment, usCashOnlyUsdCap, usOrderableQty, formatCashOrderableLine, LS_US_CROSS_WON_TR_CONFIRMED, type LSUSDeposit,
   placeLSKRBuyOrder, queryLSKROrderExec, cancelLSKRBuyOrder, krIsuNo, isKROrderSuccess,
   toLSOverseasExchcd, LSApiError, configureLSRateLimiter, classifyChart,
   LS_G3203_MAX_QRYCNT_UNCOMPRESSED,
@@ -613,6 +613,17 @@ describe('해외 주문/체결/예수금 (공식 필드)', () => {
     expect(usCashOnlyUsdCap(dep({ usdOrderable: 100, usdPrexchOrderable: 9245.88 }))).toBeCloseTo(100);
     expect(usCashOnlyUsdCap(dep({ usdOrderable: 100, usdPrexchOrderable: 9245.88 }), { crossWonVerified: true })).toBeCloseTo(100);  // 코드상수 봉인
     expect(usCashOnlyUsdCap(dep({ usdOrderable: 0, usdPrexchOrderable: 9245.88 }))).toBe(0);   // 실계정: USD현금 0 → 상한 0
+  });
+
+  it('P0-17 cashOrderable 로그: 성공/실패 두 형태만, "미조회" 절대 없음', () => {
+    expect(formatCashOrderableLine({ ok: true, cash: 97.29, rspCd: '00136', rspMsg: '' }))
+      .toBe('cashOrderable=97.29 USD (rsp_cd=00136)');
+    expect(formatCashOrderableLine({ ok: true, cash: 0, rspCd: '00136', rspMsg: '조회 완료' }))
+      .toBe('cashOrderable=0.00 USD (rsp_cd=00136)');
+    const fail = formatCashOrderableLine({ ok: false, cash: 0, rspCd: 'IZAA999', rspMsg: '오류' });
+    expect(fail).toBe('cashOrderable=조회실패 rsp_cd=IZAA999 rsp_msg=오류');
+    // "미조회" 는 어떤 경우에도 나오지 않는다
+    for (const ok of [true, false]) expect(formatCashOrderableLine({ ok, cash: 5, rspCd: 'X', rspMsg: 'Y' })).not.toContain('미조회');
   });
 
   it('cancelLSUSOrder — 공식 취소 필드 미확인 → 예외(추측 금지)', async () => {
