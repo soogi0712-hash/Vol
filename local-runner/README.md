@@ -40,36 +40,39 @@ npm run ls:diag
 
 성공 기준: `token_ok && kr_balance_ok && us_balance_ok` → 종료코드 0.
 
-## 3) Phase 2 — 시세·15분봉·관찰 신호 (주문 없음)
+## 3) 국내(KR) 자동매매 — 지속 실행 러너 (해외 없음)
 
 ```cmd
 npm run ls:trade
 ```
-동작: 지정 종목(`LS_KR_SYMBOLS`/`LS_US_SYMBOLS`)에 대해 LS 15분봉(국내 t8412 / 해외 g3203)을
-받아 **형성 중 봉을 제외한 확정봉 40개 이상**을 확보하고, 기존 엔진 BB(20,2)·RSI(14)·
-`getBBSignal`로 신호를 계산해 `[OBSERVE ...]` 로그를 남깁니다. **해외(US)는 관찰 전용**이며,
-**국내(KR)는 아래 LIVE 가능 구조**로 동작합니다(기본 `LS_LIVE_TRADING=false` → 주문 미실행).
+`ls:trade` 는 **국내(KR) 전용 지속 실행 러너**입니다. 해외(US) g3101/g3203 조회는 완전히 제거됐습니다.
+**Asia/Seoul 평일 09:00~15:30** 동안 계속 돌며(Ctrl+C 로 종료), 기존 엔진 BB(20,2)·RSI(14)·
+`getBBSignal`로 신호를 계산합니다(전략 조건 불변, 확정봉 40개 이상). 기본 `LS_LIVE_TRADING=false`
+→ 주문 API 미호출(`[KR-DRY-RUN]`), 파라미터만 검증합니다.
 
-#### 국내(KR) 실거래 구조 — CSPAT00601 지정가 매수
+**동작(1분 틱):**
 
-`ls:trade` 는 스케줄러로 주기 실행되는 1회성 러너입니다. 국내 종목마다:
+1. **재시작 복원**: 시작 시 `data/us-orders-KR_<종목>.json` 에서 미체결(pending)·주문번호를 로드.
+2. **미체결 재확인/취소**: pending 이 있으면 매 틱 `CSPAQ13700` 체결조회 →
+   전량체결이면 해소 / 부분·미체결이면 유지 / **`LS_KR_PENDING_TIMEOUT_SEC`(기본 120s) 경과 시
+   `CSPAT00801` 로 잔량 취소**(취소 접수 rsp_cd 00000/00156 확인 시에만 해소 → 다음 주문 허용).
+3. **미체결 존재 시 신규 주문 차단**(취소 확인 전 다음 주문 금지).
+4. 장중이면 **15분봉(t8412) 재조회 → 신호 재평가**. `signal=BUY` 이면 실제 주문 직전까지
+   **모든 파라미터 로그**: `[KR-ORDER-PARAMS] IsuNo=A005930 qty=1 price=.. BnsTpCode=2(매수)
+   OrdprcPtnCode=00(지정가) MgntrnCode=000 MbrNo=NXT · dup=.. dailyOver=.. live=.. candle=..`.
+5. **동일 15분봉 중복주문 금지**(확정봉 datetime 키), **하루 매수 최대 1회**, **maxQty=1**.
+6. 주문 API 호출은 `LS_LIVE_TRADING=true` **그리고** 국내장 시간일 때만. 성공 시 **주문번호 즉시 저장**
+   → `CSPAQ13700` 로 전량/부분체결 확인. 실패해도 **자동 재주문 없음**.
+7. 모든 주문/체결/취소 `rsp_cd`/`rsp_msg` 를 저장(order-store audit).
+8. **15:30 이후 신규 주문 금지**. `LS_KR_EXIT_AFTER_CLOSE=true` + 미체결 없음이면 종료, 아니면 대기.
+9. **SIGINT/SIGTERM** 정상 종료(저장 flush 후 exit).
 
-1. **재시작 복원**: `local-runner/data/us-orders-KR_<종목>.json` 에서 미체결(pending)·주문번호를 로드.
-2. **미체결 재확인**: pending 이 있으면 `CSPAQ13700` 체결조회로 전량체결이면 해소, 부분/미체결이면 유지.
-3. **미체결 존재 시 신규 주문 차단**(`[KR:...] 미체결 주문 존재 → 신규 주문 차단`).
-4. **BUY 신호** 이고 미체결 없음이면, 실제 주문 직전까지 **모든 파라미터를 로그**로 출력:
-   `[KR-ORDER-PARAMS] IsuNo=A005930 qty=1 price=.. BnsTpCode=2(매수) OrdprcPtnCode=00(지정가) MgntrnCode=000 MbrNo=NXT · session=.. dup=.. dailyOver=.. live=..`.
-5. 게이트: **국내장(09:00~15:30 KST) + 평일 + 동일봉 중복 아님 + 하루 매수 한도 이내 + 현재가 확보**.
-6. **주문 API 호출은 `LS_LIVE_TRADING=true` 일 때만**. false 면 `[KR-DRY-RUN] 주문 API 미호출`.
-7. 주문 성공 시 **주문번호 즉시 저장**(디스크) → `CSPAQ13700` 로 **전량/부분체결 확인**.
-8. 실패해도 **자동 재주문 없음**. 체결조회 실패/빈응답은 절대 체결완료로 오판하지 않습니다(pending 유지).
+공식 TR(필드 확인분): 매수 `CSPAT00601`(BnsTpCode=2, OrdprcPtnCode=00) → OrdNo · 체결조회
+`CSPAQ13700`(OutBlock2 BuyOrdQty/BuyExecQty) · 취소 `CSPAT00801`(OrgOrdNo/IsuNo/OrdQty, rsp_cd 00156=취소접수).
 
-공식 TR(필드 확인분): 매수 `CSPAT00601`(BnsTpCode=2, OrdprcPtnCode=00), 체결조회 `CSPAQ13700`
-(OutBlock2 집계 BuyOrdQty/BuyExecQty), 취소 `CSPAT00801`(OrgOrdNo/IsuNo/OrdQty).
-
-> ⚠️ `MbrNo`(회원/거래소 라우팅)는 공식 예제값 `"NXT"` 를 기본값으로 씁니다(`LS_KR_MBR_NO` 로 조정).
-> KRX 라우팅 등이 필요하면 실주문 전 `[KR-ORDER-PARAMS]` 로그로 값을 확인하세요.
-> 지정가는 현재가를 원 단위 정수로 반올림합니다 — **틱사이즈 준수는 실주문 전 확인**하세요.
+> ⚠️ `MbrNo`(회원/거래소 라우팅)는 공식 예제값 `"NXT"` 기본(`LS_KR_MBR_NO` 로 조정). KRX 라우팅이
+> 필요하면 실주문 전 `[KR-ORDER-PARAMS]` 로그로 확인하세요. 지정가는 현재가를 원 정수로 반올림하므로
+> **틱사이즈 준수는 실주문 전 확인**하세요. 스케줄러 예약 시 09:00 시작으로 등록하면 됩니다.
 
 - 거래소코드(exchcd)는 확인분만: **NASDAQ=82, NYSE=81**. 미확인 거래소(AMEX 등)는
   추측하지 않고 `UNSUPPORTED_EXCHANGE`로 로그 후 스킵합니다(공식 코드 확인 후 추가).

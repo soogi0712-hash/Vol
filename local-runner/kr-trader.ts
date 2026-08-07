@@ -9,9 +9,13 @@ import type { LSKROrderResult, LSKROrderExec } from '../src/lib/ls-api';
 export interface KRTraderDeps {
   place: (p: { shcode: string; qty: number; price: number; mbrNo?: string }) => Promise<LSKROrderResult>;
   queryExec: (p: { shcode: string; ordDate: string; bnsTpCode?: string }) => Promise<LSKROrderExec>;
+  cancel: (p: { orgOrdNo: string; shcode: string; qty: number }) => Promise<LSKROrderResult>;   // CSPAT00801
   now: () => number;
   log: (m: string) => void;
 }
+
+// CSPAT00801 취소 응답 성공(00000/00156=취소 접수) 판정.
+const isKRCancelAccepted = (rspCd: string) => rspCd === '00000' || rspCd === '00156';
 export interface KRBuyParams { orders: OrderStore; shcode: string; candleDatetime: string; qty: number; price: number; krDate: string; mbrNo?: string; dailyMaxBuys: number; }
 export type KRBuyStatus = 'placed-filled' | 'placed-partial' | 'placed-pending' | 'aborted';
 export interface KRBuyOutcome { status: KRBuyStatus; ordNo: string | null; execQty: number; reason: string; }
@@ -47,11 +51,12 @@ export async function executeKRBuyOrder(deps: KRTraderDeps, p: KRBuyParams): Pro
   return { status: 'placed-pending', ordNo, execQty: 0, reason: '미체결 → pending 유지(신규주문 차단)' };
 }
 
-export type KRReconcileStatus = 'filled' | 'partial' | 'pending' | 'query-failed';
+export type KRReconcileStatus = 'filled' | 'partial' | 'pending' | 'cancelled' | 'cancel-failed' | 'query-failed';
 export interface KRReconcileOutcome { ordNo: string; status: KRReconcileStatus; execQty: number; reason: string; }
 
-// 미체결 재확인 — 실행마다 체결조회. 전량체결이면 해소. 실패/빈응답은 pending 유지(오판 금지).
-export async function reconcileKRPending(deps: KRTraderDeps, p: { orders: OrderStore; shcode: string; krDate: string }): Promise<KRReconcileOutcome[]> {
+// 미체결 재확인 — 실행마다 체결조회. 전량체결이면 해소. timeoutMs 경과 & 미체결이면 CSPAT00801 취소.
+//   취소 접수(rsp_cd 00000/00156) 확인 시에만 해소(=다음 주문 허용, req11). 취소 실패/조회실패는 pending 유지(오판 금지).
+export async function reconcileKRPending(deps: KRTraderDeps, p: { orders: OrderStore; shcode: string; krDate: string; timeoutMs: number }): Promise<KRReconcileOutcome[]> {
   const out: KRReconcileOutcome[] = [];
   for (const po of p.orders.pending) {
     const ex = await deps.queryExec({ shcode: po.symbol, ordDate: p.krDate, bnsTpCode: '2' });
@@ -60,10 +65,27 @@ export async function reconcileKRPending(deps: KRTraderDeps, p: { orders: OrderS
     if (ex.buyExecQty >= po.qty) {
       p.orders.resolvePending(po.ordNo); p.orders.flush();
       out.push({ ordNo: po.ordNo, status: 'filled', execQty: ex.buyExecQty, reason: '전량 체결 → 해소' });
-    } else if (ex.buyExecQty > 0) {
-      out.push({ ordNo: po.ordNo, status: 'partial', execQty: ex.buyExecQty, reason: `부분체결 ${ex.buyExecQty}/${po.qty} → pending 유지` });
-    } else {
-      out.push({ ordNo: po.ordNo, status: 'pending', execQty: 0, reason: '미체결 → pending 유지' });
+      continue;
+    }
+    const ageMs = deps.now() - po.placedAtMs;
+    if (ageMs < p.timeoutMs) {
+      out.push({ ordNo: po.ordNo, status: ex.buyExecQty > 0 ? 'partial' : 'pending', execQty: ex.buyExecQty, reason: `${ex.buyExecQty > 0 ? `부분체결 ${ex.buyExecQty}/${po.qty}` : '미체결'} · ${Math.round(ageMs / 1000)}s(타임아웃 ${Math.round(p.timeoutMs / 1000)}s) → pending 유지` });
+      continue;
+    }
+    // 타임아웃 → 잔량 취소(CSPAT00801)
+    const remaining = Math.max(1, po.qty - ex.buyExecQty);
+    try {
+      const c = await deps.cancel({ orgOrdNo: po.ordNo, shcode: po.symbol, qty: remaining });
+      p.orders.recordResponse({ atMs: deps.now(), tr: 'CSPAT00801', rspCd: c.rspCd, rspMsg: c.rspMsg, ordNo: po.ordNo, note: '미체결 취소' });
+      if (isKRCancelAccepted(c.rspCd)) {
+        p.orders.resolvePending(po.ordNo); p.orders.flush();
+        out.push({ ordNo: po.ordNo, status: 'cancelled', execQty: ex.buyExecQty, reason: `취소 접수 rsp_cd=${c.rspCd} ${c.rspMsg} → 해소` });
+      } else {
+        p.orders.flush();
+        out.push({ ordNo: po.ordNo, status: 'cancel-failed', execQty: ex.buyExecQty, reason: `취소 거부 rsp_cd=${c.rspCd} ${c.rspMsg} → pending 유지(다음 주문 금지)` });
+      }
+    } catch (e) {
+      out.push({ ordNo: po.ordNo, status: 'cancel-failed', execQty: ex.buyExecQty, reason: `취소 실패(${e instanceof Error ? e.message : String(e)}) → pending 유지` });
     }
   }
   return out;
