@@ -10,7 +10,7 @@ import { loadConfig, getTokenCached, type LocalLSConfig } from './ls-client';
 import { loadKRSymbols } from './universe';
 import { makeScrubber } from './mask';
 import {
-  getLSKR15Min, getLSKRPrice, classifyChart,
+  getLSKR15Min, getLSKRPrice, classifyChart, getLSKRBalance,
   placeLSKRBuyOrder, queryLSKROrderExec, cancelLSKRBuyOrder, krIsuNo, LS_KR_BNS_BUY,
   LSApiError, type LSCandle, type LSHttpDiag,
 } from '../src/lib/ls-api';
@@ -104,6 +104,11 @@ async function main() {
     place: (p) => placeLSKRBuyOrder(acct, token, p),
     queryExec: (p) => queryLSKROrderExec(acct, token, p),
     cancel: (p) => cancelLSKRBuyOrder(acct, token, p),
+    // 현금 주문가능금액 = CSPAQ12200 MnyOrdAbleAmt(orderableCash). 신용/증거금은 사용하지 않는다(req6).
+    cashOrderable: async () => {
+      try { const b = await getLSKRBalance(acct, token); return { ok: true, cash: b.orderableCash }; }
+      catch (e) { log.warn(`[KR] 주문가능현금(MnyOrdAbleAmt) 조회 실패: ${scrub(String(e))}`); return { ok: false, cash: 0 }; }
+    },
     now: () => Date.now(),
     log: (m) => log.info(scrub(m)),
   };

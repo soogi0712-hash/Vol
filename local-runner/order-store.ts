@@ -67,6 +67,16 @@ export class OrderStore {
   hasOrderedCandle(candleDatetime: string, side: 'buy' | 'sell'): boolean {
     return this.body.orderedCandles.includes(this.key(candleDatetime, side));
   }
+  /**
+   * ⚠️ candle lock — 주문 "전송 직전"(응답 해석 전)에 호출해 같은 확정봉 추가 주문을 영구 차단한다.
+   * 전송 후 API/네트워크/파싱 오류가 나도 재주문되지 않도록 하는 핵심 안전장치. flush 로 즉시 디스크 반영.
+   */
+  lockCandle(candleDatetime: string, side: 'buy' | 'sell'): boolean {
+    const k = this.key(candleDatetime, side);
+    if (this.body.orderedCandles.includes(k)) return false;
+    this.body.orderedCandles.push(k);
+    return true;
+  }
   buyCountToday(etDate: string): number { return this.body.days[etDate]?.buy ?? 0; }
   sellCountToday(etDate: string): number { return this.body.days[etDate]?.sell ?? 0; }
   canBuyToday(etDate: string, max = MAX_BUY_PER_DAY): boolean { return this.buyCountToday(etDate) < max; }

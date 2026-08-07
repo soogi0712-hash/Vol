@@ -87,6 +87,7 @@ function lsHeaders(token: string, trCd: string, trCont = 'N', trContKey = ''): R
 export const LS_SUCCESS_CODES: Record<string, string[]> = {
   CSPAQ12200: ['00000', '00136'],
   COSOQ00201: ['00000', '02679'],
+  CSPAT00601: ['00000', '00040'],   // 현물주문 — 00040 "매수 주문이 완료되었습니다."(실계정 확인) = 정상
   CSPAT00801: ['00000', '00156'],   // 현물취소주문 — 00156(취소 접수) 도 정상(공식 resExample)
 };
 /** 정상이나 데이터가 없는(빈 결과) 코드 — 잔고 0 으로 처리한다. */
@@ -637,6 +638,12 @@ export function krIsuNo(shcode: string): string { return /^A/i.test(shcode) ? sh
 // BnsTpCode: 1=매도, 2=매수 (공식 reqExample 매수="2"). OrdprcPtnCode: 00=지정가.
 export const LS_KR_BNS_BUY = '2';
 export const LS_KR_BNS_SELL = '1';
+
+// CSPAT00601 주문 성공 판정 — 성공코드(00000/00040) 또는 주문번호(OrdNo) 존재. (실계정 00040 오탐 방지)
+export const KR_ORDER_SUCCESS_CODES = new Set(['00000', '00040']);
+export function isKROrderSuccess(rspCd: string, ordNo: string | null | undefined): boolean {
+  return (ordNo != null && ordNo !== '' && ordNo !== '(unknown)') || KR_ORDER_SUCCESS_CODES.has(rspCd);
+}
 
 // ── 현물 지정가 매수 (CSPAT00601, /stock/order) ──
 // InBlock1(공식): IsuNo/OrdQty/OrdPrc/BnsTpCode/OrdprcPtnCode/MgntrnCode/LoanDt/OrdCndiTpCode/MbrNo

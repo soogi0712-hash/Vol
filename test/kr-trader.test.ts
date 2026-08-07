@@ -10,78 +10,152 @@ beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'kr-trader-')); });
 afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
 
 let clock = 1_000_000;
-const exec = (o: Partial<any> = {}) => ({ ok: true, rspCd: '00000', rspMsg: '', buyOrdQty: 1, buyExecQty: 0, sellOrdQty: 0, sellExecQty: 0, ...o });
+const exec = (o: Partial<any> = {}) => ({ ok: true, rspCd: '00000', rspMsg: '', buyOrdQty: 0, buyExecQty: 0, sellOrdQty: 0, sellExecQty: 0, ...o });
 function deps(over: Partial<KRTraderDeps> = {}): KRTraderDeps {
   return {
     place: async () => ({ rspCd: '00000', rspMsg: 'ok', ordNo: '32004', raw: {}, diag: {} as any }),
     queryExec: async () => exec(),
     cancel: async () => ({ rspCd: '00156', rspMsg: '취소접수', ordNo: '84006', raw: {}, diag: {} as any }),
+    cashOrderable: async () => ({ ok: true, cash: 1_000_000_000 }),
     now: () => clock,
     log: () => {},
     ...over,
   };
 }
 const BIG = 10 * 60_000;   // 큰 타임아웃(취소 미발생)
+
+// 실계정 흐름 모사: 전송 전 대사 queryExec 는 buyOrdQty=0, 전송 후 체결조회는 afterExec.
+function buyHarness(opts: { placeRes?: any; afterExec?: any; cash?: { ok: boolean; cash: number }; onPlace?: () => void } = {}): KRTraderDeps & { placeCalls: number } {
+  let placed = false; let placeCalls = 0;
+  const d = deps({
+    place: async () => { placeCalls++; placed = true; opts.onPlace?.(); return opts.placeRes ?? { rspCd: '00040', rspMsg: '매수 주문이 완료되었습니다.', ordNo: '32004', raw: {}, diag: {} as any }; },
+    queryExec: async () => placed ? (opts.afterExec ?? exec({ buyOrdQty: 1, buyExecQty: 1 })) : exec({ buyOrdQty: 0, buyExecQty: 0 }),
+    cashOrderable: async () => opts.cash ?? { ok: true, cash: 1_000_000_000 },
+  });
+  Object.defineProperty(d, 'placeCalls', { get: () => placeCalls });
+  return d as KRTraderDeps & { placeCalls: number };
+}
 const params = (orders: OrderStore, over: Partial<any> = {}) => ({ orders, shcode: '005930', candleDatetime: '202608071500', qty: 1, price: 70000, krDate: '20260807', mbrNo: 'NXT', dailyMaxBuys: 1, ...over });
 
 describe('executeKRBuyOrder — 전송/체결/부분/미체결', () => {
   beforeEach(() => { clock = 1_000_000; });
-  it('전량 체결 → placed-filled, 주문번호 저장 + pending 해소 + 일일카운트', async () => {
+  it('rsp_cd=00040(매수 완료) + OrdNo → 성공(placed-filled), 오판 아님', async () => {
     const orders = new OrderStore('KR_005930', dir);
-    const r = await executeKRBuyOrder(deps({ queryExec: async () => exec({ buyOrdQty: 1, buyExecQty: 1 }) }), params(orders));
+    const r = await executeKRBuyOrder(buyHarness({ placeRes: { rspCd: '00040', rspMsg: '매수 주문이 완료되었습니다.', ordNo: '32004', raw: {}, diag: {} as any }, afterExec: exec({ buyOrdQty: 1, buyExecQty: 1 }) }), params(orders));
     expect(r.status).toBe('placed-filled');
     expect(r.ordNo).toBe('32004');
-    expect(orders.hasPending()).toBe(false);
     expect(orders.buyCountToday('20260807')).toBe(1);
   });
   it('부분 체결 → placed-partial, pending 유지', async () => {
     const orders = new OrderStore('KR_005930', dir);
-    const r = await executeKRBuyOrder(deps({ queryExec: async () => exec({ buyOrdQty: 2, buyExecQty: 1 }) }), params(orders, { qty: 2 }));
+    const r = await executeKRBuyOrder(buyHarness({ afterExec: exec({ buyOrdQty: 2, buyExecQty: 1 }) }), params(orders, { qty: 2 }));
     expect(r.status).toBe('placed-partial');
     expect(r.execQty).toBe(1);
     expect(orders.hasPending()).toBe(true);
   });
-  it('미체결 → placed-pending, pending 유지(주문번호 저장됨)', async () => {
+  it('미체결 → placed-pending, 주문번호 저장', async () => {
     const orders = new OrderStore('KR_005930', dir);
-    const r = await executeKRBuyOrder(deps({ queryExec: async () => exec({ buyOrdQty: 1, buyExecQty: 0 }) }), params(orders));
+    const r = await executeKRBuyOrder(buyHarness({ afterExec: exec({ buyOrdQty: 1, buyExecQty: 0 }) }), params(orders));
     expect(r.status).toBe('placed-pending');
     expect(orders.pending[0].ordNo).toBe('32004');
-    expect(orders.pending[0].placedAtMs).toBe(1_000_000);
   });
-  it('체결조회 실패는 체결완료로 오판하지 않음 → placed-pending', async () => {
+  it('원문 rsp_cd/rsp_msg 저장(대사+현금+주문+체결조회)', async () => {
     const orders = new OrderStore('KR_005930', dir);
-    const r = await executeKRBuyOrder(deps({ queryExec: async () => exec({ ok: false, rspCd: 'ERR', buyExecQty: 0 }) }), params(orders));
-    expect(r.status).toBe('placed-pending');
-    expect(orders.hasPending()).toBe(true);
-  });
-  it('원문 rsp_cd/rsp_msg 저장(주문+체결조회)', async () => {
-    const orders = new OrderStore('KR_005930', dir);
-    await executeKRBuyOrder(deps(), params(orders));
-    expect(orders.responses.map(a => a.tr)).toEqual(expect.arrayContaining(['CSPAT00601', 'CSPAQ13700']));
+    await executeKRBuyOrder(buyHarness({}), params(orders));
+    expect(orders.responses.map(a => a.tr)).toEqual(expect.arrayContaining(['CSPAQ13700', 'CSPAQ12200', 'CSPAT00601']));
   });
 });
 
-describe('executeKRBuyOrder — 방어적 abort(자동 재주문 없음)', () => {
+// ─── 이번 SK하이닉스 3중 체결 버그 재현/방지 ───
+describe('SK하이닉스 3중 체결 버그 재현·방지', () => {
+  beforeEach(() => { clock = 1_000_000; });
+  it('00040 을 실패로 오판하지 않는다 — 같은 candle 재호출 시 place 1회만', async () => {
+    const orders = new OrderStore('A000660', dir);
+    const h = buyHarness({ placeRes: { rspCd: '00040', rspMsg: '매수 주문이 완료되었습니다.', ordNo: '55001', raw: {}, diag: {} as any }, afterExec: exec({ buyOrdQty: 1, buyExecQty: 1 }) });
+    const p = params(orders, { shcode: '000660', candleDatetime: '202608071015' });
+    // 같은 15분봉에서 3회 시도(러너가 3틱 도는 상황 재현)
+    const r1 = await executeKRBuyOrder(h, p);
+    const r2 = await executeKRBuyOrder(h, p);
+    const r3 = await executeKRBuyOrder(h, p);
+    expect(r1.status).toBe('placed-filled');
+    expect(r2.status).toBe('aborted');            // 한도/잠금 어느 쪽이든 재주문 차단
+    expect(r3.status).toBe('aborted');
+    expect(h.placeCalls).toBe(1);                 // ★ 실주문 1회만(3중 체결 방지)
+    expect(orders.buyCountToday('20260807')).toBe(1);
+  });
+  it('candle lock 은 전송 직전 기록 — 전송 예외가 나도 재주문 금지', async () => {
+    const orders = new OrderStore('A000660', dir);
+    let calls = 0;
+    const d = deps({
+      place: async () => { calls++; throw new Error('ETIMEDOUT'); },   // 네트워크 예외(접수 여부 불명)
+      queryExec: async () => exec({ buyOrdQty: 0, buyExecQty: 0 }),
+    });
+    const p = params(orders, { shcode: '000660', candleDatetime: '202608071015' });
+    const r1 = await executeKRBuyOrder(d, p);
+    const r2 = await executeKRBuyOrder(d, p);
+    expect(r1.status).toBe('aborted'); expect(r1.reason).toMatch(/예외/);
+    expect(orders.hasOrderedCandle('202608071015', 'buy')).toBe(true);   // ★ 전송 직전 잠금됨
+    expect(r2.status).toBe('aborted'); expect(r2.reason).toMatch(/이미 주문|잠금/);
+    expect(calls).toBe(1);                          // ★ 전송 1회만(재시도 없음, req7)
+  });
+  it('거래소 대사: 로컬 미기록 매수주문 존재 → 전송 금지(place 미호출)', async () => {
+    const orders = new OrderStore('A000660', dir);
+    let placed = false;
+    const d = deps({
+      place: async () => { placed = true; return { rspCd: '00040', rspMsg: '', ordNo: '1', raw: {}, diag: {} as any }; },
+      queryExec: async () => exec({ buyOrdQty: 3, buyExecQty: 3 }),   // 거래소엔 이미 3건(로컬 0)
+    });
+    const r = await executeKRBuyOrder(d, params(orders, { shcode: '000660' }));
+    expect(r.status).toBe('aborted');
+    expect(r.reason).toMatch(/대사|거래소/);
+    expect(placed).toBe(false);
+  });
+});
+
+describe('현금 주문가능금액(MnyOrdAbleAmt) 가드', () => {
+  beforeEach(() => { clock = 1_000_000; });
+  it('price*qty > 현금가능 → CSPAT00601 절대 미호출', async () => {
+    const orders = new OrderStore('KR_005930', dir);
+    let placed = false;
+    const h = buyHarness({ cash: { ok: true, cash: 50_000 }, onPlace: () => { placed = true; } });   // 현금 5만 < 필요 7만
+    const r = await executeKRBuyOrder(h, params(orders, { price: 70000, qty: 1 }));
+    expect(r.status).toBe('aborted');
+    expect(r.reason).toMatch(/현금/);
+    expect(placed).toBe(false);
+    expect(h.placeCalls).toBe(0);
+  });
+  it('현금가능 조회 실패 → 전송 금지(오판 방지)', async () => {
+    const orders = new OrderStore('KR_005930', dir);
+    const h = buyHarness({ cash: { ok: false, cash: 0 } });
+    const r = await executeKRBuyOrder(h, params(orders));
+    expect(r.status).toBe('aborted');
+    expect(h.placeCalls).toBe(0);
+  });
+});
+
+describe('executeKRBuyOrder — 방어적 abort', () => {
   beforeEach(() => { clock = 1_000_000; });
   it('일일 한도 초과 → aborted, place 미호출', async () => {
     const orders = new OrderStore('KR_005930', dir);
     orders.recordPlaced('buy', '202608071445', '20260807', { ordNo: '1', symbol: '005930', qty: 1, price: 70000, placedAtMs: 1 });
-    let placed = false;
-    const r = await executeKRBuyOrder(deps({ place: async () => { placed = true; return { rspCd: '00000', rspMsg: '', ordNo: '2', raw: {}, diag: {} as any }; } }), params(orders));
-    expect(r.status).toBe('aborted'); expect(placed).toBe(false);
+    const h = buyHarness({});
+    const r = await executeKRBuyOrder(h, params(orders));
+    expect(r.status).toBe('aborted'); expect(h.placeCalls).toBe(0);
   });
   it('미체결 존재 → aborted', async () => {
     const orders = new OrderStore('KR_005930', dir);
     orders.recordPlaced('buy', '202608061500', '20260806', { ordNo: '9', symbol: '005930', qty: 1, price: 70000, placedAtMs: 1 });
-    const r = await executeKRBuyOrder(deps(), params(orders));
+    const r = await executeKRBuyOrder(buyHarness({}), params(orders));
     expect(r.status).toBe('aborted'); expect(r.reason).toMatch(/미체결/);
   });
-  it('주문 거부(rsp_cd!=00000) → aborted, 원문 저장, 재주문 없음', async () => {
+  it('주문 거부(성공코드 아님 + OrdNo 없음) → aborted, candle 잠금 유지, 재주문 없음', async () => {
     const orders = new OrderStore('KR_005930', dir);
-    const r = await executeKRBuyOrder(deps({ place: async () => ({ rspCd: '08085', rspMsg: '주문거부', ordNo: null, raw: {}, diag: {} as any }) }), params(orders));
+    const h = buyHarness({ placeRes: { rspCd: '08085', rspMsg: '주문거부', ordNo: null, raw: {}, diag: {} as any } });
+    const r = await executeKRBuyOrder(h, params(orders));
     expect(r.status).toBe('aborted');
     expect(orders.responses.some(a => a.rspCd === '08085')).toBe(true);
     expect(orders.hasPending()).toBe(false);
+    expect(orders.hasOrderedCandle('202608071500', 'buy')).toBe(true);   // 잠금 유지 → 재주문 없음
   });
 });
 

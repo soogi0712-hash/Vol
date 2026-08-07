@@ -4,7 +4,7 @@ import {
   getLSKRPrice, getLSUSPrice, getLSKR15Min, getLSUS15Min, getLSUS15MinPaged,
   getLSUSTicks, getLSUSTicksPaged, lsOverseasChartRaw,
   placeLSUSBuyOrder, queryLSUSOrderExec, getLSUSDeposit, getLSUSHoldings, cancelLSUSOrder, LS_CANCEL_TR_CONFIRMED,
-  placeLSKRBuyOrder, queryLSKROrderExec, cancelLSKRBuyOrder, krIsuNo,
+  placeLSKRBuyOrder, queryLSKROrderExec, cancelLSKRBuyOrder, krIsuNo, isKROrderSuccess,
   toLSOverseasExchcd, LSApiError, configureLSRateLimiter, classifyChart,
   LS_G3203_MAX_QRYCNT_UNCOMPRESSED,
 } from '../src/lib/ls-api';
@@ -528,6 +528,19 @@ describe('국내 현물 주문/체결/취소 (공식 필드)', () => {
     expect(sent).toMatchObject({ IsuNo: 'A005930', OrdQty: 1, OrdPrc: 70000, BnsTpCode: '2', OrdprcPtnCode: '00', MgntrnCode: '000', LoanDt: '', OrdCndiTpCode: '0', MbrNo: 'NXT' });
     expect(r.rspCd).toBe('00000');
     expect(r.ordNo).toBe('32004');
+  });
+  it('isKROrderSuccess — 00040(매수 완료) 또는 OrdNo 존재 시 성공(실계정 오탐 방지)', () => {
+    expect(isKROrderSuccess('00000', null)).toBe(true);
+    expect(isKROrderSuccess('00040', null)).toBe(true);       // 매수 주문이 완료되었습니다.
+    expect(isKROrderSuccess('99999', '32004')).toBe(true);    // 코드 몰라도 OrdNo 있으면 성공
+    expect(isKROrderSuccess('08085', null)).toBe(false);      // 거부
+    expect(isKROrderSuccess('99999', '(unknown)')).toBe(false);
+  });
+  it('CSPAT00601 rsp_cd=00040 은 lsPost 에서 throw 되지 않고 OrdNo 반환(핵심 버그 수정)', async () => {
+    stubFetch(() => ({ json: { rsp_cd: '00040', rsp_msg: '매수 주문이 완료되었습니다.', CSPAT00601OutBlock2: { OrdNo: 32004 } } }));
+    const r = await placeLSKRBuyOrder(cfg, 'T', { shcode: '000660', qty: 1, price: 190000 });
+    expect(r.rspCd).toBe('00040');
+    expect(r.ordNo).toBe('32004');   // 실패로 오판하지 않음
   });
   it('CSPAQ13700 체결조회 — OutBlock2 집계(BuyOrdQty/BuyExecQty)', async () => {
     stubFetch((url, init) => {
