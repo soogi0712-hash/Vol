@@ -259,6 +259,9 @@ REST 자동취소 TR(COSAT00311)은 공식 필드 미확인이라 **자동취소
 - **P0-4**: `LS_LIVE_TRADING=true` 라도 아래 전부여야 실제 POST — READY·confirmed≥20·signal=BUY·
   wsConnected·GSC fresh·GSH fresh·bid/ask/lastPrice>0·pending=0·하루 BUY<1·candle lock 없음·현금 충분.
 - **P0-5**: POST 직전 현금(USD) **재조회**, `price×qty > cashOrderable` 이면 POST 금지.
+- **P0-13**: **프로그램 시작 직후**(BUY 신호와 무관) AAPL `cashOrderable` 1회 조회 →
+  `[STARTUP-CASH] cashOrderable=5234.15 USD rsp_cd=00000` 출력. **조회 실패면 LIVE 금지**(liveCapable=false).
+  성공값은 메모리 캐시(60초), BUY 직전 executeBuyOrder 가 다시 재조회해 부족하면 POST 금지.
 - **P0-6~P0-9**: AAPL·qty1·하루1(추가매수/물타기 금지) · OrdNo 저장 + AS 연결 · 재시작 대사 완료 전 BUY 금지 ·
   같은 candle BUY 신호 **100회 반복돼도 실제 POST 1회**.
 

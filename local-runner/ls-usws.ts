@@ -161,12 +161,35 @@ async function main() {
   let liveCfg: LiveConfig;
   try { liveCfg = loadLiveConfig(); } catch (e) { log.error(String(e)); process.exit(1); return; }
   const armedMode = liveCfg.armed;
-  // 실행 능력(3중): armed=true 가정 시 LIVE_TRADING + 취소TR(코드상수 false) + env 취소확인 모두 필요
-  const liveCapable = canExecuteLive(true, liveCfg.liveTrading, { manualCancel: liveCfg.manualCancel, cancelEnvConfirmed: liveCfg.cancelConfirmed }).execute;
+
+  // ── 현금 주문가능액(USD 예수금) 조회 캐시 + refreshDeposit ── 계좌 단위 60초 캐시. rsp_cd/rsp_msg/금액 보존.
+  let depAt = 0; let depCash = 0; let depOk = false; let depRspCd = ''; let depRspMsg = '';
+  async function refreshDeposit(force = false): Promise<void> {
+    const now = Date.now();
+    if (!force && now - depAt < 60_000) return;
+    try {
+      const d = await getLSUSDeposit(cfg, token);
+      depOk = d.rspCd === '00000' && d.found; depCash = d.usdDeposit; depRspCd = d.rspCd; depRspMsg = d.rspMsg;
+    } catch (e) {
+      depOk = false; depCash = 0;
+      if (e instanceof LSApiError) { depRspCd = e.rspCd ?? `ERR(${e.kind})`; depRspMsg = e.message; }
+      else { depRspCd = 'EXCEPTION'; depRspMsg = String(e); }
+    }
+    depAt = now;
+  }
+
+  // ── P0-13: 프로그램 시작 직후 BUY 여부와 무관하게 AAPL cashOrderable 1회 조회 + 로그. 실패면 LIVE 금지 ──
+  await refreshDeposit(true);
+  if (depOk) log.info(`[STARTUP-CASH ${liveCfg.liveSymbol}] cashOrderable=${depCash.toFixed(2)} USD rsp_cd=${depRspCd}`);
+  else log.error(`[STARTUP-CASH ${liveCfg.liveSymbol}] cashOrderable 조회실패 rsp_cd=${depRspCd} rsp_msg=${scrub(depRspMsg)} → LIVE 금지`);
+  const startupCashOk = depOk;
+
+  // 실행 능력: armed 가정 시 LIVE_TRADING + 취소모드(수동 허용) + 시작시 현금조회 성공(P0-13) 모두 필요
+  const liveCapable = canExecuteLive(true, liveCfg.liveTrading, { manualCancel: liveCfg.manualCancel, cancelEnvConfirmed: liveCfg.cancelConfirmed }).execute && startupCashOk;
   // P0-10: 최종 체크리스트 출력
   const p0 = computeUSP0Checklist(liveCfg);
   log.info(`[P0-CHECKLIST]\n${formatUSP0Checklist(p0)}`);
-  log.info(`[P0] US_LIVE_READY=${p0.US_LIVE_READY} → 오늘 미국장 실전 ${p0.US_LIVE_READY ? '가능(단, LS_LIVE_TRADING=true 필요)' : '불가 — LS_LIVE_TRADING=false 유지'}`);
+  log.info(`[P0] US_LIVE_READY=${p0.US_LIVE_READY} · 시작현금조회=${startupCashOk} → 오늘 미국장 실전 ${p0.US_LIVE_READY && startupCashOk ? '가능(단, LS_LIVE_TRADING=true 필요)' : '불가/차단'}`);
   log.info(`[LIVE-CFG] 대상=${liveCfg.liveExchange}:${liveCfg.liveSymbol}(exchcd=${liveCfg.liveExchcd}) maxQty=${liveCfg.maxQty} 하루매수=${liveCfg.dailyMaxBuys} 하루매도=${liveCfg.dailyMaxSells} 미체결타임아웃=${liveCfg.pendingTimeoutSec}s`);
   log.info(`ARMED=${armedMode} · LS_LIVE_TRADING=${liveCfg.liveTrading} · 취소TR확인(env)=${liveCfg.cancelConfirmed}/(코드)=false → 실주문 ${liveCapable ? '가능' : '차단'}`);
 
@@ -234,22 +257,6 @@ async function main() {
     now: () => Date.now(),
     log: (m) => log.info(scrub(m)),
   };
-
-  // 현금 주문가능액(USD 예수금) 조회 캐시 — 계좌 단위 60초 캐시. rsp_cd/rsp_msg/금액 보존(로그용).
-  let depAt = 0; let depCash = 0; let depOk = false; let depRspCd = ''; let depRspMsg = '';
-  async function refreshDeposit(): Promise<void> {
-    const now = Date.now();
-    if (now - depAt < 60_000) return;
-    try {
-      const d = await getLSUSDeposit(cfg, token);
-      depOk = d.rspCd === '00000' && d.found; depCash = d.usdDeposit; depRspCd = d.rspCd; depRspMsg = d.rspMsg;
-    } catch (e) {
-      depOk = false; depCash = 0;
-      if (e instanceof LSApiError) { depRspCd = e.rspCd ?? `ERR(${e.kind})`; depRspMsg = e.message; }
-      else { depRspCd = 'EXCEPTION'; depRspMsg = String(e); }
-    }
-    depAt = now;
-  }
 
   async function evaluateArmed(ctx: SymCtx, sig: { action: string; candleDatetime: string }, now: number): Promise<void> {
     const etDate = etDateStr(now);
