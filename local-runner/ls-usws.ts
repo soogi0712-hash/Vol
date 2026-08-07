@@ -11,7 +11,7 @@ import {
   getLSUS15MinPaged, getLSUSTicksPaged, getLSUSDeposit,
   placeLSUSBuyOrder, queryLSUSOrderExec, cancelLSUSOrder, LSApiError,
   decideUSCashPayment, usCashOnlyUsdCap, usOrderableQty, formatCashOrderableLine,
-  evaluateCrossWon, formatCrossWonCheck, LS_US_CROSS_WON_TR_CONFIRMED, type LSUSDeposit,
+  evaluateCrossWon, formatCrossWonCheck, formatCrossWonLiveCand, LS_US_CROSS_WON_TR_CONFIRMED, type LSUSDeposit,
 } from '../src/lib/ls-api';
 import {
   LSUSRealtimeClient, RealtimeCandleBuilder, buildWsTrKey, evaluateReadiness, MIN_RT_CANDLES,
@@ -45,6 +45,7 @@ interface SymCtx {
   lastPrice: number;
   bestBid: number;
   bestAsk: number;
+  crossWonLiveDone: boolean;   // 최초 유효 bestAsk>0 수신 후 CROSS-WON 실계정 후보 1회 재계산 완료 여부(P0-19)
 }
 
 // Warm-up/관찰 신호 계산 — 확정봉으로 BB(20,2)/RSI(14)/getBBSignal 을 **항상** 계산한다(형성봉 제외).
@@ -101,7 +102,7 @@ async function main() {
     orders.load();
     if (orders.corrupt) log.error(`[US:${s.symbol}] 주문상태 파일 손상 → 실주문 차단 유지. 파일: ${orders.file}`);
     const builder = new RealtimeCandleBuilder();
-    const ctx: SymCtx = { symbol: s.symbol, exchange: s.exchange, exchcd: s.exchcd, builder, store, orders, lastGSCat: null, lastGSHat: null, lastPrice: 0, bestBid: 0, bestAsk: 0 };
+    const ctx: SymCtx = { symbol: s.symbol, exchange: s.exchange, exchcd: s.exchcd, builder, store, orders, lastGSCat: null, lastGSHat: null, lastPrice: 0, bestBid: 0, bestAsk: 0, crossWonLiveDone: false };
     ctxs.set(s.symbol, ctx);
 
     const trKey = buildWsTrKey(s.exchcd, s.symbol);
@@ -213,9 +214,11 @@ async function main() {
     if (!liveCfg.crossWonVerified) log.warn(`[${tag}-BLOCK ${liveCfg.liveSymbol}] 타통화+원화(통합증거금/선환전) 공식 필드 미확인 → US BUY 하드차단. 확인 절차: HTS 에서 실제 "타통화+원화 가능수량" 버튼을 눌러 나오는 금액/수량과 위 후보필드(PrexchOrdAbleAmt/WonPrexchAbleAmt 등)를 대조 후 코드상수 LS_US_CROSS_WON_TR_CONFIRMED 전환 필요.`);
   }
 
-  // ── P0-18: 통합증거금(타통화+원화) 가능수량 실측대조 로그 — 후보필드별 프로그램 수량 vs HTS 실측 + [CROSS-WON-CHECK] ──
+  // ── P0-18/19: 통합증거금(타통화+원화) 가능수량 실측대조 로그 — 후보필드별 프로그램 수량 vs HTS 실측 + [CROSS-WON-CHECK] ──
   function logCrossWon(tag: string, priceUsd: number): void {
     if (!depOk || !depFull) { log.error(`[${tag} ${liveCfg.liveSymbol}] 예수금조회 실패 rsp_cd=${depRspCd} rsp_msg=${scrub(depRspMsg)} → 주문 차단`); return; }
+    // P0-19 #1: 가격 미확보(bestAsk=0)면 후보수량 확정 금지 — GSH bestAsk 수신 후 자동 재계산.
+    if (!(priceUsd > 0)) { log.warn(`[${tag} ${liveCfg.liveSymbol}] bestAsk 미확보(가격=0) → 후보수량 계산 보류. 최초 유효 GSH bestAsk 수신 직후 자동 재계산.`); return; }
     const e = evaluateCrossWon(depFull, priceUsd, liveCfg.htsOrderableQty);
     // 후보 필드별 계산 수량(같은 bestAsk 기준) — 사용자가 HTS 실측값과 대조해 일치 필드 식별
     for (const c of e.candidates) {
@@ -224,6 +227,15 @@ async function main() {
     log.info(`[${tag}-CASHONLY ${liveCfg.liveSymbol}] cashOnly=${e.cashOnly}${e.cashOnly ? '' : ` 차단필드=[${e.cashOnlyBlockers.join(', ')}]`} (미수 OvrsMgn=${Math.round(depFull.overseasMargin)} / 대출 LoanAmt=${Math.round(depFull.loanAmt)} / 담보 FcurrPldgAmt=${depFull.fcurrPldgAmt.toFixed(2)})`);
     if (e.htsQty != null) log.info(`[${tag}-MATCHED ${liveCfg.liveSymbol}] HTS실측=${e.htsQty} 와 일치하는 후보필드=[${e.matchedKeys.join(', ') || '없음'}] (채택필드=${e.adoptedField ?? '미채택'})`);
     log.info(formatCrossWonCheck(liveCfg.liveSymbol, e));
+  }
+
+  // ── P0-19 #2,#3: 최초 유효 bestAsk>0 수신 직후 실계정 예수금 캐시 + 실제 bestAsk 로 CROSS-WON 후보 자동 재계산 ──
+  async function runCrossWonLive(ctx: SymCtx): Promise<void> {
+    await refreshDeposit();   // 계좌 예수금 캐시(만료 시에만 재조회)
+    if (!depOk || !depFull) { log.error(`[CROSS-WON-LIVE ${ctx.symbol}] 예수금 조회 실패 rsp_cd=${depRspCd} → 재계산 보류(다음 GSH 재시도)`); ctx.crossWonLiveDone = false; return; }
+    const e = evaluateCrossWon(depFull, ctx.bestAsk, liveCfg.htsOrderableQty);
+    log.info(formatCrossWonLiveCand(ctx.symbol, e));   // [CROSS-WON-LIVE-CAND] 요구 형식(bestAsk/BaseXchrat/후보별 qty/HTS)
+    logCrossWon('CROSS-WON-LIVE', ctx.bestAsk);         // 후보 상세 + cashOnly + [CROSS-WON-CHECK]
   }
 
   // ── P0-13/P0-15: 프로그램 시작 직후 BUY 여부와 무관하게 예수금 1회 조회 + 진단 로그. 실패면 LIVE 금지 ──
@@ -299,6 +311,11 @@ async function main() {
       ctx.bestBid = q.bestBid;
       ctx.bestAsk = q.bestAsk;
       log.info(`[GSH ${q.symbol}] bid=${q.bestBid}(${q.bidRem}) ask=${q.bestAsk}(${q.askRem})`);
+      // P0-19 #2: 최초 유효 bestAsk>0 수신 직후 실계정 종목에 대해 CROSS-WON 후보 1회 자동 재계산
+      if (!ctx.crossWonLiveDone && q.bestAsk > 0 && isLiveSymbol(liveCfg, q.symbol)) {
+        ctx.crossWonLiveDone = true;
+        void runCrossWonLive(ctx);
+      }
     },
     onStatus: (m) => log.info(`[WS] ${scrub(m)}`),
   }, { accountEvents: true });   // AS0~AS4 계좌 이벤트 등록(tr_type=1) — 재연결 시 자동 재등록

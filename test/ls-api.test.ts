@@ -5,7 +5,7 @@ import {
   getLSUSTicks, getLSUSTicksPaged, lsOverseasChartRaw,
   placeLSUSBuyOrder, queryLSUSOrderExec, getLSUSDeposit, getLSUSHoldings, cancelLSUSOrder, LS_CANCEL_TR_CONFIRMED, isUSOrderSuccess,
   decideUSCashPayment, usCashOnlyUsdCap, usOrderableQty, formatCashOrderableLine,
-  evaluateCrossWon, formatCrossWonCheck, maskLSResponse, CROSS_WON_ADOPTED_FIELD, LS_US_CROSS_WON_TR_CONFIRMED, type LSUSDeposit,
+  evaluateCrossWon, formatCrossWonCheck, formatCrossWonLiveCand, maskLSResponse, CROSS_WON_ADOPTED_FIELD, LS_US_CROSS_WON_TR_CONFIRMED, type LSUSDeposit,
   placeLSKRBuyOrder, queryLSKROrderExec, cancelLSKRBuyOrder, krIsuNo, isKROrderSuccess,
   toLSOverseasExchcd, LSApiError, configureLSRateLimiter, classifyChart,
   LS_G3203_MAX_QRYCNT_UNCOMPRESSED,
@@ -672,6 +672,52 @@ describe('해외 주문/체결/예수금 (공식 필드)', () => {
     expect(e.match).toBeNull();
     expect(e.candidates.every(c => c.match === null)).toBe(true);
     expect(formatCrossWonCheck('AAPL', e)).toContain('MATCH=N/A');
+  });
+
+  // ── P0-19: 실계정 결정적 매칭 — HTS=2 는 WonDpsBalAmt/MnyoutAbleAmt(원화현금) 와 일치 ──
+  const real = () => dep({
+    usdOrderable: 0, usdPrexchOrderable: 97.29, baseXchRate: 1418.80,
+    krwCash: 1000742, krwWithdrawable: 1000742, krwPrexchable: 144942,
+  });
+  it('P0-19 실계정: bestAsk=311.65 → WonDpsBalAmt/MnyoutAbleAmt qty=2, 선환전류 qty=0', () => {
+    const e = evaluateCrossWon(real(), 311.65, 2);
+    const byKey = Object.fromEntries(e.candidates.map(c => [c.key, c]));
+    expect(byKey['WonDpsBalAmt'].qty).toBe(2);       // 1000742/(311.65*1418.8)=2.26 → 2
+    expect(byKey['MnyoutAbleAmt'].qty).toBe(2);
+    expect(byKey['WonCashMin'].qty).toBe(2);          // min(1000742,1000742) → 2
+    expect(byKey['WonPrexchAbleAmt'].qty).toBe(0);   // 144942/442169 → 0
+    expect(byKey['PrexchOrdAbleAmt'].qty).toBe(0);   // 97.29/311.65 → 0
+    expect(byKey['FcurrOrdAbleAmt'].qty).toBe(0);
+  });
+  it('P0-19 실계정: HTS=2 와 일치하는 후보 자동표시(WonDpsBalAmt/MnyoutAbleAmt/WonCashMin)', () => {
+    const e = evaluateCrossWon(real(), 311.65, 2);
+    expect(e.matchedKeys).toEqual(expect.arrayContaining(['WonDpsBalAmt', 'MnyoutAbleAmt', 'WonCashMin']));
+    expect(e.matchedKeys).not.toContain('PrexchOrdAbleAmt');
+    expect(e.matchedKeys).not.toContain('WonPrexchAbleAmt');
+  });
+  it('P0-19 실계정: 채택필드 미확정 → orderAllowed=false, 하드차단 유지', () => {
+    const e = evaluateCrossWon(real(), 311.65, 2);
+    expect(e.adoptedField).toBeNull();
+    expect(e.orderAllowed).toBe(false);
+    expect(e.reason).toBe('CROSS_WON_UNCONFIRMED');   // 코드상수·채택 확정 전
+    expect(e.cashOnly).toBe(true);                     // OvrsMgn/Loan/Pldg 전부 0
+  });
+  it('P0-19 [CROSS-WON-LIVE-CAND] 형식(요구 필드 포함)', () => {
+    const line = formatCrossWonLiveCand('AAPL', evaluateCrossWon(real(), 311.65, 2));
+    expect(line).toContain('[CROSS-WON-LIVE-CAND AAPL]');
+    expect(line).toContain('bestAsk=311.65');
+    expect(line).toContain('BaseXchrat=1418.80');
+    expect(line).toContain('WonDpsBalAmt=1000742 → qty=2');
+    expect(line).toContain('MnyoutAbleAmt=1000742 → qty=2');
+    expect(line).toContain('WonPrexchAbleAmt=144942 → qty=0');
+    expect(line).toContain('PrexchOrdAbleAmt=97.29 → qty=0');
+    expect(line).toContain('HTS=2');
+  });
+  it('P0-19 WonCashMin: 두 현금지표가 다르면 작은 값 채택(초과주문 방지)', () => {
+    const e = evaluateCrossWon(dep({ krwCash: 1000742, krwWithdrawable: 500000, baseXchRate: 1418.8 }), 311.65, null);
+    const byKey = Object.fromEntries(e.candidates.map(c => [c.key, c]));
+    expect(byKey['WonCashMin'].amount).toBe(500000);   // min(1000742, 500000)
+    expect(byKey['WonCashMin'].qty).toBe(1);           // 500000/442169 → 1
   });
 
   it('P0-17 cashOrderable 로그: 성공/실패 두 형태만, "미조회" 절대 없음', () => {

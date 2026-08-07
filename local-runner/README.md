@@ -253,6 +253,33 @@ AAPL 1종목에 대해 `g3203 / g3202 / g3103 / g3204` 를 각 1회 호출해
 현재 `CROSS_WON_ADOPTED_FIELD=null`·`LS_US_CROSS_WON_TR_CONFIRMED=false` → `orderAllowed=false`
 (`CROSS_WON_UNCONFIRMED`). 실측 확정 전까지 US BUY 는 `LS_LIVE_TRADING=true` 여도 하드차단.
 
+### P0-19 — 실계정 결정적 매칭(HTS=2 ↔ 원화현금) + bestAsk 확보 후 자동 재계산
+
+실계정(AAPL bestAsk=311.65, BaseXchrat=1418.80): 1주 원화비용 ≈ 442,000 KRW.
+HTS 실제 "타통화+원화 가능수량" = **2주**. 후보 계산 결과:
+
+| 후보필드 | 값 | ÷ 1주비용 | qty | HTS=2 일치 |
+|---|---|---|---|---|
+| `WonDpsBalAmt` | 1,000,742 KRW | /442,169 | **2** | ✓ |
+| `MnyoutAbleAmt` | 1,000,742 KRW | /442,169 | **2** | ✓ |
+| `WonCashMin`(min 합성) | 1,000,742 KRW | /442,169 | **2** | ✓ |
+| `WonPrexchAbleAmt` | 144,942 KRW | /442,169 | 0 | ✗ |
+| `PrexchOrdAbleAmt` | 97.29 USD | /311.65 | 0 | ✗ |
+| `FcurrOrdAbleAmt` | 0 | | 0 | ✗ |
+
+→ HTS 2주와 일치하는 후보는 **원화예수금(`WonDpsBalAmt`) / 출금가능(`MnyoutAbleAmt`)** (선환전류 아님).
+
+**STARTUP 후보가 전부 0 이던 원인**: WS 연결 전 `bestAsk=0` → 1주비용=0 → 후보수량 미확정. 수정:
+- STARTUP 은 가격 미확보 시 후보수량을 **확정하지 않는다**(보류 로그만).
+- **최초 유효 GSH `bestAsk>0` 수신 직후**, 예수금 캐시 + 실제 bestAsk 로 후보 계산을 **자동 재실행**하고
+  `[CROSS-WON-LIVE-CAND]`(bestAsk/BaseXchrat/후보별 qty/HTS) + `[CROSS-WON-CHECK]` 출력.
+
+**WonDpsBalAmt vs MnyoutAbleAmt(둘 다 2)**: 어느 필드가 "실제 현금 주문가능" 공식 기준인지 확정 전까지
+**임의 채택 금지**. 안전 우선 합성 후보 `WonCashMin=min(WonDpsBalAmt,MnyoutAbleAmt)` 를 함께 계산해
+초과주문을 원천 방지한다(실계정에선 둘이 같아 2). `OvrsMgn=0`·`LoanAmt=0`·`FcurrPldgAmt=0` cash-only 유지.
+실계정 로그로 `HTS=2 / PROGRAM=2 / MATCH=true / cashOnly=true` 확인 시 그때 `CROSS_WON_ADOPTED_FIELD` 확정 +
+`LS_US_CROSS_WON_TR_CONFIRMED=true` 전환(BUY 직전 동일 재검증).
+
 ### COSAT00311(미체결 취소) 공식 필드 확인 결과 — 근거
 
 Phase 3A 완성을 위해 취소 TR 을 구현하려 했으나, **공식 필드를 확인하지 못했습니다.** 확인 경로와 결과:

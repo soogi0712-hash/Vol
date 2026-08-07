@@ -750,7 +750,7 @@ export function formatCashOrderableLine(s: { ok: boolean; cash: number; rspCd: s
 // cash-only 원칙: 신용/미수/대출/증거금(담보) 잔액이 하나라도 >0 이면 cashOnly=false → 주문 금지.
 export type CrossWonFieldKey =
   | 'FcurrOrdAbleAmt' | 'PrexchOrdAbleAmt' | 'FcurrOrdAmt' | 'FcurrMxchgAbleAmt' | 'T4FcurrDps'
-  | 'WonPrexchAbleAmt' | 'WonDpsBalAmt' | 'MnyoutAbleAmt';
+  | 'WonPrexchAbleAmt' | 'WonDpsBalAmt' | 'MnyoutAbleAmt' | 'WonCashMin';
 export interface CrossWonCandidate {
   key: CrossWonFieldKey; label: string; basis: 'USD' | 'KRW';
   amount: number; perShareCost: number; qty: number; match: boolean | null;
@@ -789,6 +789,8 @@ export function evaluateCrossWon(dep: LSUSDeposit, bestAsk: number, htsQty: numb
     mk('WonPrexchAbleAmt', '원화 선환전 가능(KRW)', 'KRW', dep.krwPrexchable),
     mk('WonDpsBalAmt', '원화예수금잔고(KRW)', 'KRW', dep.krwCash),
     mk('MnyoutAbleAmt', '출금가능(KRW)', 'KRW', dep.krwWithdrawable),
+    // 안전 우선 합성 후보 — 실제현금 두 지표 중 작은 값(초과주문 방지). 공식 근거 확인 전 임의 채택 금지.
+    mk('WonCashMin', '원화현금 한도 min(WonDpsBalAmt,MnyoutAbleAmt)', 'KRW', Math.min(dep.krwCash, dep.krwWithdrawable)),
   ];
   const matchedKeys = htsQty == null ? [] : candidates.filter(c => c.qty === htsQty).map(c => c.key);
   // cash-only: 미수(OvrsMgn)/대출(LoanAmt)/담보(FcurrPldgAmt) 잔액 전부 0 이어야 함
@@ -825,6 +827,14 @@ export function formatCrossWonCheck(symbol: string, e: CrossWonEval): string {
   return `[CROSS-WON-CHECK ${symbol}] bestAsk=${e.bestAsk.toFixed(2)} HTS orderableQty=${e.htsQty == null ? '미입력' : e.htsQty}`
     + ` PROGRAM orderableQty=${e.adoptedField ? e.programQty : '미채택'} MATCH=${e.match == null ? 'N/A' : e.match}`
     + ` paymentMode=CROSS_WON cashOnly=${e.cashOnly} orderAllowed=${e.orderAllowed}${e.orderAllowed ? '' : ` (${e.reason})`}`;
+}
+// [CROSS-WON-LIVE-CAND] — 최초 유효 bestAsk>0 수신 직후, 실계정 후보별 수량을 실측 대조용으로 출력(P0-19).
+export function formatCrossWonLiveCand(symbol: string, e: CrossWonEval): string {
+  const lines = [`[CROSS-WON-LIVE-CAND ${symbol}]`, `bestAsk=${e.bestAsk.toFixed(2)}`, `BaseXchrat=${e.baseXchRate.toFixed(2)}`];
+  for (const c of e.candidates) lines.push(`${c.key}=${c.amount} → qty=${c.qty}${c.match === true ? ' ✓HTS일치' : ''}`);
+  lines.push(`HTS=${e.htsQty == null ? '미입력' : e.htsQty}`);
+  if (e.htsQty != null) lines.push(`HTS(${e.htsQty})일치후보=[${e.matchedKeys.join(', ') || '없음'}]`);
+  return lines.join('\n');
 }
 
 // ── 미체결 취소 (COSAT00311) — ⚠️ 공식 카탈로그에 필드(reqExample/InBlock) 미수록 ──
