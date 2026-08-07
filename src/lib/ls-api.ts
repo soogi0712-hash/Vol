@@ -653,46 +653,52 @@ export async function getLSUSDeposit(cfg: LSConfig, token: string): Promise<LSUS
   };
 }
 
-// ── cash-only 결제 판정 (P0-15) — USD 현금 우선, 부족 시 원화현금 선환전. 신용/미수/증거금 절대 미사용 ──
-// 안전원칙: (1) overseasMargin(OvrsMgn) > 0 이면 즉시 차단(계좌에 미수/증거금 사용 흔적) →
-//           (2) USD 현금(FcurrDps) 이 필요금액을 덮으면 USD 결제, (3) 아니면 원화현금 선환전:
-//               · 공식 USD 선환전주문가능(PrexchOrdAbleAmt) ≥ 필요 USD  그리고
-//               · 실제 원화현금(min(WonDpsBalAmt, WonPrexchAbleAmt)) ≥ 필요USD × 기준환율  둘 다 충족.
-//           원화현금은 실제 예수금을 초과할 수 없도록 min 으로 캡(레버리지 유입 차단).
+// ── cash-only 주문가능수량 판정 (P0-16) — HTS 표시와 100% 동일하게 맞춘다 ──
+// 실계정 HTS 검증(결정적 증거):
+//   · HTS "거래국가 통화 가능수량"  = FcurrOrdAbleAmt(외화주문가능, USD 현금만) ÷ 주문가(1주비용). 실계정 0 == HTS 0(정확일치).
+//   · HTS "타통화+원화 가능수량"     = PrexchOrdAbleAmt(선환전주문가능, 先換錢=타통화+원화 현금 선환전) ÷ 주문가.
+// ⚠️ 이전 P0-15 는 원화예수금(WonDpsBalAmt) 한도까지 추가로 요구해 HTS 와 어긋났다(선환전 가능액은 타통화 현금도
+//    담보로 포함하므로 원화예수금만으로 캡하면 과도차단). 공식 선환전 필드(PrexchOrdAbleAmt)를 그대로 사용한다.
+// cash-only 보증: OvrsMgn(해외증거금/미수 잔액)==0 이 유일·충분한 근거(선환전주문가능은 LS 가 산출한 '미수 없이
+//    선환전으로 주문가능한 현금' 금액이며, 신용/미수 사용분은 OvrsMgn 으로 드러난다). OvrsMgn>0 이면 즉시 차단.
 export type USPaymentMode = 'USD' | 'KRW' | 'NONE';
 export interface USCashDecision {
   paymentMode: USPaymentMode; orderAllowed: boolean; reason: string;
   usdCash: number; krwCash: number; baseXchRate: number; overseasMargin: number;
   estimatedUsd: number; estimatedKrw: number; cashOnlyUsdCap: number;
+  qtyCountry: number;   // HTS "거래국가 통화 가능수량"(USD 현금만) = floor(FcurrOrdAbleAmt / price)
+  qtyCrossWon: number;  // HTS "타통화+원화 가능수량"(선환전) = floor(PrexchOrdAbleAmt / price)
 }
-// 계좌가 순수현금으로 결제 가능한 최대 USD 명목금액(레버리지 제외). 가격 무관.
+// 계좌가 순수현금(USD현금 or 타통화+원화 선환전)으로 결제 가능한 최대 USD 명목금액(레버리지 제외). 가격 무관.
+// OvrsMgn(미수)>0 이면 0. 그 외에는 공식 선환전주문가능(PrexchOrdAbleAmt, USD현금 FcurrOrdAbleAmt 포함) 사용.
 export function usCashOnlyUsdCap(dep: LSUSDeposit): number {
   if (!dep.ok || dep.overseasMargin > 0) return 0;   // 미수/증거금 사용 계좌 → cash-only 불가
-  const krwCashOnly = Math.min(dep.krwCash, dep.krwPrexchable);   // 실제 예수금 초과 금지(레버리지 캡)
-  const krwPathUsd = (dep.baseXchRate > 0 && krwCashOnly > 0)
-    ? Math.min(dep.usdPrexchOrderable, krwCashOnly / dep.baseXchRate)   // 공식 선환전가능 vs 원화현금 환산 중 작은 값
-    : 0;
-  return Math.max(dep.usdCash, krwPathUsd);
+  return Math.max(dep.usdOrderable, dep.usdPrexchOrderable);   // 거래국가(USD) vs 타통화+원화 선환전 중 큰 값
+}
+// HTS "타통화+원화 가능수량"(및 "거래국가 통화 가능수량")과 동일한 방식으로 주문가능수량을 계산한다.
+export function usOrderableQty(dep: LSUSDeposit, priceUsd: number): { qtyCountry: number; qtyCrossWon: number } {
+  if (!dep.ok || dep.overseasMargin > 0 || !(priceUsd > 0)) return { qtyCountry: 0, qtyCrossWon: 0 };
+  return {
+    qtyCountry: Math.floor(dep.usdOrderable / priceUsd),        // 거래국가 통화(USD 현금)
+    qtyCrossWon: Math.floor(dep.usdPrexchOrderable / priceUsd), // 타통화+원화 선환전
+  };
 }
 export function decideUSCashPayment(dep: LSUSDeposit, priceUsd: number, qty: number): USCashDecision {
   const estimatedUsd = priceUsd * qty;
+  const { qtyCountry, qtyCrossWon } = usOrderableQty(dep, priceUsd);
   const base = {
     usdCash: dep.usdCash, krwCash: dep.krwCash, baseXchRate: dep.baseXchRate, overseasMargin: dep.overseasMargin,
     estimatedUsd, estimatedKrw: estimatedUsd * (dep.baseXchRate > 0 ? dep.baseXchRate : 0),
-    cashOnlyUsdCap: usCashOnlyUsdCap(dep),
+    cashOnlyUsdCap: usCashOnlyUsdCap(dep), qtyCountry, qtyCrossWon,
   };
   if (!dep.ok) return { ...base, paymentMode: 'NONE', orderAllowed: false, reason: 'INVALID_RESPONSE' };
   if (dep.overseasMargin > 0) return { ...base, paymentMode: 'NONE', orderAllowed: false, reason: 'MARGIN_PRESENT' };
   if (!(priceUsd > 0) || !(qty > 0)) return { ...base, paymentMode: 'NONE', orderAllowed: false, reason: 'INVALID_PRICE' };
-  // (2) USD 현금 결제
-  if (dep.usdCash >= estimatedUsd) return { ...base, paymentMode: 'USD', orderAllowed: true, reason: 'USD_CASH' };
-  // (3) 원화현금 선환전 결제 — 공식 선환전가능(USD) AND 실제 원화현금(KRW) 둘 다 충족
-  const krwCashOnly = Math.min(dep.krwCash, dep.krwPrexchable);
-  const krwOk = dep.baseXchRate > 0 && krwCashOnly > 0
-    && dep.usdPrexchOrderable >= estimatedUsd
-    && krwCashOnly >= base.estimatedKrw;
-  if (krwOk) return { ...base, paymentMode: 'KRW', orderAllowed: true, reason: 'KRW_PREXCH_CASH' };
-  return { ...base, paymentMode: 'NONE', orderAllowed: false, reason: 'KRW_CASH_INSUFFICIENT' };
+  // (2) 거래국가 통화(USD 현금) 로 필요수량 결제 가능
+  if (qtyCountry >= qty) return { ...base, paymentMode: 'USD', orderAllowed: true, reason: 'USD_CASH' };
+  // (3) 타통화+원화 선환전(HTS 와 동일) 으로 필요수량 결제 가능 — 미수 없음(OvrsMgn==0)
+  if (qtyCrossWon >= qty) return { ...base, paymentMode: 'KRW', orderAllowed: true, reason: 'CROSS_WON_PREXCH' };
+  return { ...base, paymentMode: 'NONE', orderAllowed: false, reason: 'ORDERABLE_QTY_INSUFFICIENT' };
 }
 
 // ── 미체결 취소 (COSAT00311) — ⚠️ 공식 카탈로그에 필드(reqExample/InBlock) 미수록 ──

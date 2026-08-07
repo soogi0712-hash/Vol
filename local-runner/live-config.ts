@@ -17,6 +17,7 @@ export interface LiveConfig {
   autoCancel: boolean;         // 자동취소 모드 — env AND 코드상수(취소TR 확인). 현재 항상 false.
   manualCancel: boolean;       // 수동취소 모드 — autoCancel 아니면 true(오늘 운영 모드).
   pendingTimeoutSec: number;   // (auto 모드에서만) 미체결 취소까지 대기 시간(초)
+  htsOrderableQty: number | null;  // LS_US_HTS_ORDERABLE_QTY — HTS "타통화+원화 가능수량" 관찰값(교차검증용). 미설정=null.
 }
 
 const intEnv = (name: string, def: number, min: number, max: number): number => {
@@ -46,6 +47,8 @@ export function loadLiveConfig(): LiveConfig {
     autoCancel,
     manualCancel: !autoCancel,
     pendingTimeoutSec: intEnv('LS_US_PENDING_TIMEOUT_SEC', 60, 5, 600),
+    // HTS 관찰값(타통화+원화 가능수량) — 설정 시 프로그램 계산값과 반드시 일치해야 LIVE 허용(불일치 → 차단).
+    htsOrderableQty: (() => { const v = process.env.LS_US_HTS_ORDERABLE_QTY; if (v == null || v.trim() === '') return null; const n = parseInt(v, 10); return Number.isFinite(n) ? Math.max(0, n) : null; })(),
   };
 }
 

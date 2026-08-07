@@ -192,9 +192,29 @@ AAPL 1종목에 대해 `g3203 / g3202 / g3103 / g3204` 를 각 1회 호출해
 
 판정(`decideUSCashPayment`): ① `OvrsMgn>0` → 차단 ② USD현금 ≥ 필요USD → **USD 결제**
 ③ 아니면 공식 선환전가능(USD) ≥ 필요USD **그리고** `min(WonDpsBalAmt, WonPrexchAbleAmt)` ≥ 필요USD×환율
-→ **원화현금 선환전 결제**, 아니면 `KRW_CASH_INSUFFICIENT` 차단. 원화현금은 실제 예수금을 초과할 수
-없도록 `min` 으로 캡해 레버리지 유입을 차단한다. 진단 로그 `[STARTUP-US-CASH]`/`[BUY-US-CASH]`:
-`USD cashOrderable / KRW cashOrderable / 선환전USD / 기준환율 / 미수(OvrsMgn) / estimated 1share / paymentMode / orderAllowed`.
+→ **원화현금 선환전 결제**, 아니면 차단.
+
+### P0-16 — HTS "타통화+원화 가능수량" 과 100% 동일하게 (실계정 결정적 증거로 수정)
+
+실계정 HTS 에서 AAPL 이 **거래국가 통화 가능수량=0 / 타통화+원화 가능수량=2** 로 표시되는데 프로그램은
+`orderAllowed=false` 로 어긋났다. 원인: P0-15 가 원화예수금(`WonDpsBalAmt`) 한도까지 추가로 요구했으나,
+**선환전 가능액은 타통화 현금도 담보로 포함**하므로 원화예수금만으로 캡하면 과도차단된다. 결정적 대응:
+
+| HTS 라벨 | 공식 필드(COSOQ02701 OutBlock3 USD) | 근거 |
+|---|---|---|
+| **거래국가 통화 가능수량** | `FcurrOrdAbleAmt`(외화주문가능, USD현금만) ÷ 주문가 | 실계정 `FcurrOrdAbleAmt=0` == HTS 0 **정확 일치** |
+| **타통화+원화 가능수량** | `PrexchOrdAbleAmt`(선환전주문가능, 先換錢=타통화+원화) ÷ 주문가 | 선환전 = 타통화/원화 현금 자동환전 주문 |
+
+해외주식 전용 "주문가능수량" TR 은 카탈로그에 없다(국내 `CSPBQ00200` 만 존재). HTS 도 위 금액 ÷ 주문가로
+수량을 산출한다. 따라서 프로그램도 **동일 필드·동일 주문가**로 `usOrderableQty` 를 계산한다.
+cash-only 보증은 **`OvrsMgn`(해외증거금/미수)==0** 이 유일·충분한 근거(선환전주문가능은 LS 가 미수 없이
+산출한 현금 주문가능액이며, 신용/미수 사용분은 `OvrsMgn` 으로 드러난다). `OvrsMgn>0` → 즉시 차단.
+
+**HTS 교차검증(`LS_US_HTS_ORDERABLE_QTY`)**: HTS 화면의 "타통화+원화 가능수량" 을 env 로 입력하면,
+BUY 직전 프로그램 계산값과 비교해 **다르면 주문 차단(LIVE 금지)**. 진단 로그
+`[STARTUP-US-CASH]`/`[BUY-US-CASH]` + `[...-QTY]`:
+`거래국가통화 가능수량 / 타통화+원화 가능수량(프로그램) / HTS 타통화+원화 가능수량 / 일치 / paymentMode / orderAllowed`.
+즉 HTS=2 → 프로그램=2 → `orderAllowed=true`, HTS≠프로그램 → 차단. HTS 와 100% 동일 결과를 보장한다.
 
 ### COSAT00311(미체결 취소) 공식 필드 확인 결과 — 근거
 
@@ -257,10 +277,11 @@ READY · 미체결 시 신규 금지 · 동일봉 중복 금지 · 주문번호 
 
 - **`US_ORDER_POST_IDEMPOTENT`** — `COSAT00301` 전송 **직전**(응답 해석 전) candle lock 을 영구 저장+flush.
   같은 확정봉 BUY 신호가 3번 반복돼도 **실제 POST 는 1회**. HTTP/timeout/500/parse/rsp_cd 오류 뒤에도 **재POST 0회**.
-- **`US_CASH_ONLY_GATE`** — 주문 직전 예수금(`COSOQ02701`) 재조회. **두 경로**로 현금결제 판정
-  (`decideUSCashPayment`): ① USD 현금(`FcurrDps`) 충분 → USD 결제 ② USD=0 이면 **원화현금 선환전**
-  (`PrexchOrdAbleAmt`/`WonPrexchAbleAmt`, 실제 예수금 min 캡). `orderAllowed=false`이면 `COSAT00301`
-  **미호출**. **`OvrsMgn`(해외증거금)>0 이면 즉시 차단** — 신용/미수/대출/증거금 레버리지 절대 미사용. (P0-15)
+- **`US_CASH_ONLY_GATE`** — 주문 직전 예수금(`COSOQ02701`) 재조회. **HTS 와 동일한 주문가능수량**으로 판정
+  (`decideUSCashPayment`/`usOrderableQty`): 거래국가통화 가능수량=`FcurrOrdAbleAmt÷주문가`, 타통화+원화
+  가능수량=`PrexchOrdAbleAmt÷주문가`. 필요수량 미만이면 `COSAT00301` **미호출**. **`OvrsMgn`(해외증거금)>0
+  이면 즉시 차단** — 신용/미수/대출/증거금 레버리지 절대 미사용. HTS 관찰값(`LS_US_HTS_ORDERABLE_QTY`)과
+  불일치 시에도 차단. (P0-15/16)
 - **`US_PENDING_REORDER_BLOCKED`** — pending 주문이 하나라도 있으면 신규 BUY 금지.
 - **`US_RESTART_RECONCILIATION`** — 주문 전 `COSAQ00102` 로 당일 실제 매수주문과 로컬 OrderStore 를
   대사. 조회 실패 또는 로컬 미기록 주문 감지 시 신규 BUY 금지(재시작 후에도).

@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { loadLiveConfig, isLiveSymbol } from '../local-runner/live-config';
 
-const KEYS = ['LS_US_LIVE_SYMBOL', 'LS_US_MAX_QTY', 'LS_US_DAILY_MAX_BUYS', 'LS_US_DAILY_MAX_SELLS', 'LS_TRADING_ARMED', 'LS_LIVE_TRADING', 'LS_CANCEL_TR_CONFIRMED', 'LS_US_PENDING_TIMEOUT_SEC'];
+const KEYS = ['LS_US_LIVE_SYMBOL', 'LS_US_MAX_QTY', 'LS_US_DAILY_MAX_BUYS', 'LS_US_DAILY_MAX_SELLS', 'LS_TRADING_ARMED', 'LS_LIVE_TRADING', 'LS_CANCEL_TR_CONFIRMED', 'LS_US_PENDING_TIMEOUT_SEC', 'LS_US_HTS_ORDERABLE_QTY'];
 let saved: Record<string, string | undefined>;
 beforeEach(() => { saved = {}; for (const k of KEYS) { saved[k] = process.env[k]; delete process.env[k]; } });
 afterEach(() => { for (const k of KEYS) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]; } });
@@ -32,6 +32,15 @@ describe('loadLiveConfig — 오늘 실전 제한 강제', () => {
     process.env.LS_CANCEL_TR_CONFIRMED = 'true';
     const c = loadLiveConfig();
     expect(c.armed).toBe(true); expect(c.liveTrading).toBe(true); expect(c.cancelConfirmed).toBe(true);
+  });
+  it('LS_US_HTS_ORDERABLE_QTY — 미설정=null, 설정 시 정수 파싱(HTS 교차검증값)', () => {
+    expect(loadLiveConfig().htsOrderableQty).toBeNull();
+    process.env.LS_US_HTS_ORDERABLE_QTY = '2';
+    expect(loadLiveConfig().htsOrderableQty).toBe(2);
+    process.env.LS_US_HTS_ORDERABLE_QTY = '0';
+    expect(loadLiveConfig().htsOrderableQty).toBe(0);
+    process.env.LS_US_HTS_ORDERABLE_QTY = '   ';
+    expect(loadLiveConfig().htsOrderableQty).toBeNull();
   });
   it('거래소 미확인 심볼 → 예외(추측 금지)', () => {
     process.env.LS_US_LIVE_SYMBOL = 'LSE:VOD';   // 미확인 거래소

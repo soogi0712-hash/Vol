@@ -10,7 +10,7 @@ import { makeScrubber } from './mask';
 import {
   getLSUS15MinPaged, getLSUSTicksPaged, getLSUSDeposit,
   placeLSUSBuyOrder, queryLSUSOrderExec, cancelLSUSOrder, LSApiError,
-  decideUSCashPayment, usCashOnlyUsdCap, type LSUSDeposit,
+  decideUSCashPayment, usCashOnlyUsdCap, usOrderableQty, type LSUSDeposit,
 } from '../src/lib/ls-api';
 import {
   LSUSRealtimeClient, RealtimeCandleBuilder, buildWsTrKey, evaluateReadiness, MIN_RT_CANDLES,
@@ -181,14 +181,25 @@ async function main() {
     }
     depAt = now;
   }
-  // ── P0-15 진단 로그: USD/KRW 현금·환율·미수·1주 예상결제·결제모드·주문허용 여부를 한 줄로 출력 ──
+  // ── HTS 교차검증(P0-16): 프로그램 계산 "타통화+원화 가능수량" 과 HTS 관찰값 비교 ──
+  // HTS 값(env)이 있으면: 프로그램 값과 다르면 mismatch=true(→ LIVE/주문 차단). env 없으면 mismatch=null(비교 생략, 관찰용 출력만).
+  function htsCompare(priceUsd: number): { htsQty: number | null; progQty: number; mismatch: boolean | null } {
+    const progQty = (depOk && depFull && priceUsd > 0) ? usOrderableQty(depFull, priceUsd).qtyCrossWon : 0;
+    const htsQty = liveCfg.htsOrderableQty;
+    return { htsQty, progQty, mismatch: htsQty == null ? null : htsQty !== progQty };
+  }
+
+  // ── P0-15/16 진단 로그: 현금·환율·미수 + HTS 방식 가능수량(거래국가/타통화+원화) + HTS 비교를 한 줄로 출력 ──
   function logUSCashDiag(tag: string, priceUsd: number): void {
     if (!depOk || !depFull) { log.error(`[${tag} ${liveCfg.liveSymbol}] 예수금조회 실패 rsp_cd=${depRspCd} rsp_msg=${scrub(depRspMsg)} → 주문 차단`); return; }
     const dec = decideUSCashPayment(depFull, priceUsd, liveCfg.maxQty);
+    const cmp = htsCompare(priceUsd);
     const est = priceUsd > 0
-      ? `estimated ${liveCfg.liveSymbol} ${liveCfg.maxQty}share(USD)=${dec.estimatedUsd.toFixed(2)} / KRW=${Math.round(dec.estimatedKrw)}`
-      : `estimated=대기(가격미확보)`;
-    log.info(`[${tag}] USD cashOrderable=${depFull.usdCash.toFixed(2)} / KRW cashOrderable=${Math.round(depFull.krwCash)} / 선환전USD=${depFull.usdPrexchOrderable.toFixed(2)} / 기준환율=${depFull.baseXchRate.toFixed(2)} / 미수(OvrsMgn)=${Math.round(depFull.overseasMargin)} / ${est} / paymentMode=${dec.paymentMode} / orderAllowed=${dec.orderAllowed}${dec.orderAllowed ? '' : ` (${dec.reason})`} / rsp_cd=${depRspCd}`);
+      ? `주문가(1주)=${priceUsd.toFixed(2)}USD / estimated ${liveCfg.maxQty}주=${dec.estimatedUsd.toFixed(2)}USD(${Math.round(dec.estimatedKrw)}KRW)`
+      : `주문가=대기(가격미확보)`;
+    // HTS 라벨과 동일: "거래국가 통화 가능수량"(USD현금) / "타통화+원화 가능수량"(선환전)
+    log.info(`[${tag}] USD현금=${depFull.usdCash.toFixed(2)} / 거래국가통화주문가능=${depFull.usdOrderable.toFixed(2)}USD / 타통화+원화선환전=${depFull.usdPrexchOrderable.toFixed(2)}USD / 원화현금=${Math.round(depFull.krwCash)}KRW / 기준환율=${depFull.baseXchRate.toFixed(2)} / 미수(OvrsMgn)=${Math.round(depFull.overseasMargin)} / ${est}`);
+    log.info(`[${tag}-QTY] 거래국가통화 가능수량=${dec.qtyCountry} / 타통화+원화 가능수량(프로그램)=${dec.qtyCrossWon} / HTS 타통화+원화 가능수량=${cmp.htsQty == null ? '미입력(LS_US_HTS_ORDERABLE_QTY)' : cmp.htsQty} / 일치=${cmp.mismatch == null ? 'N/A' : !cmp.mismatch} / paymentMode=${dec.paymentMode} / orderAllowed=${dec.orderAllowed && cmp.mismatch !== true}${dec.orderAllowed && cmp.mismatch !== true ? '' : ` (${cmp.mismatch === true ? 'HTS_QTY_MISMATCH' : dec.reason})`} / rsp_cd=${depRspCd}`);
   }
 
   // ── P0-13/P0-15: 프로그램 시작 직후 BUY 여부와 무관하게 예수금 1회 조회 + 진단 로그. 실패면 LIVE 금지 ──
@@ -288,13 +299,16 @@ async function main() {
     let cashLog = 'cashOrderable=미조회';
     if (sig.action === 'BUY' && ctx.builder.confirmedCount >= MIN_RT_CANDLES) {
       await refreshDeposit();
-      // cash-only 결제 판정(USD현금 or 원화현금 선환전). orderAllowed=false 면 주문 차단.
+      // cash-only 결제 판정(거래국가 USD현금 or 타통화+원화 선환전 — HTS 방식 가능수량). orderAllowed=false 면 주문 차단.
       const dec = depFull ? decideUSCashPayment(depFull, buyPrice, liveCfg.maxQty) : null;
-      orderableQtyOk = !!(depOk && buyPrice > 0 && dec && dec.orderAllowed);   // 조회성공 AND cash-only 1주 결제가능
+      const cmp = htsCompare(buyPrice);   // HTS 관찰값과 프로그램 계산값 비교
+      // P0-16: HTS 값이 있고 프로그램과 다르면 주문 차단(HTS 와 100% 동일해야 함). 없으면 비교 생략.
+      orderableQtyOk = !!(depOk && buyPrice > 0 && dec && dec.orderAllowed && cmp.mismatch !== true);
+      if (cmp.mismatch === true) log.error(`[BUY-HTS-CMP ${ctx.symbol}] HTS 타통화+원화 가능수량=${cmp.htsQty} ≠ 프로그램=${cmp.progQty} → 불일치, 주문 차단(LIVE 금지)`);
       cashLog = depOk && dec
-        ? `cashOrderable(cash-only)=${depCash.toFixed(2)} USD (필요=${need.toFixed(2)}, mode=${dec.paymentMode}, allowed=${dec.orderAllowed}${dec.orderAllowed ? '' : `:${dec.reason}`}, rsp_cd=${depRspCd})`
+        ? `가능수량(타통화+원화)=${dec.qtyCrossWon}(HTS=${cmp.htsQty ?? '미입력'}) 거래국가통화=${dec.qtyCountry} mode=${dec.paymentMode} allowed=${orderableQtyOk}${orderableQtyOk ? '' : `:${cmp.mismatch === true ? 'HTS_QTY_MISMATCH' : dec.reason}`} rsp_cd=${depRspCd}`
         : `cashOrderable 조회실패 rsp_cd=${depRspCd} rsp_msg=${scrub(depRspMsg)}`;
-      logUSCashDiag('BUY-US-CASH', buyPrice);   // BUY 직전 재조회 진단(P0-15)
+      logUSCashDiag('BUY-US-CASH', buyPrice);   // BUY 직전 재조회 진단(P0-15/16)
     }
 
     const state: GateState = {

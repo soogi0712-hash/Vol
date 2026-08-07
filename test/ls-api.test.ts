@@ -4,7 +4,7 @@ import {
   getLSKRPrice, getLSUSPrice, getLSKR15Min, getLSUS15Min, getLSUS15MinPaged,
   getLSUSTicks, getLSUSTicksPaged, lsOverseasChartRaw,
   placeLSUSBuyOrder, queryLSUSOrderExec, getLSUSDeposit, getLSUSHoldings, cancelLSUSOrder, LS_CANCEL_TR_CONFIRMED, isUSOrderSuccess,
-  decideUSCashPayment, usCashOnlyUsdCap, type LSUSDeposit,
+  decideUSCashPayment, usCashOnlyUsdCap, usOrderableQty, type LSUSDeposit,
   placeLSKRBuyOrder, queryLSKROrderExec, cancelLSKRBuyOrder, krIsuNo, isKROrderSuccess,
   toLSOverseasExchcd, LSApiError, configureLSRateLimiter, classifyChart,
   LS_G3203_MAX_QRYCNT_UNCOMPRESSED,
@@ -554,7 +554,8 @@ describe('해외 주문/체결/예수금 (공식 필드)', () => {
     await expect(getLSUSDeposit(cfg, 'T')).rejects.toThrow();
   });
 
-  // ── P0-15: cash-only 결제 판정(decideUSCashPayment / usCashOnlyUsdCap) ──
+  // ── P0-16: HTS "타통화+원화 가능수량" 과 100% 동일한 주문가능수량 판정 ──
+  // usdOrderable = FcurrOrdAbleAmt(거래국가 통화, USD현금) / usdPrexchOrderable = PrexchOrdAbleAmt(타통화+원화 선환전)
   function dep(over: Partial<LSUSDeposit> = {}): LSUSDeposit {
     return {
       ok: true, rspCd: '00136', rspMsg: '', found: true, diag: {} as any,
@@ -563,38 +564,57 @@ describe('해외 주문/체결/예수금 (공식 필드)', () => {
       usdDeposit: 0, ...over,
     };
   }
-  it('P0-15 결제판정: USD현금이 충분 → paymentMode=USD, orderAllowed=true', () => {
-    const d = decideUSCashPayment(dep({ usdCash: 500, usdDeposit: 500 }), 200, 1);
-    expect(d.paymentMode).toBe('USD');
-    expect(d.orderAllowed).toBe(true);
-  });
-  it('P0-15 결제판정: USD현금=0 이지만 원화현금 선환전 충분 → paymentMode=KRW, orderAllowed=true', () => {
-    const d = decideUSCashPayment(dep({ usdCash: 0 }), 200, 1);   // 필요 200USD, 선환전가능 9245.88, 원화 1392만
+  it('P0-16 실계정 재현: 거래국가통화=0(HTS 0), 타통화+원화 선환전으로 매수가능 → allowed', () => {
+    // 실계정: FcurrOrdAbleAmt=0(거래국가 통화 가능수량 0), PrexchOrdAbleAmt로 주문가능
+    const d = decideUSCashPayment(dep({ usdOrderable: 0, usdPrexchOrderable: 9245.88 }), 200, 1);
+    expect(d.qtyCountry).toBe(0);                 // HTS "거래국가 통화 가능수량" = 0
+    expect(d.qtyCrossWon).toBe(Math.floor(9245.88 / 200));  // HTS "타통화+원화 가능수량"
     expect(d.paymentMode).toBe('KRW');
     expect(d.orderAllowed).toBe(true);
-    expect(d.estimatedKrw).toBeCloseTo(200 * 1434.6);
+    expect(d.reason).toBe('CROSS_WON_PREXCH');
   });
-  it('P0-15 결제판정: OvrsMgn>0(미수/증거금 사용) → 즉시 차단(MARGIN_PRESENT)', () => {
-    const d = decideUSCashPayment(dep({ usdCash: 0, overseasMargin: 100000 }), 200, 1);
+  it('P0-16 가능수량: usOrderableQty 가 HTS 두 수량을 각각 산출', () => {
+    const q = usOrderableQty(dep({ usdOrderable: 460, usdPrexchOrderable: 920 }), 230);
+    expect(q.qtyCountry).toBe(2);    // 460/230
+    expect(q.qtyCrossWon).toBe(4);   // 920/230
+  });
+  it('P0-16: 거래국가 통화(USD현금)로 충분 → paymentMode=USD', () => {
+    const d = decideUSCashPayment(dep({ usdOrderable: 500, usdCash: 500 }), 200, 1);
+    expect(d.qtyCountry).toBe(2);
+    expect(d.paymentMode).toBe('USD');
+    expect(d.orderAllowed).toBe(true);
+    expect(d.reason).toBe('USD_CASH');
+  });
+  it('P0-16: OvrsMgn>0(미수/증거금) → 즉시 차단(MARGIN_PRESENT), 가능수량 0', () => {
+    const d = decideUSCashPayment(dep({ overseasMargin: 100000 }), 200, 1);
     expect(d.orderAllowed).toBe(false);
     expect(d.reason).toBe('MARGIN_PRESENT');
-    expect(usCashOnlyUsdCap(dep({ usdCash: 0, overseasMargin: 100000 }))).toBe(0);
+    expect(d.qtyCrossWon).toBe(0);
+    expect(usCashOnlyUsdCap(dep({ overseasMargin: 100000 }))).toBe(0);
+    expect(usOrderableQty(dep({ overseasMargin: 100000 }), 200)).toEqual({ qtyCountry: 0, qtyCrossWon: 0 });
   });
-  it('P0-15 결제판정: 원화현금 부족(예상결제 > 원화현금) → 차단(KRW_CASH_INSUFFICIENT)', () => {
-    // 필요 200USD, 원화현금 10000원(=선환전 매우 작음) → 부족
-    const d = decideUSCashPayment(dep({ usdCash: 0, krwCash: 10000, krwPrexchable: 10000, usdPrexchOrderable: 7 }), 200, 1);
+  it('P0-16: 타통화+원화 선환전도 1주 미만 → 차단(ORDERABLE_QTY_INSUFFICIENT)', () => {
+    // 필요 200USD/주, 선환전가능 97.29 → 0주 → 차단(실계정 orderAllowed=false 상황 재현)
+    const d = decideUSCashPayment(dep({ usdOrderable: 0, usdPrexchOrderable: 97.29 }), 200, 1);
+    expect(d.qtyCrossWon).toBe(0);
     expect(d.orderAllowed).toBe(false);
-    expect(d.reason).toBe('KRW_CASH_INSUFFICIENT');
+    expect(d.reason).toBe('ORDERABLE_QTY_INSUFFICIENT');
   });
-  it('P0-15 결제판정: 응답 실패(ok=false) → 차단(INVALID_RESPONSE)', () => {
+  it('P0-16: 실계정 재현(97.29/주문가48.6 → 2주) — HTS 타통화+원화=2 와 동일', () => {
+    // HTS 가 2주로 표시하는 상황: 선환전가능 97.29, 주문가(1주) 48.6 → floor(97.29/48.6)=2
+    const d = decideUSCashPayment(dep({ usdOrderable: 0, usdPrexchOrderable: 97.29 }), 48.6, 1);
+    expect(d.qtyCrossWon).toBe(2);   // HTS "타통화+원화 가능수량" = 2 와 일치
+    expect(d.orderAllowed).toBe(true);
+    expect(d.paymentMode).toBe('KRW');
+  });
+  it('P0-16: 응답 실패(ok=false) → 차단(INVALID_RESPONSE)', () => {
     const d = decideUSCashPayment(dep({ ok: false }), 200, 1);
     expect(d.orderAllowed).toBe(false);
     expect(d.reason).toBe('INVALID_RESPONSE');
   });
-  it('P0-15 cash-only 상한: 원화현금은 실제 예수금(min WonDps/WonPrexch) 초과 불가(레버리지 캡)', () => {
-    // WonPrexchAbleAmt(선환전가능)가 실제 예수금보다 큼 → 레버리지 의심 → 실제 예수금으로 캡
-    const cap = usCashOnlyUsdCap(dep({ usdCash: 0, krwCash: 1434600, krwPrexchable: 99999999, usdPrexchOrderable: 99999 }));
-    expect(cap).toBeCloseTo(1434600 / 1434.6, 1);   // = min(krwCash, krwPrexch)/rate = 1000 USD 근사
+  it('P0-16 cash-only 상한: OvrsMgn==0 이면 max(거래국가, 타통화+원화) 선환전가능', () => {
+    expect(usCashOnlyUsdCap(dep({ usdOrderable: 100, usdPrexchOrderable: 9245.88 }))).toBeCloseTo(9245.88);
+    expect(usCashOnlyUsdCap(dep({ usdOrderable: 9999, usdPrexchOrderable: 100 }))).toBeCloseTo(9999);
   });
 
   it('cancelLSUSOrder — 공식 취소 필드 미확인 → 예외(추측 금지)', async () => {
