@@ -9,7 +9,7 @@ import { loadUSSymbols } from './universe';
 import { makeScrubber } from './mask';
 import {
   getLSUS15MinPaged, getLSUSTicksPaged, getLSUSDeposit,
-  placeLSUSBuyOrder, queryLSUSOrderExec, cancelLSUSOrder,
+  placeLSUSBuyOrder, queryLSUSOrderExec, cancelLSUSOrder, LSApiError,
 } from '../src/lib/ls-api';
 import {
   LSUSRealtimeClient, RealtimeCandleBuilder, buildWsTrKey, evaluateReadiness, MIN_RT_CANDLES,
@@ -235,16 +235,20 @@ async function main() {
     log: (m) => log.info(scrub(m)),
   };
 
-  // 예수금(주문가능) 조회 캐시 — 계좌 단위라 60초 캐시(불필요 네트워크 억제)
-  let depAt = 0; let depUsd = 0; let depOk = false;
-  async function orderableCheck(priceNeeded: number): Promise<boolean> {
+  // 현금 주문가능액(USD 예수금) 조회 캐시 — 계좌 단위 60초 캐시. rsp_cd/rsp_msg/금액 보존(로그용).
+  let depAt = 0; let depCash = 0; let depOk = false; let depRspCd = ''; let depRspMsg = '';
+  async function refreshDeposit(): Promise<void> {
     const now = Date.now();
-    if (now - depAt >= 60_000) {
-      try { const d = await getLSUSDeposit(cfg, token); depOk = d.rspCd === '00000' && d.found; depUsd = d.usdDeposit; }
-      catch (e) { depOk = false; depUsd = 0; log.warn(`[ARMED] 예수금 조회 실패: ${scrub(String(e))}`); }
-      depAt = now;
+    if (now - depAt < 60_000) return;
+    try {
+      const d = await getLSUSDeposit(cfg, token);
+      depOk = d.rspCd === '00000' && d.found; depCash = d.usdDeposit; depRspCd = d.rspCd; depRspMsg = d.rspMsg;
+    } catch (e) {
+      depOk = false; depCash = 0;
+      if (e instanceof LSApiError) { depRspCd = e.rspCd ?? `ERR(${e.kind})`; depRspMsg = e.message; }
+      else { depRspCd = 'EXCEPTION'; depRspMsg = String(e); }
     }
-    return depOk && depUsd >= priceNeeded;   // 1주 매수 가능 여부
+    depAt = now;
   }
 
   async function evaluateArmed(ctx: SymCtx, sig: { action: string; candleDatetime: string }, now: number): Promise<void> {
@@ -254,11 +258,19 @@ async function main() {
     // 동일 확정봉 중복/일일한도/손상 → 중복주문으로 간주(cond9), 미체결(cond10)
     const dup = ctx.orders.corrupt || ctx.orders.hasOrderedCandle(sig.candleDatetime, 'buy') || !ctx.orders.canBuyToday(etDate, liveCfg.dailyMaxBuys);
     const pending = ctx.orders.hasPending();
-    // 매수 지정가 = GSH ask (req4). 나머지 조건이 모두 통과할 때만 예수금 조회(불필요 네트워크 억제)
-    const buyPrice = ctx.bestAsk;
-    const worthQuery = sig.action === 'BUY' && ctx.builder.confirmedCount >= MIN_RT_CANDLES && client.connected
-      && isUSRegularSession(now) && ctx.bestBid > 0 && ctx.bestAsk > 0 && ctx.lastPrice > 0 && !dup && !pending;
-    const orderableQtyOk = worthQuery ? await orderableCheck(buyPrice) : false;
+    const buyPrice = ctx.bestAsk;   // 매수 지정가 = GSH ask
+    const need = buyPrice > 0 ? buyPrice * liveCfg.maxQty : 0;
+
+    // ── cashOrderable 조회 (BUY 신호 + 확정봉≥20 이면 항상 조회해 금액/실패사유를 ARMED 로그에 출력, P0-12) ──
+    let orderableQtyOk = false;
+    let cashLog = 'cashOrderable=미조회';
+    if (sig.action === 'BUY' && ctx.builder.confirmedCount >= MIN_RT_CANDLES) {
+      await refreshDeposit();
+      orderableQtyOk = depOk && buyPrice > 0 && depCash >= need;   // 조회성공 AND 1주 매수 가능
+      cashLog = depOk
+        ? `cashOrderable=${depCash.toFixed(2)} USD (필요=${need.toFixed(2)}, rsp_cd=${depRspCd})`
+        : `cashOrderable 조회실패 rsp_cd=${depRspCd} rsp_msg=${scrub(depRspMsg)}`;
+    }
 
     const state: GateState = {
       confirmedCount: ctx.builder.confirmedCount, signalAction: sig.action, wsConnected: client.connected,
@@ -266,7 +278,7 @@ async function main() {
       orderableQtyOk, duplicateCandleOrdered: dup, hasPendingOrder: pending,
     };
     const g = evaluateTradeGate(state);
-    log.info(`[ARMED ${ctx.symbol}] armed=${g.armed} 통과=${g.passed.length}/10${g.blockedBy.length ? ` 차단=[${g.blockedBy.join(', ')}]` : ''}`);
+    log.info(`[ARMED ${ctx.symbol}] armed=${g.armed} 통과=${g.passed.length}/10 ${cashLog}${g.blockedBy.length ? ` 차단=[${g.blockedBy.join(', ')}]` : ''}`);
     if (!g.armed) return;
 
     const live = canExecuteLive(g.armed, liveCfg.liveTrading, { manualCancel: liveCfg.manualCancel, cancelEnvConfirmed: liveCfg.cancelConfirmed });

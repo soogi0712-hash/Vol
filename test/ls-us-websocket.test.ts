@@ -192,6 +192,17 @@ describe('LSUSRealtimeClient (fake socket)', () => {
     expect(events[0]).toMatchObject({ tr: 'AS1' });
     expect(events[0].b.sOrdNo).toBe('141');
   });
+  it('등록응답 tr_cd 가 빈 문자열이어도 FIFO 로 AS0~AS4 귀속(P0-12)', () => {
+    const ws = fakeWs();
+    const acks: Array<{ tr: string }> = [];
+    const client = new LSUSRealtimeClient('TOK', { onRegisterAck: (tr) => acks.push({ tr }) }, { wsFactory: () => ws, accountEvents: true });
+    client.connect([{ exchcd: '82', symbol: 'AAPL' }]);
+    ws.onopen?.();   // 전송 순서: GSC, GSH, AS0, AS1, AS2, AS3, AS4
+    // 등록응답 7건 모두 tr_cd 빈 문자열 → FIFO 로 순서대로 귀속
+    for (let i = 0; i < 7; i++) ws.onmessage?.({ data: JSON.stringify({ header: { tr_cd: '', rsp_cd: '0', rsp_msg: '정상 처리 되었습니다.' } }) });
+    // GSC/GSH 는 onRegisterAck 대상 아님. AS0~AS4 5건만 콜백.
+    expect(acks.map(a => a.tr)).toEqual(['AS0', 'AS1', 'AS2', 'AS3', 'AS4']);
+  });
   it('재연결 시 GSC/GSH + AS0~AS4 모두 자동 재등록', async () => {
     const sockets: any[] = [];
     const client = new LSUSRealtimeClient('TOK', {}, { wsFactory: () => { const w = fakeWs(); sockets.push(w); return w; }, accountEvents: true, backoffMs: [1], sleep: async () => {} });

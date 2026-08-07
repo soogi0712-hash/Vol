@@ -297,6 +297,7 @@ export class LSUSRealtimeClient {
   private subs: SymbolSub[] = [];
   private closedByUser = false;
   private isConnected = false;   // onopen~onclose 사이 true (readiness 의 websocketConnected)
+  private regQueue: string[] = [];   // 등록 전송 순서(등록응답 FIFO 귀속 — 실계정 tr_cd 빈 문자열 대응)
   private lastMsgAt = 0;
   private staleTimer: ReturnType<typeof setInterval> | null = null;
   private attempt = 0;
@@ -350,18 +351,22 @@ export class LSUSRealtimeClient {
   }
 
   private registerAll(): void {
+    this.regQueue = [];   // 재연결 시 초기화 — 등록응답(ack) FIFO 귀속용
     // 시세(GSC/GSH) 등록 — tr_type="3", 종목별 tr_key(18자리 패딩)
     for (const s of this.subs) {
       const trKey = buildWsTrKey(s.exchcd, s.symbol);
       for (const tr of ['GSC', 'GSH'] as const) {
         this.ws?.send(JSON.stringify(buildRegisterMessage(this.token, tr, trKey, '3')));
+        this.regQueue.push(tr);
       }
     }
     // 계좌 주문이벤트(AS0~AS4) 등록 — tr_type="1", tr_key="" (재연결 시에도 자동 재등록)
     if (this.accountEvents) {
       for (const tr of LS_ACCOUNT_EVENT_TRS) {
         this.ws?.send(JSON.stringify(buildRegisterMessage(this.token, tr, '', '1')));
+        this.regQueue.push(tr);
       }
+      this.hooks.onStatus?.(`계좌이벤트 등록요청 전송(tr_type=1): ${LS_ACCOUNT_EVENT_TRS.join(', ')}`);
     }
   }
 
@@ -371,11 +376,14 @@ export class LSUSRealtimeClient {
     catch { return; }
     const trCd = String(msg?.header?.tr_cd ?? '');
     if (trCd === 'PINGPONG') { this.ws?.send(JSON.stringify(msg)); return; }   // heartbeat echo
-    // 등록 성공/실패 응답(헤더에 rsp_cd/rsp_msg) — 데이터가 아닌 ack
+    // 등록 성공/실패 응답(헤더에 rsp_cd/rsp_msg) — 데이터가 아닌 ack.
+    // ⚠️ 실계정 등록응답은 header.tr_cd 가 빈 문자열인 경우가 있어, 등록 전송 순서(FIFO)로 TR 을 귀속한다.
     if (msg?.header?.rsp_cd !== undefined || msg?.header?.rsp_msg !== undefined) {
       const rspCd = String(msg.header.rsp_cd ?? ''); const rspMsg = String(msg.header.rsp_msg ?? '');
-      this.hooks.onStatus?.(`등록응답 tr_cd=${trCd} rsp_cd=${rspCd} rsp_msg=${rspMsg}`);
-      if ((LS_ACCOUNT_EVENT_TRS as readonly string[]).includes(trCd)) this.hooks.onRegisterAck?.(trCd, rspCd, rspMsg);
+      const shifted = this.regQueue.shift();   // 전송 순서대로 1:1 귀속(등록 1건당 응답 1건 가정)
+      const ackTr = trCd || String(msg?.body?.tr_cd ?? '') || shifted || '?';
+      this.hooks.onStatus?.(`등록응답 tr_cd=${ackTr} rsp_cd=${rspCd} rsp_msg=${rspMsg}`);
+      if ((LS_ACCOUNT_EVENT_TRS as readonly string[]).includes(ackTr)) this.hooks.onRegisterAck?.(ackTr, rspCd, rspMsg);
       return;
     }
     if (!msg?.body) return;
