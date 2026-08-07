@@ -8,7 +8,7 @@ beforeEach(() => { saved = {}; for (const k of KEYS) { saved[k] = process.env[k]
 afterEach(() => { for (const k of KEYS) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]; } });
 
 describe('P0-10 최종 체크리스트', () => {
-  it('오늘 기본 설정(AAPL·1주·하루1) → 10개 플래그 전부 true, US_LIVE_READY=true', () => {
+  it('오늘 기본 설정(AAPL·1주·하루1) → 안전장치 true, 단 타통화+원화 미확인이라 US_LIVE_READY=false(P0-16 하드차단)', () => {
     const c = computeUSP0Checklist(loadLiveConfig());
     expect(c).toEqual({
       MANUAL_CANCEL_MODE: true,
@@ -20,7 +20,8 @@ describe('P0-10 최종 체크리스트', () => {
       US_AS_EVENT_LINKED: true,
       US_SINGLE_POST_PER_CANDLE: true,
       US_DAILY_BUY_LIMIT: true,
-      US_LIVE_READY: true,
+      US_CROSS_WON_VERIFIED: false,   // 코드상수 봉인 → 항상 false
+      US_LIVE_READY: false,           // 타통화+원화 공식 필드 실측확인 전까지 실전 불가
     });
   });
   it('LS_AUTO_CANCEL_MODE=true 여도 코드상수(취소TR 미확인)로 자동취소 불가 → 수동모드 유지', () => {
@@ -28,7 +29,8 @@ describe('P0-10 최종 체크리스트', () => {
     const c = computeUSP0Checklist(loadLiveConfig());
     expect(c.AUTO_CANCEL_MODE).toBe(false);
     expect(c.MANUAL_CANCEL_MODE).toBe(true);
-    expect(c.US_LIVE_READY).toBe(true);
+    expect(c.US_CROSS_WON_VERIFIED).toBe(false);
+    expect(c.US_LIVE_READY).toBe(false);   // P0-16: 타통화+원화 미확인 하드차단
   });
   it('일일제한 위반(종목/수량) → US_DAILY_BUY_LIMIT=false, US_LIVE_READY=false', () => {
     process.env.LS_US_LIVE_SYMBOL = 'NASDAQ:TSLA';

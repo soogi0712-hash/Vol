@@ -12,6 +12,7 @@ export interface USP0Checklist {
   US_AS_EVENT_LINKED: boolean;            // AS0/AS1/AS3/AS4 ↔ 주문번호 pending 연결(구현됨)
   US_SINGLE_POST_PER_CANDLE: boolean;     // 같은 candle 1회 POST(idempotent 와 동일 보장)
   US_DAILY_BUY_LIMIT: boolean;            // AAPL·qty1·하루 BUY1 제한(설정 확인)
+  US_CROSS_WON_VERIFIED: boolean;         // 타통화+원화(통합증거금/선환전) 공식 필드 실측확인(P0-16). 미확인이면 BUY 하드차단.
   US_LIVE_READY: boolean;                 // 위 전부 충족(+수동취소 모드) → 실전 가능
 }
 
@@ -28,12 +29,13 @@ export function computeUSP0Checklist(cfg: LiveConfig): USP0Checklist {
     US_AS_EVENT_LINKED: true,
     US_SINGLE_POST_PER_CANDLE: true,
     US_DAILY_BUY_LIMIT: dailyOk,
+    US_CROSS_WON_VERIFIED: cfg.crossWonVerified,   // 실측확인 전 false → 타통화+원화 경로 BUY 하드차단
   };
-  // 실전 준비 = 안전장치 전부 true + 수동취소 모드(자동취소 미확인이므로) + 일일제한 OK.
+  // 실전 준비 = 안전장치 전부 true + 수동취소 모드(자동취소 미확인이므로) + 일일제한 OK + 타통화+원화 필드 실측확인.
   const READY = base.MANUAL_CANCEL_MODE && !base.AUTO_CANCEL_MODE
     && base.US_ORDER_POST_IDEMPOTENT && base.US_CASH_ONLY_GATE && base.US_PENDING_REORDER_BLOCKED
     && base.US_RESTART_RECONCILIATION && base.US_AS_EVENT_LINKED && base.US_SINGLE_POST_PER_CANDLE
-    && base.US_DAILY_BUY_LIMIT;
+    && base.US_DAILY_BUY_LIMIT && base.US_CROSS_WON_VERIFIED;
   return { ...base, US_LIVE_READY: READY };
 }
 

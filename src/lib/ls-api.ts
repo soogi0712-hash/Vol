@@ -653,51 +653,60 @@ export async function getLSUSDeposit(cfg: LSConfig, token: string): Promise<LSUS
   };
 }
 
-// ── cash-only 주문가능수량 판정 (P0-16) — HTS 표시와 100% 동일하게 맞춘다 ──
-// 실계정 HTS 검증(결정적 증거):
-//   · HTS "거래국가 통화 가능수량"  = FcurrOrdAbleAmt(외화주문가능, USD 현금만) ÷ 주문가(1주비용). 실계정 0 == HTS 0(정확일치).
-//   · HTS "타통화+원화 가능수량"     = PrexchOrdAbleAmt(선환전주문가능, 先換錢=타통화+원화 현금 선환전) ÷ 주문가.
-// ⚠️ 이전 P0-15 는 원화예수금(WonDpsBalAmt) 한도까지 추가로 요구해 HTS 와 어긋났다(선환전 가능액은 타통화 현금도
-//    담보로 포함하므로 원화예수금만으로 캡하면 과도차단). 공식 선환전 필드(PrexchOrdAbleAmt)를 그대로 사용한다.
-// cash-only 보증: OvrsMgn(해외증거금/미수 잔액)==0 이 유일·충분한 근거(선환전주문가능은 LS 가 산출한 '미수 없이
-//    선환전으로 주문가능한 현금' 금액이며, 신용/미수 사용분은 OvrsMgn 으로 드러난다). OvrsMgn>0 이면 즉시 차단.
+// ── cash-only 주문가능수량 판정 (P0-16 재검토) — 확인된 필드만 사용, 나머지는 하드 차단 ──
+// 확정(실계정 결정적 일치):
+//   · "거래국가 통화 가능수량" = FcurrOrdAbleAmt(외화주문가능, USD 현금만) ÷ 주문가. 실계정 0 == HTS 0(정확일치).
+// 미확정(⚠️ 추측 금지 — LIVE 하드 차단):
+//   · "타통화+원화 가능수량"(통합증거금/선환전)을 결정하는 공식 필드는 아직 실측 확인 안 됨. 사용자가 올린 "2" 는
+//     조회결과가 아니라 주문창 수량 입력값(버튼 라벨 오해)이었다. PrexchOrdAbleAmt(선환전주문가능)를 그 값으로 단정
+//     불가: 실계정 PrexchOrdAbleAmt=97.29USD 인데 AAPL≈311USD → 정수주 0. 통합증거금 신청 후 값이 바뀌는지,
+//     HTS 버튼을 실제로 눌렀을 때 어떤 필드/팝업이 수량을 결정하는지 사용자 실측 확인 전까지 이 경로는 신뢰하지 않는다.
+//   · OvrsMgn==0 은 '현재 미수 잔액 없음' 을 뜻할 수 있어도, PrexchOrdAbleAmt 가 전체 통합증거금 주문가능액이라는
+//     근거가 되지 못한다(별개 사실). 따라서 코드상수로 봉인한다.
+// LS_US_CROSS_WON_TR_CONFIRMED=false 인 동안: 타통화+원화(선환전/통합증거금) 경로로는 절대 LIVE 허용 불가.
+//   → USD 현금(FcurrOrdAbleAmt) 이 필요수량을 덮는 경우에만 결제 가능. 실계정 USD현금=0 이므로 사실상 US BUY 하드차단.
+export const LS_US_CROSS_WON_TR_CONFIRMED = false;   // 사용자 실측으로 공식 필드 확인 시 true 로 전환
 export type USPaymentMode = 'USD' | 'KRW' | 'NONE';
 export interface USCashDecision {
   paymentMode: USPaymentMode; orderAllowed: boolean; reason: string;
   usdCash: number; krwCash: number; baseXchRate: number; overseasMargin: number;
   estimatedUsd: number; estimatedKrw: number; cashOnlyUsdCap: number;
-  qtyCountry: number;   // HTS "거래국가 통화 가능수량"(USD 현금만) = floor(FcurrOrdAbleAmt / price)
-  qtyCrossWon: number;  // HTS "타통화+원화 가능수량"(선환전) = floor(PrexchOrdAbleAmt / price)
+  qtyCountry: number;    // "거래국가 통화 가능수량"(USD 현금만) = floor(FcurrOrdAbleAmt / price) [확정]
+  qtyCrossWon: number;   // 참고표시용: floor(PrexchOrdAbleAmt / price) [미확정 — LIVE 판정에 미사용]
+  crossWonVerified: boolean;   // 타통화+원화 경로 실측확인 여부(=env AND 코드상수). false 면 해당 경로 LIVE 차단.
 }
-// 계좌가 순수현금(USD현금 or 타통화+원화 선환전)으로 결제 가능한 최대 USD 명목금액(레버리지 제외). 가격 무관.
-// OvrsMgn(미수)>0 이면 0. 그 외에는 공식 선환전주문가능(PrexchOrdAbleAmt, USD현금 FcurrOrdAbleAmt 포함) 사용.
-export function usCashOnlyUsdCap(dep: LSUSDeposit): number {
+// 계좌가 순수현금으로 결제 가능한 최대 USD 명목금액. OvrsMgn>0 → 0.
+// 기본: USD 현금(FcurrOrdAbleAmt)만. 타통화+원화 선환전은 실측확인(crossWonVerified)된 경우에만 포함.
+export function usCashOnlyUsdCap(dep: LSUSDeposit, opts: { crossWonVerified?: boolean } = {}): number {
   if (!dep.ok || dep.overseasMargin > 0) return 0;   // 미수/증거금 사용 계좌 → cash-only 불가
-  return Math.max(dep.usdOrderable, dep.usdPrexchOrderable);   // 거래국가(USD) vs 타통화+원화 선환전 중 큰 값
+  const verified = !!opts.crossWonVerified && LS_US_CROSS_WON_TR_CONFIRMED;
+  return verified ? Math.max(dep.usdOrderable, dep.usdPrexchOrderable) : dep.usdOrderable;
 }
-// HTS "타통화+원화 가능수량"(및 "거래국가 통화 가능수량")과 동일한 방식으로 주문가능수량을 계산한다.
+// 진단표시용 주문가능수량(거래국가/타통화+원화). qtyCrossWon 은 참고용일 뿐 LIVE 판정 근거가 아니다.
 export function usOrderableQty(dep: LSUSDeposit, priceUsd: number): { qtyCountry: number; qtyCrossWon: number } {
   if (!dep.ok || dep.overseasMargin > 0 || !(priceUsd > 0)) return { qtyCountry: 0, qtyCrossWon: 0 };
   return {
-    qtyCountry: Math.floor(dep.usdOrderable / priceUsd),        // 거래국가 통화(USD 현금)
-    qtyCrossWon: Math.floor(dep.usdPrexchOrderable / priceUsd), // 타통화+원화 선환전
+    qtyCountry: Math.floor(dep.usdOrderable / priceUsd),        // 거래국가 통화(USD 현금) [확정]
+    qtyCrossWon: Math.floor(dep.usdPrexchOrderable / priceUsd), // 타통화+원화 선환전 [미확정·참고]
   };
 }
-export function decideUSCashPayment(dep: LSUSDeposit, priceUsd: number, qty: number): USCashDecision {
+export function decideUSCashPayment(dep: LSUSDeposit, priceUsd: number, qty: number, opts: { crossWonVerified?: boolean } = {}): USCashDecision {
   const estimatedUsd = priceUsd * qty;
   const { qtyCountry, qtyCrossWon } = usOrderableQty(dep, priceUsd);
+  const crossWonVerified = !!opts.crossWonVerified && LS_US_CROSS_WON_TR_CONFIRMED;   // 코드상수로 최종 봉인
   const base = {
     usdCash: dep.usdCash, krwCash: dep.krwCash, baseXchRate: dep.baseXchRate, overseasMargin: dep.overseasMargin,
     estimatedUsd, estimatedKrw: estimatedUsd * (dep.baseXchRate > 0 ? dep.baseXchRate : 0),
-    cashOnlyUsdCap: usCashOnlyUsdCap(dep), qtyCountry, qtyCrossWon,
+    cashOnlyUsdCap: usCashOnlyUsdCap(dep, { crossWonVerified }), qtyCountry, qtyCrossWon, crossWonVerified,
   };
   if (!dep.ok) return { ...base, paymentMode: 'NONE', orderAllowed: false, reason: 'INVALID_RESPONSE' };
   if (dep.overseasMargin > 0) return { ...base, paymentMode: 'NONE', orderAllowed: false, reason: 'MARGIN_PRESENT' };
   if (!(priceUsd > 0) || !(qty > 0)) return { ...base, paymentMode: 'NONE', orderAllowed: false, reason: 'INVALID_PRICE' };
-  // (2) 거래국가 통화(USD 현금) 로 필요수량 결제 가능
+  // (2) 거래국가 통화(USD 현금) 로 필요수량 결제 가능 — 확정 경로만 LIVE 허용
   if (qtyCountry >= qty) return { ...base, paymentMode: 'USD', orderAllowed: true, reason: 'USD_CASH' };
-  // (3) 타통화+원화 선환전(HTS 와 동일) 으로 필요수량 결제 가능 — 미수 없음(OvrsMgn==0)
-  if (qtyCrossWon >= qty) return { ...base, paymentMode: 'KRW', orderAllowed: true, reason: 'CROSS_WON_PREXCH' };
+  // (3) 타통화+원화 선환전 — 실측확인(crossWonVerified) 전까지 절대 허용 금지(하드 차단)
+  if (qtyCrossWon >= qty && crossWonVerified) return { ...base, paymentMode: 'KRW', orderAllowed: true, reason: 'CROSS_WON_PREXCH_VERIFIED' };
+  if (qtyCrossWon >= qty && !crossWonVerified) return { ...base, paymentMode: 'NONE', orderAllowed: false, reason: 'CROSS_WON_UNVERIFIED' };
   return { ...base, paymentMode: 'NONE', orderAllowed: false, reason: 'ORDERABLE_QTY_INSUFFICIENT' };
 }
 
