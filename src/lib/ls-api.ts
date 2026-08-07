@@ -625,7 +625,25 @@ export interface LSUSDeposit {
   krwWithdrawable: number;    // OutBlock4 MnyoutAbleAmt (출금가능 — 순수현금 근거)
   krwPrexchable: number;      // OutBlock4 WonPrexchAbleAmt (원화 선환전 가능 KRW 현금)
   overseasMargin: number;     // OutBlock4 OvrsMgn (해외증거금/미수 — 0 이어야 cash-only)
+  // ── 후보 필드(P0-18) — HTS "타통화+원화 가능수량" 결정 필드 실측대조용 ──
+  t4FcurrDps: number;         // OutBlock3 USD T4FcurrDps (T+4 외화예수금)
+  fcurrOrdAmt: number;        // OutBlock3 USD FcurrOrdAmt (외화주문금액)
+  fcurrMxchgAbleAmt: number;  // OutBlock3 USD FcurrMxchgAbleAmt (외화환전가능금액)
+  fcurrPldgAmt: number;       // OutBlock3 USD FcurrPldgAmt (외화담보금액 — 담보/증거금 성격)
+  loanAmt: number;            // OutBlock3 USD LoanAmt (대출금액 — 있으면 cash-only 아님)
   usdDeposit: number;         // 하위호환: = usdCash
+  rawMasked: any;             // 민감정보(AcntNo/Pwd 등) 마스킹한 COSOQ02701 전체 응답(진단 출력용)
+}
+// LS 응답에서 계좌번호/비밀번호 등 민감 키를 재귀적으로 마스킹.
+const LS_SENSITIVE_KEY = /acntno|passwd|\bpwd\b|password|account/i;
+export function maskLSResponse(obj: any): any {
+  if (Array.isArray(obj)) return obj.map(maskLSResponse);
+  if (obj && typeof obj === 'object') {
+    const out: any = {};
+    for (const [k, v] of Object.entries(obj)) out[k] = LS_SENSITIVE_KEY.test(k) ? '****' : maskLSResponse(v);
+    return out;
+  }
+  return obj;
 }
 export async function getLSUSDeposit(cfg: LSConfig, token: string): Promise<LSUSDeposit> {
   const { data, rspCd, rspMsg, diag } = await lsPost(token, '/overseas-stock/accno', 'COSOQ02701', {
@@ -649,7 +667,13 @@ export async function getLSUSDeposit(cfg: LSConfig, token: string): Promise<LSUS
     krwWithdrawable: ob4 ? toNum(ob4.MnyoutAbleAmt) : 0,
     krwPrexchable: ob4 ? toNum(ob4.WonPrexchAbleAmt) : 0,
     overseasMargin: ob4 ? toNum(ob4.OvrsMgn) : 0,
+    t4FcurrDps: usd ? toNum(usd.T4FcurrDps) : 0,
+    fcurrOrdAmt: usd ? toNum(usd.FcurrOrdAmt) : 0,
+    fcurrMxchgAbleAmt: usd ? toNum(usd.FcurrMxchgAbleAmt) : 0,
+    fcurrPldgAmt: usd ? toNum(usd.FcurrPldgAmt) : 0,
+    loanAmt: usd ? toNum(usd.LoanAmt) : 0,
     usdDeposit: usdCash,   // 하위호환
+    rawMasked: maskLSResponse(data),
   };
 }
 
@@ -717,6 +741,90 @@ export function formatCashOrderableLine(s: { ok: boolean; cash: number; rspCd: s
   return s.ok
     ? `cashOrderable=${s.cash.toFixed(2)} USD (rsp_cd=${s.rspCd})`
     : `cashOrderable=조회실패 rsp_cd=${s.rspCd} rsp_msg=${s.rspMsg}`;
+}
+
+// ── 통합증거금(타통화+원화) 주문가능수량 실측대조 엔진 (P0-18) ──
+// 목표: HTS 에서 실제 "타통화+원화 가능수량" 버튼으로 표시되는 수량과, 같은 시각·같은 주문가(bestAsk)로
+//       각 후보 필드에서 계산한 프로그램 수량을 대조하여, "정확히 일치하는" 공식 필드/조합만 채택한다(추측 금지).
+// 채택 전까지 CROSS_WON_ADOPTED_FIELD=null → programQty 판정 불가 → LIVE 하드차단 유지.
+// cash-only 원칙: 신용/미수/대출/증거금(담보) 잔액이 하나라도 >0 이면 cashOnly=false → 주문 금지.
+export type CrossWonFieldKey =
+  | 'FcurrOrdAbleAmt' | 'PrexchOrdAbleAmt' | 'FcurrOrdAmt' | 'FcurrMxchgAbleAmt' | 'T4FcurrDps'
+  | 'WonPrexchAbleAmt' | 'WonDpsBalAmt' | 'MnyoutAbleAmt';
+export interface CrossWonCandidate {
+  key: CrossWonFieldKey; label: string; basis: 'USD' | 'KRW';
+  amount: number; perShareCost: number; qty: number; match: boolean | null;
+}
+export interface CrossWonEval {
+  bestAsk: number; baseXchRate: number; htsQty: number | null;
+  candidates: CrossWonCandidate[];
+  adoptedField: CrossWonFieldKey | null;
+  programQty: number;              // 채택 필드 기준(미채택이면 0)
+  matchedKeys: CrossWonFieldKey[]; // htsQty 와 정확히 일치한 후보들(실측 대조 결과)
+  match: boolean | null;           // htsQty!=null && 채택필드 있음 && programQty===htsQty
+  cashOnly: boolean;               // 미수/대출/담보 잔액 전부 0
+  cashOnlyBlockers: string[];      // cashOnly=false 사유(필드=값)
+  crossWonConfirmed: boolean;      // 코드상수(공식 필드 확정) — false 면 절대 허용 금지
+  orderAllowed: boolean;
+  reason: string;
+}
+// ⚠️ 실측으로 HTS 수량과 일치하는 필드가 확정되기 전까지 null(채택 없음) 유지 — 추측 금지.
+export const CROSS_WON_ADOPTED_FIELD: CrossWonFieldKey | null = null;
+
+export function evaluateCrossWon(dep: LSUSDeposit, bestAsk: number, htsQty: number | null): CrossWonEval {
+  const rate = dep.baseXchRate;
+  const usdCost = bestAsk;                 // USD 기준 1주 비용
+  const krwCost = bestAsk * rate;          // KRW 기준 1주 비용(환산)
+  const mk = (key: CrossWonFieldKey, label: string, basis: 'USD' | 'KRW', amount: number): CrossWonCandidate => {
+    const perShareCost = basis === 'USD' ? usdCost : krwCost;
+    const qty = (dep.ok && perShareCost > 0) ? Math.floor(amount / perShareCost) : 0;
+    return { key, label, basis, amount, perShareCost, qty, match: htsQty == null ? null : qty === htsQty };
+  };
+  const candidates: CrossWonCandidate[] = [
+    mk('FcurrOrdAbleAmt', '외화주문가능(거래국가 통화·USD현금)', 'USD', dep.usdOrderable),
+    mk('PrexchOrdAbleAmt', '선환전 주문가능(USD)', 'USD', dep.usdPrexchOrderable),
+    mk('FcurrOrdAmt', '외화주문금액(USD)', 'USD', dep.fcurrOrdAmt),
+    mk('FcurrMxchgAbleAmt', '외화환전가능(USD)', 'USD', dep.fcurrMxchgAbleAmt),
+    mk('T4FcurrDps', 'T+4 외화예수금(USD)', 'USD', dep.t4FcurrDps),
+    mk('WonPrexchAbleAmt', '원화 선환전 가능(KRW)', 'KRW', dep.krwPrexchable),
+    mk('WonDpsBalAmt', '원화예수금잔고(KRW)', 'KRW', dep.krwCash),
+    mk('MnyoutAbleAmt', '출금가능(KRW)', 'KRW', dep.krwWithdrawable),
+  ];
+  const matchedKeys = htsQty == null ? [] : candidates.filter(c => c.qty === htsQty).map(c => c.key);
+  // cash-only: 미수(OvrsMgn)/대출(LoanAmt)/담보(FcurrPldgAmt) 잔액 전부 0 이어야 함
+  const cashOnlyBlockers: string[] = [];
+  if (dep.overseasMargin > 0) cashOnlyBlockers.push(`OvrsMgn=${dep.overseasMargin}`);
+  if (dep.loanAmt > 0) cashOnlyBlockers.push(`LoanAmt=${dep.loanAmt}`);
+  if (dep.fcurrPldgAmt > 0) cashOnlyBlockers.push(`FcurrPldgAmt=${dep.fcurrPldgAmt}`);
+  const cashOnly = cashOnlyBlockers.length === 0;
+
+  const adoptedField = CROSS_WON_ADOPTED_FIELD;
+  const adopted = adoptedField ? candidates.find(c => c.key === adoptedField) ?? null : null;
+  const programQty = adopted ? adopted.qty : 0;
+  const match = (htsQty != null && adopted != null) ? programQty === htsQty : null;
+  const crossWonConfirmed = LS_US_CROSS_WON_TR_CONFIRMED;
+
+  let reason = 'OK';
+  if (!dep.ok) reason = 'INVALID_RESPONSE';
+  else if (!(bestAsk > 0)) reason = 'PRICE_UNAVAILABLE';
+  else if (!crossWonConfirmed) reason = 'CROSS_WON_UNCONFIRMED';   // 코드상수 미확정 → 하드차단
+  else if (adopted == null) reason = 'NO_ADOPTED_FIELD';
+  else if (htsQty == null) reason = 'HTS_QTY_MISSING';
+  else if (match !== true) reason = 'HTS_QTY_MISMATCH';
+  else if (!cashOnly) reason = 'NOT_CASH_ONLY';
+  else if (programQty < 1) reason = 'CROSS_WON_INSUFFICIENT';
+  const orderAllowed = reason === 'OK';
+
+  return {
+    bestAsk, baseXchRate: rate, htsQty, candidates, adoptedField, programQty,
+    matchedKeys, match, cashOnly, cashOnlyBlockers, crossWonConfirmed, orderAllowed, reason,
+  };
+}
+// [CROSS-WON-CHECK] 최종 로그 라인(요구 형식).
+export function formatCrossWonCheck(symbol: string, e: CrossWonEval): string {
+  return `[CROSS-WON-CHECK ${symbol}] bestAsk=${e.bestAsk.toFixed(2)} HTS orderableQty=${e.htsQty == null ? '미입력' : e.htsQty}`
+    + ` PROGRAM orderableQty=${e.adoptedField ? e.programQty : '미채택'} MATCH=${e.match == null ? 'N/A' : e.match}`
+    + ` paymentMode=CROSS_WON cashOnly=${e.cashOnly} orderAllowed=${e.orderAllowed}${e.orderAllowed ? '' : ` (${e.reason})`}`;
 }
 
 // ── 미체결 취소 (COSAT00311) — ⚠️ 공식 카탈로그에 필드(reqExample/InBlock) 미수록 ──

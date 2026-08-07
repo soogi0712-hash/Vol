@@ -10,7 +10,8 @@ import { makeScrubber } from './mask';
 import {
   getLSUS15MinPaged, getLSUSTicksPaged, getLSUSDeposit,
   placeLSUSBuyOrder, queryLSUSOrderExec, cancelLSUSOrder, LSApiError,
-  decideUSCashPayment, usCashOnlyUsdCap, usOrderableQty, formatCashOrderableLine, LS_US_CROSS_WON_TR_CONFIRMED, type LSUSDeposit,
+  decideUSCashPayment, usCashOnlyUsdCap, usOrderableQty, formatCashOrderableLine,
+  evaluateCrossWon, formatCrossWonCheck, LS_US_CROSS_WON_TR_CONFIRMED, type LSUSDeposit,
 } from '../src/lib/ls-api';
 import {
   LSUSRealtimeClient, RealtimeCandleBuilder, buildWsTrKey, evaluateReadiness, MIN_RT_CANDLES,
@@ -212,12 +213,28 @@ async function main() {
     if (!liveCfg.crossWonVerified) log.warn(`[${tag}-BLOCK ${liveCfg.liveSymbol}] 타통화+원화(통합증거금/선환전) 공식 필드 미확인 → US BUY 하드차단. 확인 절차: HTS 에서 실제 "타통화+원화 가능수량" 버튼을 눌러 나오는 금액/수량과 위 후보필드(PrexchOrdAbleAmt/WonPrexchAbleAmt 등)를 대조 후 코드상수 LS_US_CROSS_WON_TR_CONFIRMED 전환 필요.`);
   }
 
+  // ── P0-18: 통합증거금(타통화+원화) 가능수량 실측대조 로그 — 후보필드별 프로그램 수량 vs HTS 실측 + [CROSS-WON-CHECK] ──
+  function logCrossWon(tag: string, priceUsd: number): void {
+    if (!depOk || !depFull) { log.error(`[${tag} ${liveCfg.liveSymbol}] 예수금조회 실패 rsp_cd=${depRspCd} rsp_msg=${scrub(depRspMsg)} → 주문 차단`); return; }
+    const e = evaluateCrossWon(depFull, priceUsd, liveCfg.htsOrderableQty);
+    // 후보 필드별 계산 수량(같은 bestAsk 기준) — 사용자가 HTS 실측값과 대조해 일치 필드 식별
+    for (const c of e.candidates) {
+      log.info(`[${tag}-CAND ${liveCfg.liveSymbol}] ${c.key}(${c.label}) [${c.basis}] amount=${c.amount} / 1주비용=${c.perShareCost.toFixed(4)} → qty=${c.qty}${c.match == null ? '' : ` / HTS일치=${c.match}`}`);
+    }
+    log.info(`[${tag}-CASHONLY ${liveCfg.liveSymbol}] cashOnly=${e.cashOnly}${e.cashOnly ? '' : ` 차단필드=[${e.cashOnlyBlockers.join(', ')}]`} (미수 OvrsMgn=${Math.round(depFull.overseasMargin)} / 대출 LoanAmt=${Math.round(depFull.loanAmt)} / 담보 FcurrPldgAmt=${depFull.fcurrPldgAmt.toFixed(2)})`);
+    if (e.htsQty != null) log.info(`[${tag}-MATCHED ${liveCfg.liveSymbol}] HTS실측=${e.htsQty} 와 일치하는 후보필드=[${e.matchedKeys.join(', ') || '없음'}] (채택필드=${e.adoptedField ?? '미채택'})`);
+    log.info(formatCrossWonCheck(liveCfg.liveSymbol, e));
+  }
+
   // ── P0-13/P0-15: 프로그램 시작 직후 BUY 여부와 무관하게 예수금 1회 조회 + 진단 로그. 실패면 LIVE 금지 ──
   await refreshDeposit(true);
   const startupPrice = ctxs.get(liveCfg.liveSymbol)?.lastPrice ?? 0;   // 시작 시 알 수 있는 참조가(시드/실시간). 없으면 0
   if (depOk) log.info(`[STARTUP-CASH ${liveCfg.liveSymbol}] cashOrderable(cash-only)=${depCash.toFixed(2)} USD rsp_cd=${depRspCd}`);
   else log.error(`[STARTUP-CASH ${liveCfg.liveSymbol}] cashOrderable 조회실패 rsp_cd=${depRspCd} rsp_msg=${scrub(depRspMsg)} → LIVE 금지`);
   logUSCashDiag('STARTUP-US-CASH', startupPrice);
+  // ── P0-18: COSOQ02701 전체 실계정 원본(민감정보 마스킹) 출력 — 후보 필드 대조용 ──
+  if (depFull?.rawMasked) log.info(`[COSOQ02701-RAW ${liveCfg.liveSymbol}] ${scrub(JSON.stringify(depFull.rawMasked))}`);
+  logCrossWon('STARTUP-CROSS-WON', startupPrice);   // 후보필드별 수량 + [CROSS-WON-CHECK]
   const startupCashOk = depOk;
 
   // ── P0-16 하드차단: 타통화+원화(통합증거금/선환전) 공식 필드 미확인 → US BUY 원천 차단(LS_LIVE_TRADING=true 여도) ──
@@ -315,9 +332,13 @@ async function main() {
     let orderableQtyOk = false;
     const isBuySignal = sig.action === 'BUY' && ctx.builder.confirmedCount >= MIN_RT_CANDLES;
     if (isBuySignal) {
-      await refreshDeposit(true);          // BUY 직전 강제 재조회(P0-17 #4,#6)
-      orderableQtyOk = usOrderAllowed(buyPrice).allowed;   // 확정경로(USD현금)만 허용, 타통화+원화는 하드차단
+      await refreshDeposit(true);          // BUY 직전 강제 재조회(P0-17 #4,#6 / P0-18 #9 재검증)
+      // 통합증거금(타통화+원화) 경로: 실측대조·cash-only 재확인. 채택필드+코드상수 확정 전까지 하드차단.
+      const crossWon = depFull ? evaluateCrossWon(depFull, buyPrice, liveCfg.htsOrderableQty) : null;
+      // 확정경로(USD현금) 또는 확정된 통합증거금 경로 중 하나라도 허용이면 통과(현재 둘 다 하드차단).
+      orderableQtyOk = usOrderAllowed(buyPrice).allowed || !!(crossWon && crossWon.orderAllowed);
       logUSCashDiag('BUY-US-CASH', buyPrice);              // BUY 직전 상세 진단(P0-16)
+      logCrossWon('BUY-CROSS-WON', buyPrice);              // BUY 직전 통합증거금 실측대조(P0-18)
     } else {
       await refreshDeposit();              // 60초 캐시 사용(만료 시에만 재조회) — 재조회 전엔 캐시 유지
     }

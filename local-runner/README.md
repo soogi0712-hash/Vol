@@ -223,7 +223,35 @@ AAPL 1종목에 대해 `g3203 / g3202 / g3103 / g3204` 를 각 1회 호출해
 `FcurrMxchgAbleAmt` 등)와 대조해 **어떤 필드가 그 수량을 결정하는지 확정**한 뒤, 코드상수를 전환한다.
 진단 로그(BUY 직전 실제 bestAsk≈311 사용):
 `거래국가통화 가능수량(확정) / 타통화+원화 가능수량(참고·미확정) / crossWon실측확인 / orderAllowed(사유)`.
-`LS_US_HTS_ORDERABLE_QTY` 는 참고용 관찰값일 뿐이며, 불일치 시 '차단'만 하고 허용 근거로는 쓰지 않는다.
+
+### P0-18 — 통합증거금(타통화+원화) 가능수량 실측대조 하네스 (목표: HTS 와 정확 일치)
+
+미국 자동매매는 USD 직접환전이 아니라 **LS 통합증거금(타통화+원화 가능수량)** 방식으로 거래한다. 다만 그
+가능수량을 결정하는 공식 필드가 HTS 와 정확히 일치함을 **실측으로 확정**하기 전까지 하드차단을 유지한다.
+
+**실측대조 절차:**
+1. **원본 덤프** — 시작 시 `[COSOQ02701-RAW]` 로 COSOQ02701 전체 실계정 응답을 민감정보(AcntNo/Pwd) 마스킹
+   후 출력. 주문가능 관련 필드 전부 포함: `FcurrDps`/`FcurrOrdAbleAmt`/`PrexchOrdAbleAmt`/`FcurrOrdAmt`/
+   `FcurrMxchgAbleAmt`/`T4FcurrDps`/`WonDpsBalAmt`/`WonPrexchAbleAmt`/`MnyoutAbleAmt`/`OvrsMgn`/`BaseXchrat`/
+   `LoanAmt`/`FcurrPldgAmt`.
+2. **HTS 실측** — 사용자가 HTS 에서 실제 AAPL "타통화+원화 가능수량" 버튼을 눌러 표시된 수량을
+   `LS_US_HTS_ORDERABLE_QTY` 로 입력.
+3. **후보 계산** — 같은 시각·같은 주문가(bestAsk)로 각 후보 필드에서 수량 계산(`[STARTUP-CROSS-WON-CAND]`):
+   USD 기준은 `금액 ÷ bestAsk`, KRW 기준은 `금액 ÷ (bestAsk × BaseXchrat)`.
+4. **채택** — HTS 실측과 **정확히 일치**하는 후보만 채택(`[…-MATCHED]` 에 일치 필드 표시). 코드상수
+   `CROSS_WON_ADOPTED_FIELD`(현재 `null`) 를 그 필드로 지정. 추측 금지.
+5. **cash-only** — 신용/미수/대출/증거금 금지. `OvrsMgn`(미수)·`LoanAmt`(대출)·`FcurrPldgAmt`(담보) 잔액이
+   하나라도 >0 이면 `cashOnly=false` → 주문 금지(`[…-CASHONLY]` 에 차단필드 보고). 주문 직전 재조회.
+6. **허용 조건** — 통합증거금 가능수량 ≥ 1 일 때만 AAPL qty=1 POST. 0 이면 `CROSS_WON_INSUFFICIENT` 차단.
+7. **최종 로그** `[CROSS-WON-CHECK AAPL]`: `bestAsk / HTS orderableQty / PROGRAM orderableQty / MATCH /
+   paymentMode=CROSS_WON / cashOnly / orderAllowed`.
+8. **MATCH=false → LIVE 하드차단.** MATCH=true 이고 cashOnly=true 일 때만 `LS_US_CROSS_WON_TR_CONFIRMED=true`
+   코드상수 전환(수동, 사용자 확인 후).
+9. **BUY 직전 동일 재검증**(`[BUY-CROSS-WON…]`).
+10. 오늘 첫 실전: AAPL 1주 / 하루 BUY 1회 / 추가매수 없음 / 미체결 시 수동취소 유지.
+
+현재 `CROSS_WON_ADOPTED_FIELD=null`·`LS_US_CROSS_WON_TR_CONFIRMED=false` → `orderAllowed=false`
+(`CROSS_WON_UNCONFIRMED`). 실측 확정 전까지 US BUY 는 `LS_LIVE_TRADING=true` 여도 하드차단.
 
 ### COSAT00311(미체결 취소) 공식 필드 확인 결과 — 근거
 

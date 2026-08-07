@@ -4,7 +4,8 @@ import {
   getLSKRPrice, getLSUSPrice, getLSKR15Min, getLSUS15Min, getLSUS15MinPaged,
   getLSUSTicks, getLSUSTicksPaged, lsOverseasChartRaw,
   placeLSUSBuyOrder, queryLSUSOrderExec, getLSUSDeposit, getLSUSHoldings, cancelLSUSOrder, LS_CANCEL_TR_CONFIRMED, isUSOrderSuccess,
-  decideUSCashPayment, usCashOnlyUsdCap, usOrderableQty, formatCashOrderableLine, LS_US_CROSS_WON_TR_CONFIRMED, type LSUSDeposit,
+  decideUSCashPayment, usCashOnlyUsdCap, usOrderableQty, formatCashOrderableLine,
+  evaluateCrossWon, formatCrossWonCheck, maskLSResponse, CROSS_WON_ADOPTED_FIELD, LS_US_CROSS_WON_TR_CONFIRMED, type LSUSDeposit,
   placeLSKRBuyOrder, queryLSKROrderExec, cancelLSKRBuyOrder, krIsuNo, isKROrderSuccess,
   toLSOverseasExchcd, LSApiError, configureLSRateLimiter, classifyChart,
   LS_G3203_MAX_QRYCNT_UNCOMPRESSED,
@@ -562,7 +563,8 @@ describe('해외 주문/체결/예수금 (공식 필드)', () => {
       ok: true, rspCd: '00136', rspMsg: '', found: true, diag: {} as any,
       usdCash: 0, usdOrderable: 0, usdPrexchOrderable: 97.29, baseXchRate: 1434.6,
       krwCash: 13927349, krwWithdrawable: 13927349, krwPrexchable: 13927349, overseasMargin: 0,
-      usdDeposit: 0, ...over,
+      t4FcurrDps: 0, fcurrOrdAmt: 0, fcurrMxchgAbleAmt: 0, fcurrPldgAmt: 0, loanAmt: 0,
+      usdDeposit: 0, rawMasked: {}, ...over,
     };
   }
   it('P0-16 실계정 재현(AAPL≈311, PrexchOrdAbleAmt=97.29) → 가능수량 0, 하드차단', () => {
@@ -613,6 +615,63 @@ describe('해외 주문/체결/예수금 (공식 필드)', () => {
     expect(usCashOnlyUsdCap(dep({ usdOrderable: 100, usdPrexchOrderable: 9245.88 }))).toBeCloseTo(100);
     expect(usCashOnlyUsdCap(dep({ usdOrderable: 100, usdPrexchOrderable: 9245.88 }), { crossWonVerified: true })).toBeCloseTo(100);  // 코드상수 봉인
     expect(usCashOnlyUsdCap(dep({ usdOrderable: 0, usdPrexchOrderable: 9245.88 }))).toBe(0);   // 실계정: USD현금 0 → 상한 0
+  });
+
+  // ── P0-18: 통합증거금(타통화+원화) 실측대조 엔진 ──
+  it('P0-18 마스킹: AcntNo/Pwd 등 민감키 재귀 마스킹, 금액 필드는 보존', () => {
+    const m = maskLSResponse({ COSOQ02701OutBlock1: { AcntNo: '12345678900', Pwd: 'secret', RecCnt: 1 }, COSOQ02701OutBlock3: [{ CrcyCode: 'USD', PrexchOrdAbleAmt: '97.29' }] });
+    expect(m.COSOQ02701OutBlock1.AcntNo).toBe('****');
+    expect(m.COSOQ02701OutBlock1.Pwd).toBe('****');
+    expect(m.COSOQ02701OutBlock1.RecCnt).toBe(1);
+    expect(m.COSOQ02701OutBlock3[0].PrexchOrdAbleAmt).toBe('97.29');
+  });
+  it('P0-18 채택필드 없음(null) → 실측 전 하드차단 유지', () => {
+    expect(CROSS_WON_ADOPTED_FIELD).toBeNull();
+    expect(LS_US_CROSS_WON_TR_CONFIRMED).toBe(false);
+  });
+  it('P0-18 후보 수량: 같은 bestAsk 로 각 필드 수량 산출(USD/KRW 기준) + HTS 일치 표시', () => {
+    // 실계정: PrexchOrdAbleAmt=97.29, bestAsk=311 → 선환전 qty=0. 원화선환전 1392만/(311*1434.6)=31.
+    const e = evaluateCrossWon(dep({ usdOrderable: 0, usdPrexchOrderable: 97.29, krwPrexchable: 13927349, krwCash: 13927349 }), 311, 0);
+    const byKey = Object.fromEntries(e.candidates.map(c => [c.key, c]));
+    expect(byKey['PrexchOrdAbleAmt'].qty).toBe(0);      // 97.29/311 → 0
+    expect(byKey['FcurrOrdAbleAmt'].qty).toBe(0);       // 거래국가통화(USD현금)=0
+    expect(byKey['WonPrexchAbleAmt'].qty).toBe(Math.floor(13927349 / (311 * 1434.6)));
+    // HTS 실측=0 이면 qty=0 후보들이 일치로 표시
+    expect(byKey['PrexchOrdAbleAmt'].match).toBe(true);
+    expect(e.matchedKeys).toContain('PrexchOrdAbleAmt');
+  });
+  it('P0-18 실계정 재현: 채택필드 없음 → orderAllowed=false (CROSS_WON_UNCONFIRMED)', () => {
+    const e = evaluateCrossWon(dep({ usdPrexchOrderable: 97.29 }), 311, 0);
+    expect(e.orderAllowed).toBe(false);
+    expect(e.reason).toBe('CROSS_WON_UNCONFIRMED');   // 코드상수 미확정이 최우선 차단
+    expect(e.programQty).toBe(0);                      // 미채택 → 0
+  });
+  it('P0-18 cash-only: 미수/대출/담보 잔액 있으면 cashOnly=false + 차단필드 보고', () => {
+    const e = evaluateCrossWon(dep({ overseasMargin: 5000, loanAmt: 100, fcurrPldgAmt: 3.5 }), 311, 2);
+    expect(e.cashOnly).toBe(false);
+    expect(e.cashOnlyBlockers).toEqual(['OvrsMgn=5000', 'LoanAmt=100', 'FcurrPldgAmt=3.5']);
+  });
+  it('P0-18 cash-only: 잔액 전부 0 → cashOnly=true', () => {
+    const e = evaluateCrossWon(dep({ overseasMargin: 0, loanAmt: 0, fcurrPldgAmt: 0 }), 311, 0);
+    expect(e.cashOnly).toBe(true);
+    expect(e.cashOnlyBlockers).toEqual([]);
+  });
+  it('P0-18 [CROSS-WON-CHECK] 로그 형식(요구 필드 포함)', () => {
+    const e = evaluateCrossWon(dep({ usdPrexchOrderable: 97.29 }), 311, 0);
+    const line = formatCrossWonCheck('AAPL', e);
+    expect(line).toContain('[CROSS-WON-CHECK AAPL]');
+    expect(line).toContain('bestAsk=311.00');
+    expect(line).toContain('HTS orderableQty=0');
+    expect(line).toContain('PROGRAM orderableQty=미채택');
+    expect(line).toContain('paymentMode=CROSS_WON');
+    expect(line).toContain('cashOnly=true');
+    expect(line).toContain('orderAllowed=false');
+  });
+  it('P0-18 HTS 미입력 → match=N/A, 후보 match=null', () => {
+    const e = evaluateCrossWon(dep(), 311, null);
+    expect(e.match).toBeNull();
+    expect(e.candidates.every(c => c.match === null)).toBe(true);
+    expect(formatCrossWonCheck('AAPL', e)).toContain('MATCH=N/A');
   });
 
   it('P0-17 cashOrderable 로그: 성공/실패 두 형태만, "미조회" 절대 없음', () => {
