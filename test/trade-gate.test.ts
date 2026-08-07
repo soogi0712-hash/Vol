@@ -95,21 +95,23 @@ describe('10개 필수조건 게이트', () => {
   });
 });
 
-describe('canExecuteLive — 실주문은 삼중 차단', () => {
+describe('canExecuteLive — 수동/자동 취소 모드', () => {
   it('armed 여도 LIVE=false 면 실행 불가', () => {
-    const r = canExecuteLive(true, false, true);
+    const r = canExecuteLive(true, false, { manualCancel: true });
     expect(r.execute).toBe(false);
     expect(r.reason).toMatch(/LS_LIVE_TRADING=false/);
   });
-  it('armed + LIVE=true + env취소확인=true 여도 코드 상수(LS_CANCEL_TR_CONFIRMED=false)면 실행 불가', () => {
-    const r = canExecuteLive(true, true, true);
-    expect(r.execute).toBe(false);   // 코드 상수가 최종 안전장치
+  it('수동취소 모드 + armed + LIVE=true → 실행 가능(미체결은 수동취소)', () => {
+    const r = canExecuteLive(true, true, { manualCancel: true });
+    expect(r.execute).toBe(true);
+    expect(r.reason).toMatch(/수동취소/);
+  });
+  it('자동취소 모드 + env취소확인=true 여도 코드상수(false)면 실행 불가', () => {
+    const r = canExecuteLive(true, true, { manualCancel: false, cancelEnvConfirmed: true });
+    expect(r.execute).toBe(false);
     expect(r.reason).toMatch(/COSAT00311|취소/);
   });
-  it('env 취소확인=false 면(코드 상수와 무관하게) 실행 불가', () => {
-    expect(canExecuteLive(true, true, false).execute).toBe(false);
-  });
   it('armed=false 면 무조건 실행 불가', () => {
-    expect(canExecuteLive(false, true, true).execute).toBe(false);
+    expect(canExecuteLive(false, true, { manualCancel: true }).execute).toBe(false);
   });
 });

@@ -21,6 +21,7 @@ import { parseAccountEvent, applyOrderEvent } from './order-events';
 import { evaluateTradeGate, canExecuteLive, etDateStr, isUSRegularSession, type GateState } from './trade-gate';
 import { executeBuyOrder, reconcilePending, linkTrackedToOrders, type TraderDeps } from './trader';
 import { loadLiveConfig, isLiveSymbol, type LiveConfig } from './live-config';
+import { computeUSP0Checklist, formatUSP0Checklist } from './us-live-checklist';
 import { calcBB, calcRSI, getBBSignal, validateCandleData } from '../src/lib/bollinger';
 
 function kstYmd(offsetDays = 0): string {
@@ -161,7 +162,11 @@ async function main() {
   try { liveCfg = loadLiveConfig(); } catch (e) { log.error(String(e)); process.exit(1); return; }
   const armedMode = liveCfg.armed;
   // 실행 능력(3중): armed=true 가정 시 LIVE_TRADING + 취소TR(코드상수 false) + env 취소확인 모두 필요
-  const liveCapable = canExecuteLive(true, liveCfg.liveTrading, liveCfg.cancelConfirmed).execute;
+  const liveCapable = canExecuteLive(true, liveCfg.liveTrading, { manualCancel: liveCfg.manualCancel, cancelEnvConfirmed: liveCfg.cancelConfirmed }).execute;
+  // P0-10: 최종 체크리스트 출력
+  const p0 = computeUSP0Checklist(liveCfg);
+  log.info(`[P0-CHECKLIST]\n${formatUSP0Checklist(p0)}`);
+  log.info(`[P0] US_LIVE_READY=${p0.US_LIVE_READY} → 오늘 미국장 실전 ${p0.US_LIVE_READY ? '가능(단, LS_LIVE_TRADING=true 필요)' : '불가 — LS_LIVE_TRADING=false 유지'}`);
   log.info(`[LIVE-CFG] 대상=${liveCfg.liveExchange}:${liveCfg.liveSymbol}(exchcd=${liveCfg.liveExchcd}) maxQty=${liveCfg.maxQty} 하루매수=${liveCfg.dailyMaxBuys} 하루매도=${liveCfg.dailyMaxSells} 미체결타임아웃=${liveCfg.pendingTimeoutSec}s`);
   log.info(`ARMED=${armedMode} · LS_LIVE_TRADING=${liveCfg.liveTrading} · 취소TR확인(env)=${liveCfg.cancelConfirmed}/(코드)=false → 실주문 ${liveCapable ? '가능' : '차단'}`);
 
@@ -264,7 +269,7 @@ async function main() {
     log.info(`[ARMED ${ctx.symbol}] armed=${g.armed} 통과=${g.passed.length}/10${g.blockedBy.length ? ` 차단=[${g.blockedBy.join(', ')}]` : ''}`);
     if (!g.armed) return;
 
-    const live = canExecuteLive(g.armed, liveCfg.liveTrading, liveCfg.cancelConfirmed);
+    const live = canExecuteLive(g.armed, liveCfg.liveTrading, { manualCancel: liveCfg.manualCancel, cancelEnvConfirmed: liveCfg.cancelConfirmed });
     if (!live.execute) { log.info(`[ARMED-READY ${ctx.symbol}] 전 10개 조건 충족 · 매수지정가=${buyPrice}(ask) · 주문 없음 — ${live.reason}`); return; }
     // ↓ 현재 도달 불가(LIVE off 또는 취소 TR 미확인). 도달 시에도 trader 가 한도/중복/미체결 재검증.
     const outcome = await executeBuyOrder(traderDeps, {
@@ -307,7 +312,7 @@ async function main() {
           // 미체결 조정: 체결완료→해소 / 타임아웃→취소. 취소TR 미확인이면 취소는 실패로 남고 pending 유지(req15).
           if (ctx.orders.hasPending()) {
             if (liveCapable) {
-              const rec = await reconcilePending(traderDeps, { orders: ctx.orders, exchcd: ctx.exchcd, ordDate: etDateStr(Date.now()), timeoutMs: liveCfg.pendingTimeoutSec * 1000 });
+              const rec = await reconcilePending(traderDeps, { orders: ctx.orders, exchcd: ctx.exchcd, ordDate: etDateStr(Date.now()), timeoutMs: liveCfg.pendingTimeoutSec * 1000, autoCancel: liveCfg.autoCancel });
               for (const o of rec) log.info(`[RECONCILE ${ctx.symbol}] ordNo=${o.ordNo} ${o.status} — ${o.reason}`);
             } else {
               log.warn(`[RECONCILE ${ctx.symbol}] 미체결 ${ctx.orders.pending.length}건 존재하나 실주문/취소 비활성 → 수동 확인 필요(신규주문 차단)`);

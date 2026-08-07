@@ -1,7 +1,8 @@
 // Phase 3A 실전 설정 — 환경변수에서 읽는다. 오늘 실전 제한을 코드로 강제한다.
 //   대상 1종목(NASDAQ:AAPL), 최대 1주, 지정가만, 하루 매수/매도 각 1회.
-// ⚠️ 실주문은 armed + LS_LIVE_TRADING=true + LS_CANCEL_TR_CONFIRMED=true 전부일 때만(3중 차단).
-import { toLSOverseasExchcd } from '../src/lib/ls-api';
+// ⚠️ 자동취소 REST(COSAT00311)는 공식 필드 미확인 → AUTO_CANCEL_MODE 불가.
+//    대신 MANUAL_CANCEL_MODE(수동취소)로 운영: 미체결 시 사용자 수동취소 요구, AS3 수신 시에만 다음 BUY.
+import { toLSOverseasExchcd, LS_CANCEL_TR_CONFIRMED } from '../src/lib/ls-api';
 
 export interface LiveConfig {
   liveSymbol: string;          // 'AAPL'
@@ -12,8 +13,10 @@ export interface LiveConfig {
   dailyMaxSells: number;       // 1
   armed: boolean;              // LS_TRADING_ARMED
   liveTrading: boolean;        // LS_LIVE_TRADING
-  cancelConfirmed: boolean;    // LS_CANCEL_TR_CONFIRMED (공식 취소 필드 확인 시에만 true)
-  pendingTimeoutSec: number;   // 미체결 취소까지 대기 시간(초)
+  cancelConfirmed: boolean;    // LS_CANCEL_TR_CONFIRMED (env)
+  autoCancel: boolean;         // 자동취소 모드 — env AND 코드상수(취소TR 확인). 현재 항상 false.
+  manualCancel: boolean;       // 수동취소 모드 — autoCancel 아니면 true(오늘 운영 모드).
+  pendingTimeoutSec: number;   // (auto 모드에서만) 미체결 취소까지 대기 시간(초)
 }
 
 const intEnv = (name: string, def: number, min: number, max: number): number => {
@@ -30,6 +33,7 @@ export function loadLiveConfig(): LiveConfig {
   const liveSymbol = (symRaw || '').trim().toUpperCase();
   const liveExchcd = toLSOverseasExchcd(liveExchange) ?? '';
   if (!liveSymbol || !liveExchcd) throw new Error(`LS_US_LIVE_SYMBOL 파싱 실패/거래소 미확인: '${raw}'`);
+  const autoCancel = process.env.LS_AUTO_CANCEL_MODE === 'true' && LS_CANCEL_TR_CONFIRMED;   // 코드상수 false → 항상 false
   return {
     liveSymbol, liveExchange, liveExchcd,
     maxQty: intEnv('LS_US_MAX_QTY', 1, 1, 1),               // 오늘은 상한 1주로 하드 제한
@@ -38,6 +42,9 @@ export function loadLiveConfig(): LiveConfig {
     armed: process.env.LS_TRADING_ARMED === 'true',
     liveTrading: process.env.LS_LIVE_TRADING === 'true',
     cancelConfirmed: process.env.LS_CANCEL_TR_CONFIRMED === 'true',
+    // 자동취소는 env 요청 AND 코드상수(공식 취소필드 확인)여야 가능. 코드상수 false → 항상 false → 수동취소 모드.
+    autoCancel,
+    manualCancel: !autoCancel,
     pendingTimeoutSec: intEnv('LS_US_PENDING_TIMEOUT_SEC', 60, 5, 600),
   };
 }

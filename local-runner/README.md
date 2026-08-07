@@ -245,7 +245,26 @@ READY · 미체결 시 신규 금지 · 동일봉 중복 금지 · 주문번호 
 - 성공 판정 = **OrdNo 존재 또는 성공코드(00000)**(`isUSOrderSuccess`) — 미확인 성공코드도 OrdNo 로 성공 처리.
 
 > 오늘 첫 미국 실전 대상: `LS_US_LIVE_SYMBOL`=NASDAQ:AAPL 1종목, 1주, 하루 BUY 1회.
-> 단, REST 취소 TR(COSAT00311) 미확인으로 **실주문 자체는 여전히 3중 차단**(`LS_LIVE_TRADING=false`).
+
+#### 수동취소 모드(MANUAL_CANCEL_MODE) + P0 체크리스트 (실전 투입 게이트)
+
+REST 자동취소 TR(COSAT00311)은 공식 필드 미확인이라 **자동취소(AUTO_CANCEL_MODE)는 불가**합니다.
+대신 **수동취소 모드**로 실전 운영합니다:
+
+- **P0-1**: `AUTO_CANCEL_MODE=false`, `MANUAL_CANCEL_MODE=true`(코드상수로 강제).
+- **P0-2**: 미체결 주문 발생 시 자동취소하지 않고 `[MANUAL-CANCEL] 미체결 주문 발생. LS HTS/MTS에서
+  수동취소하십시오.` 를 출력하며, **pending 유지 → 다음 BUY 절대 금지**.
+- **P0-3**: **AS3(취소 확인) 수신** 시 해당 원주문을 `CANCELLED` 로 바꾸고 pending 을 해소 →
+  그때만 다음 BUY 허용(`linkTrackedToOrders`). (체결 AS1 도 동일하게 해소)
+- **P0-4**: `LS_LIVE_TRADING=true` 라도 아래 전부여야 실제 POST — READY·confirmed≥20·signal=BUY·
+  wsConnected·GSC fresh·GSH fresh·bid/ask/lastPrice>0·pending=0·하루 BUY<1·candle lock 없음·현금 충분.
+- **P0-5**: POST 직전 현금(USD) **재조회**, `price×qty > cashOrderable` 이면 POST 금지.
+- **P0-6~P0-9**: AAPL·qty1·하루1(추가매수/물타기 금지) · OrdNo 저장 + AS 연결 · 재시작 대사 완료 전 BUY 금지 ·
+  같은 candle BUY 신호 **100회 반복돼도 실제 POST 1회**.
+
+러너 시작 시 `[P0-CHECKLIST]` 로 10개 플래그와 `US_LIVE_READY` 를 출력합니다.
+**모두 true 여야 오늘 실전 가능**하며, `LS_LIVE_TRADING=true` 로 켜면 수동취소 모드로 BUY 가 실행됩니다.
+하나라도 false 면 `LS_LIVE_TRADING=false` 를 유지하세요.
 
 ### 해외 시세 구분(delaygb) — 미국 실시간 Non-Display 불가
 

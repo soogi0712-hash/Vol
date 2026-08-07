@@ -93,13 +93,15 @@ export async function executeBuyOrder(deps: TraderDeps, p: BuyParams): Promise<B
   return { status: 'placed-pending', ordNo, reason: '미체결 → pending 유지(타임아웃 후 취소)' };
 }
 
-export type ReconcileStatus = 'filled' | 'cancelled' | 'cancel-failed' | 'waiting' | 'none';
+export type ReconcileStatus = 'filled' | 'cancelled' | 'cancel-failed' | 'manual-cancel-required' | 'waiting' | 'none';
 export interface ReconcileOutcome { ordNo: string; status: ReconcileStatus; reason: string; }
 
-// 미체결 주문을 재조회한다. 체결완료→해소. 타임아웃 경과 & 미체결→COSAT00311 취소(성공 시 해소).
-// req14(타임아웃 취소)·req15(취소 성공 확인 전 다음 주문 금지 — pending 유지로 자동 보장)·req18(원문 저장).
+// 미체결 주문을 재조회한다. 체결완료→해소.
+//  - 수동취소 모드(autoCancel=false, 오늘 운영): 미체결이면 자동취소하지 않는다. pending 유지 + 수동취소 안내.
+//    해소는 AS3(취소 확인) 또는 AS1(체결) 이벤트로만 이뤄진다(linkTrackedToOrders). → 다음 BUY 금지 유지(P0-2).
+//  - 자동취소 모드(autoCancel=true): 타임아웃 경과 시 COSAT00311 취소(현재 코드상수로 불가).
 export async function reconcilePending(
-  deps: TraderDeps, p: { orders: OrderStore; exchcd: string; ordDate: string; timeoutMs: number },
+  deps: TraderDeps, p: { orders: OrderStore; exchcd: string; ordDate: string; timeoutMs: number; autoCancel: boolean },
 ): Promise<ReconcileOutcome[]> {
   const out: ReconcileOutcome[] = [];
   for (const po of p.orders.pending) {
@@ -111,9 +113,15 @@ export async function reconcilePending(
       out.push({ ordNo: po.ordNo, status: 'filled', reason: '전량 체결' });
       continue;
     }
+    // 수동취소 모드: 자동취소 금지. 미체결이면 사용자 수동취소 안내 후 pending 유지(P0-1·P0-2).
+    if (!p.autoCancel) {
+      deps.log(`[MANUAL-CANCEL ${po.symbol}] ordNo=${po.ordNo} 미체결 주문 발생. LS HTS/MTS에서 수동취소하십시오. (AS3 수신 전 다음 BUY 금지)`);
+      out.push({ ordNo: po.ordNo, status: 'manual-cancel-required', reason: '미체결 → 수동취소 필요(자동취소 없음). AS3 수신 시 해소' });
+      continue;
+    }
     const ageMs = deps.now() - po.placedAtMs;
     if (ageMs < p.timeoutMs) { out.push({ ordNo: po.ordNo, status: 'waiting', reason: `미체결 ${Math.round(ageMs / 1000)}s (타임아웃 ${Math.round(p.timeoutMs / 1000)}s)` }); continue; }
-    // 타임아웃 → 취소
+    // (자동취소 모드) 타임아웃 → COSAT00311 취소
     const unfilled = row ? row.unfilledQty : po.qty;
     try {
       const c = await deps.cancel({ exchcd: p.exchcd, symbol: po.symbol, ordNo: po.ordNo, qty: unfilled });

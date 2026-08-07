@@ -93,13 +93,16 @@ export function evaluateTradeGate(s: GateState): GateResult {
   return { armed, passed, blockedBy };
 }
 
-// 실주문 실행 가능 여부(러너용) — armed + LIVE 스위치 + 취소 TR 확인까지 모두 필요(3중 차단).
-// ⚠️ 코드 상수 LS_CANCEL_TR_CONFIRMED(공식 취소 필드 확인 시에만 true)가 최종 안전장치다.
-//    env LS_CANCEL_TR_CONFIRMED=true 로 바꿔도 코드 상수가 false 면 실주문은 차단된다.
-export function canExecuteLive(armed: boolean, liveTrading: boolean, cancelEnvConfirmed = false): { execute: boolean; reason: string } {
+// 실주문(BUY) 실행 가능 여부(러너용).
+//  - 수동취소 모드(manualCancel=true, 오늘 운영): armed + LS_LIVE_TRADING=true 면 BUY 허용.
+//    (미체결은 자동취소하지 않고 사용자 수동취소 요구 → AS3 수신 시에만 다음 BUY. P0-1~P0-3)
+//  - 자동취소 모드(manualCancel=false): 추가로 코드상수 LS_CANCEL_TR_CONFIRMED + env 확인 필요(현재 불가).
+export function canExecuteLive(armed: boolean, liveTrading: boolean, opts: { manualCancel: boolean; cancelEnvConfirmed?: boolean }): { execute: boolean; reason: string } {
   if (!armed) return { execute: false, reason: 'ARMED 조건 미충족' };
   if (!liveTrading) return { execute: false, reason: 'LS_LIVE_TRADING=false (관찰/ARMED 전용)' };
-  if (!LS_CANCEL_TR_CONFIRMED) return { execute: false, reason: '미체결 취소 TR(COSAT00311) 공식 필드 미확인 → 실주문 차단(코드)' };
-  if (!cancelEnvConfirmed) return { execute: false, reason: 'LS_CANCEL_TR_CONFIRMED=false → 실주문 차단' };
-  return { execute: true, reason: '실행 가능' };
+  if (opts.manualCancel) return { execute: true, reason: '실행 가능(수동취소 모드 — 미체결은 HTS/MTS 수동취소)' };
+  // 자동취소 모드: 코드상수(공식 취소필드) + env 확인 필요
+  if (!LS_CANCEL_TR_CONFIRMED) return { execute: false, reason: '자동취소 TR(COSAT00311) 공식 필드 미확인 → 실주문 차단(코드)' };
+  if (!opts.cancelEnvConfirmed) return { execute: false, reason: 'LS_CANCEL_TR_CONFIRMED=false → 실주문 차단' };
+  return { execute: true, reason: '실행 가능(자동취소 모드)' };
 }
