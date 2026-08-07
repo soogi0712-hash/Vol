@@ -87,6 +87,7 @@ function lsHeaders(token: string, trCd: string, trCont = 'N', trContKey = ''): R
 export const LS_SUCCESS_CODES: Record<string, string[]> = {
   CSPAQ12200: ['00000', '00136'],
   COSOQ00201: ['00000', '02679'],
+  CSPAT00801: ['00000', '00156'],   // 현물취소주문 — 00156(취소 접수) 도 정상(공식 resExample)
 };
 /** 정상이나 데이터가 없는(빈 결과) 코드 — 잔고 0 으로 처리한다. */
 export const LS_EMPTY_CODES: Record<string, string[]> = {
@@ -623,4 +624,60 @@ export async function getLSUSHoldings(cfg: LSConfig, token: string, baseDateYYYY
     symbol: String(r.ShtnIsuNo ?? ''), balQty: toNum(r.AstkBalQty), sellableQty: toNum(r.AstkSellAbleQty),
   })).filter(h => h.symbol);
   return { rspCd, rspMsg, holdings, diag };
+}
+
+// ══════════════════════════════════════════════════════════════════
+//  국내(현물) 주문/체결/취소 (공식 필드만 사용) — /stock/order, /stock/accno
+//  ⚠️ LS_LIVE_TRADING='true' + 국내장 조건 충족 시에만 러너가 호출한다.
+// ══════════════════════════════════════════════════════════════════
+
+// 국내 종목번호(IsuNo) 는 'A' 접두 6자리(예: A005930). 유니버스 shcode(005930) → A005930.
+export function krIsuNo(shcode: string): string { return /^A/i.test(shcode) ? shcode.toUpperCase() : 'A' + shcode; }
+
+// BnsTpCode: 1=매도, 2=매수 (공식 reqExample 매수="2"). OrdprcPtnCode: 00=지정가.
+export const LS_KR_BNS_BUY = '2';
+export const LS_KR_BNS_SELL = '1';
+
+// ── 현물 지정가 매수 (CSPAT00601, /stock/order) ──
+// InBlock1(공식): IsuNo/OrdQty/OrdPrc/BnsTpCode/OrdprcPtnCode/MgntrnCode/LoanDt/OrdCndiTpCode/MbrNo
+//   MbrNo 는 회원(거래소 라우팅) — 공식 reqExample 값 "NXT". 실주문 전 사용자 확인 필요(env 로 조정).
+// 응답 OutBlock2.OrdNo = 주문번호.
+export interface LSKROrderResult { rspCd: string; rspMsg: string; ordNo: string | null; raw: any; diag: LSHttpDiag; }
+export async function placeLSKRBuyOrder(cfg: LSConfig, token: string, p: { shcode: string; qty: number; price: number; mbrNo?: string }): Promise<LSKROrderResult> {
+  const inb = {
+    CSPAT00601InBlock1: {
+      IsuNo: krIsuNo(p.shcode), OrdQty: p.qty, OrdPrc: p.price, BnsTpCode: LS_KR_BNS_BUY,
+      OrdprcPtnCode: '00', MgntrnCode: '000', LoanDt: '', OrdCndiTpCode: '0', MbrNo: p.mbrNo ?? 'NXT',
+    },
+  };
+  const { data, rspCd, rspMsg, diag } = await lsPost(token, '/stock/order', 'CSPAT00601', inb);
+  const ob2 = data.CSPAT00601OutBlock2 || {};
+  return { rspCd, rspMsg, ordNo: ob2.OrdNo != null ? String(ob2.OrdNo) : null, raw: data, diag };
+}
+
+// ── 현물 취소주문 (CSPAT00801, /stock/order) ── InBlock1(공식): OrgOrdNo/IsuNo/OrdQty. 응답 OutBlock2.OrdNo.
+export async function cancelLSKRBuyOrder(cfg: LSConfig, token: string, p: { orgOrdNo: string; shcode: string; qty: number }): Promise<LSKROrderResult> {
+  const inb = { CSPAT00801InBlock1: { OrgOrdNo: Number(p.orgOrdNo), IsuNo: krIsuNo(p.shcode), OrdQty: p.qty } };
+  const { data, rspCd, rspMsg, diag } = await lsPost(token, '/stock/order', 'CSPAT00801', inb);
+  const ob2 = data.CSPAT00801OutBlock2 || {};
+  return { rspCd, rspMsg, ordNo: ob2.OrdNo != null ? String(ob2.OrdNo) : null, raw: data, diag };
+}
+
+// ── 현물 주문체결내역 조회 (CSPAQ13700, /stock/accno) — OutBlock2 집계로 체결/부분체결 판정 ──
+// InBlock1(공식): OrdMktCode/BnsTpCode/IsuNo/ExecYn/OrdDt/SrtOrdNo2/BkseqTpCode/OrdPtnCode
+// OutBlock2(공식): BuyOrdQty/BuyExecQty/SellOrdQty/SellExecQty (당일 종목 집계).
+//   하루 매수 1회 제한 하에서 BuyExecQty>=BuyOrdQty(>0) → 전량체결, 0<BuyExecQty<BuyOrdQty → 부분체결.
+// ⚠️ OutBlock3(주문별 행) 필드는 공식 스냅샷에 없어 사용하지 않는다(추측 금지) — 집계로만 판정.
+export interface LSKROrderExec { ok: boolean; rspCd: string; rspMsg: string; buyOrdQty: number; buyExecQty: number; sellOrdQty: number; sellExecQty: number; diag?: LSHttpDiag; }
+export async function queryLSKROrderExec(cfg: LSConfig, token: string, p: { shcode: string; ordDate: string; bnsTpCode?: string }): Promise<LSKROrderExec> {
+  const inb = { CSPAQ13700InBlock1: { OrdMktCode: '00', BnsTpCode: p.bnsTpCode ?? '0', IsuNo: krIsuNo(p.shcode), ExecYn: '0', OrdDt: p.ordDate, SrtOrdNo2: 0, BkseqTpCode: '0', OrdPtnCode: '00' } };
+  try {
+    const { data, rspCd, rspMsg, diag } = await lsPost(token, '/stock/accno', 'CSPAQ13700', inb);
+    const o2 = data.CSPAQ13700OutBlock2 || {};
+    return { ok: true, rspCd, rspMsg, buyOrdQty: toNum(o2.BuyOrdQty), buyExecQty: toNum(o2.BuyExecQty), sellOrdQty: toNum(o2.SellOrdQty), sellExecQty: toNum(o2.SellExecQty), diag };
+  } catch (e) {
+    // 조회 실패/빈응답은 "체결 미확인"(zeros)로 안전하게 처리 — 절대 체결완료로 오판하지 않는다.
+    if (e instanceof LSApiError) return { ok: false, rspCd: e.rspCd ?? `ERR(${e.kind})`, rspMsg: e.message, buyOrdQty: 0, buyExecQty: 0, sellOrdQty: 0, sellExecQty: 0, diag: e.diag };
+    return { ok: false, rspCd: 'EXCEPTION', rspMsg: String(e), buyOrdQty: 0, buyExecQty: 0, sellOrdQty: 0, sellExecQty: 0 };
+  }
 }

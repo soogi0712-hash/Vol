@@ -4,6 +4,7 @@ import {
   getLSKRPrice, getLSUSPrice, getLSKR15Min, getLSUS15Min, getLSUS15MinPaged,
   getLSUSTicks, getLSUSTicksPaged, lsOverseasChartRaw,
   placeLSUSBuyOrder, queryLSUSOrderExec, getLSUSDeposit, getLSUSHoldings, cancelLSUSOrder, LS_CANCEL_TR_CONFIRMED,
+  placeLSKRBuyOrder, queryLSKROrderExec, cancelLSKRBuyOrder, krIsuNo,
   toLSOverseasExchcd, LSApiError, configureLSRateLimiter, classifyChart,
   LS_G3203_MAX_QRYCNT_UNCOMPRESSED,
 } from '../src/lib/ls-api';
@@ -507,6 +508,56 @@ describe('해외 주문/체결/예수금 (공식 필드)', () => {
     const aapl = r.holdings.find(h => h.symbol === 'AAPL');
     expect(aapl?.balQty).toBe(1);
     expect(aapl?.sellableQty).toBe(1);
+  });
+});
+
+describe('국내 현물 주문/체결/취소 (공식 필드)', () => {
+  it('krIsuNo — 6자리 shcode 에 A 접두', () => {
+    expect(krIsuNo('005930')).toBe('A005930');
+    expect(krIsuNo('A005930')).toBe('A005930');
+  });
+  it('CSPAT00601 현물 지정가 매수 — 공식 InBlock(BnsTpCode=2 매수, OrdprcPtnCode=00 지정가)', async () => {
+    let sent: any = null;
+    stubFetch((url, init) => {
+      expect(url).toBe('https://openapi.ls-sec.co.kr:8080/stock/order');
+      expect(init.headers['tr_cd']).toBe('CSPAT00601');
+      sent = JSON.parse(init.body).CSPAT00601InBlock1;
+      return { json: { rsp_cd: '00000', rsp_msg: '정상', CSPAT00601OutBlock2: { OrdNo: 32004, OrdTime: '153257' } } };
+    });
+    const r = await placeLSKRBuyOrder(cfg, 'T', { shcode: '005930', qty: 1, price: 70000, mbrNo: 'NXT' });
+    expect(sent).toMatchObject({ IsuNo: 'A005930', OrdQty: 1, OrdPrc: 70000, BnsTpCode: '2', OrdprcPtnCode: '00', MgntrnCode: '000', LoanDt: '', OrdCndiTpCode: '0', MbrNo: 'NXT' });
+    expect(r.rspCd).toBe('00000');
+    expect(r.ordNo).toBe('32004');
+  });
+  it('CSPAQ13700 체결조회 — OutBlock2 집계(BuyOrdQty/BuyExecQty)', async () => {
+    stubFetch((url, init) => {
+      expect(url).toBe('https://openapi.ls-sec.co.kr:8080/stock/accno');
+      expect(init.headers['tr_cd']).toBe('CSPAQ13700');
+      const b = JSON.parse(init.body).CSPAQ13700InBlock1;
+      expect(b.IsuNo).toBe('A005930'); expect(b.OrdDt).toBe('20260807');
+      return { json: { rsp_cd: '00000', CSPAQ13700OutBlock2: { BuyOrdQty: 1, BuyExecQty: 1, SellOrdQty: 0, SellExecQty: 0 } } };
+    });
+    const r = await queryLSKROrderExec(cfg, 'T', { shcode: '005930', ordDate: '20260807', bnsTpCode: '2' });
+    expect(r.ok).toBe(true);
+    expect(r.buyOrdQty).toBe(1); expect(r.buyExecQty).toBe(1);
+  });
+  it('CSPAQ13700 조회실패/빈응답 → ok=false, 수량 0 (체결 오판 금지)', async () => {
+    stubFetch(() => ({ json: { rsp_cd: 'IZAA100', rsp_msg: '조회오류' } }));
+    const r = await queryLSKROrderExec(cfg, 'T', { shcode: '005930', ordDate: '20260807' });
+    expect(r.ok).toBe(false);
+    expect(r.buyExecQty).toBe(0);
+  });
+  it('CSPAT00801 현물취소 — 공식 InBlock(OrgOrdNo/IsuNo/OrdQty), rsp_cd 00156 정상', async () => {
+    let sent: any = null;
+    stubFetch((url, init) => {
+      expect(init.headers['tr_cd']).toBe('CSPAT00801');
+      sent = JSON.parse(init.body).CSPAT00801InBlock1;
+      return { json: { rsp_cd: '00156', rsp_msg: '취소접수', CSPAT00801OutBlock2: { OrdNo: 84006 } } };
+    });
+    const r = await cancelLSKRBuyOrder(cfg, 'T', { orgOrdNo: '84005', shcode: '005930', qty: 1 });
+    expect(sent).toMatchObject({ OrgOrdNo: 84005, IsuNo: 'A005930', OrdQty: 1 });
+    expect(r.rspCd).toBe('00156');   // 취소 접수 = 정상(허용목록)
+    expect(r.ordNo).toBe('84006');
   });
 });
 

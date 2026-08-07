@@ -38,6 +38,25 @@ export function isUSRegularSession(nowMs: number): boolean {
   return minutes >= GATE.SESSION_OPEN_MIN && minutes < GATE.SESSION_CLOSE_MIN;
 }
 
+// ── 국내장(KST) 세션 09:00~15:30, 평일 ──────────────────────────
+export const KR_SESSION = { OPEN_MIN: 9 * 60, CLOSE_MIN: 15 * 60 + 30 };
+export function krWallClock(nowMs: number): { weekday: string; minutes: number } {
+  const parts = new Intl.DateTimeFormat('en-US', { timeZone: 'Asia/Seoul', hour12: false, weekday: 'short', hour: '2-digit', minute: '2-digit' }).formatToParts(new Date(nowMs));
+  const get = (t: string) => parts.find(p => p.type === t)?.value ?? '';
+  let hh = parseInt(get('hour'), 10) % 24; if (!Number.isFinite(hh)) hh = 0;
+  return { weekday: get('weekday'), minutes: hh * 60 + parseInt(get('minute'), 10) };
+}
+export function isKRRegularSession(nowMs: number): boolean {
+  const { weekday, minutes } = krWallClock(nowMs);
+  if (weekday === 'Sat' || weekday === 'Sun') return false;
+  return minutes >= KR_SESSION.OPEN_MIN && minutes < KR_SESSION.CLOSE_MIN;
+}
+export function krDateStr(nowMs: number): string {
+  const parts = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Seoul', year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(new Date(nowMs));
+  const get = (t: string) => parts.find(p => p.type === t)?.value ?? '';
+  return `${get('year')}${get('month')}${get('day')}`;
+}
+
 export interface GateState {
   confirmedCount: number;
   signalAction: string;            // 'BUY' | 'SELL' | 'HOLD' | 'NONE'

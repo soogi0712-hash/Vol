@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { evaluateTradeGate, canExecuteLive, isUSRegularSession, etWallClock, etDateStr, GATE, type GateState } from '../local-runner/trade-gate';
+import { evaluateTradeGate, canExecuteLive, isUSRegularSession, etWallClock, etDateStr, isKRRegularSession, krDateStr, GATE, type GateState } from '../local-runner/trade-gate';
 
 // 미국 정규장 09:30~16:00 America/New_York 판정용 — UTC epoch 헬퍼.
 // (ET 벽시계를 특정하려면 UTC 로 준다. EDT=UTC-4, 여름 기준.)
@@ -30,6 +30,25 @@ describe('미국 정규장 판정 (America/New_York)', () => {
     // 2026-07-07 02:00 UTC = 2026-07-06 22:00 EDT
     expect(etDateStr(utc(2026, 7, 7, 2, 0))).toBe('20260706');
     expect(etWallClock(utc(2026, 7, 6, 13, 30)).minutes).toBe(9 * 60 + 30);
+  });
+});
+
+describe('국내장 세션 (Asia/Seoul 09:00~15:30)', () => {
+  // KST = UTC+9(서머타임 없음). 09:00 KST = 00:00 UTC.
+  it('평일 09:00 KST(00:00 UTC) → 개장, 08:59 → 개장 전', () => {
+    expect(isKRRegularSession(utc(2026, 8, 7, 0, 0))).toBe(true);    // 금 09:00 KST
+    expect(isKRRegularSession(utc(2026, 8, 6, 23, 59))).toBe(false); // 목 08:59 KST(전날 UTC)
+  });
+  it('평일 15:30 KST(06:30 UTC) → 폐장(경계 제외), 15:29 → 개장', () => {
+    expect(isKRRegularSession(utc(2026, 8, 7, 6, 30))).toBe(false);
+    expect(isKRRegularSession(utc(2026, 8, 7, 6, 29))).toBe(true);
+  });
+  it('주말 폐장', () => {
+    expect(isKRRegularSession(utc(2026, 8, 8, 3, 0))).toBe(false);   // 토 12:00 KST
+    expect(isKRRegularSession(utc(2026, 8, 9, 3, 0))).toBe(false);   // 일
+  });
+  it('krDateStr — KST 날짜 (UTC 자정 근처는 다음날 KST)', () => {
+    expect(krDateStr(utc(2026, 8, 6, 16, 0))).toBe('20260807');     // 목 16:00 UTC = 금 01:00 KST
   });
 });
 
