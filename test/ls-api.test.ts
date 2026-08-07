@@ -3,7 +3,7 @@ import {
   getLSAccessToken, getLSKRBalance, getLSUSBalance,
   getLSKRPrice, getLSUSPrice, getLSKR15Min, getLSUS15Min, getLSUS15MinPaged,
   getLSUSTicks, getLSUSTicksPaged, lsOverseasChartRaw,
-  placeLSUSBuyOrder, queryLSUSOrderExec, getLSUSDeposit, getLSUSHoldings, cancelLSUSOrder, LS_CANCEL_TR_CONFIRMED,
+  placeLSUSBuyOrder, queryLSUSOrderExec, getLSUSDeposit, getLSUSHoldings, cancelLSUSOrder, LS_CANCEL_TR_CONFIRMED, isUSOrderSuccess,
   placeLSKRBuyOrder, queryLSKROrderExec, cancelLSKRBuyOrder, krIsuNo, isKROrderSuccess,
   toLSOverseasExchcd, LSApiError, configureLSRateLimiter, classifyChart,
   LS_G3203_MAX_QRYCNT_UNCOMPRESSED,
@@ -463,6 +463,12 @@ describe('해외 주문/체결/예수금 (공식 필드)', () => {
     expect(r.ordNo).toBe('141');
   });
 
+  it('isUSOrderSuccess — 00000 또는 OrdNo 존재 시 성공(코드 오탐 방지)', () => {
+    expect(isUSOrderSuccess('00000', null)).toBe(true);
+    expect(isUSOrderSuccess('99999', '141')).toBe(true);     // 코드 몰라도 OrdNo 있으면 성공
+    expect(isUSOrderSuccess('40510', null)).toBe(false);     // 거부
+    expect(isUSOrderSuccess('99999', '(unknown)')).toBe(false);
+  });
   it('COSAQ00102 체결/미체결 조회 — OutBlock3 파싱(OrdNo/ExecQty/UnercQty)', async () => {
     stubFetch((url, init) => {
       expect(url).toBe('https://openapi.ls-sec.co.kr:8080/overseas-stock/accno');

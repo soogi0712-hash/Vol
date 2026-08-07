@@ -89,6 +89,7 @@ export const LS_SUCCESS_CODES: Record<string, string[]> = {
   COSOQ00201: ['00000', '02679'],
   CSPAT00601: ['00000', '00040'],   // 현물주문 — 00040 "매수 주문이 완료되었습니다."(실계정 확인) = 정상
   CSPAT00801: ['00000', '00156'],   // 현물취소주문 — 00156(취소 접수) 도 정상(공식 resExample)
+  COSAT00301: ['00000'],            // 미국시장주문 — 공식 확인 성공코드(00000). 그 외 코드+OrdNo 는 아래 isUSOrderSuccess 로 판정
 };
 /** 정상이나 데이터가 없는(빈 결과) 코드 — 잔고 0 으로 처리한다. */
 export const LS_EMPTY_CODES: Record<string, string[]> = {
@@ -547,6 +548,13 @@ export async function getLSUSBalance(cfg: LSConfig, token: string, baseDateYYYYM
 //   (OrdPtnCode '02'→'매수', OrdprcPtnCode '00'→'지정가')로 확인.
 //   OrdMktCode=거래소코드(exchcd), IsuNo=심볼, OvrsOrdPrc=해외주문가(지정가).
 export interface LSOrderResult { rspCd: string; rspMsg: string; ordNo: string | null; raw: any; diag: LSHttpDiag; }
+
+// COSAT00301 주문 성공 판정 — 성공코드(00000) 또는 주문번호(OrdNo) 존재. (KR 00040 오탐 사고 방지 패턴 이식)
+export const US_ORDER_SUCCESS_CODES = new Set(['00000']);
+export function isUSOrderSuccess(rspCd: string, ordNo: string | null | undefined): boolean {
+  return (ordNo != null && ordNo !== '' && ordNo !== '(unknown)') || US_ORDER_SUCCESS_CODES.has(rspCd);
+}
+
 export async function placeLSUSBuyOrder(
   cfg: LSConfig, token: string, p: { exchcd: string; symbol: string; qty: number; price: number },
 ): Promise<LSOrderResult> {

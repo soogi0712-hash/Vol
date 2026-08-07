@@ -19,7 +19,7 @@ import { CandleStore, type StoredCandle } from './candle-store';
 import { OrderStore } from './order-store';
 import { parseAccountEvent, applyOrderEvent } from './order-events';
 import { evaluateTradeGate, canExecuteLive, etDateStr, isUSRegularSession, type GateState } from './trade-gate';
-import { executeBuyOrder, reconcilePending, type TraderDeps } from './trader';
+import { executeBuyOrder, reconcilePending, linkTrackedToOrders, type TraderDeps } from './trader';
 import { loadLiveConfig, isLiveSymbol, type LiveConfig } from './live-config';
 import { calcBB, calcRSI, getBBSignal, validateCandleData } from '../src/lib/bollinger';
 
@@ -156,6 +156,15 @@ async function main() {
     }
   }
 
+  // ── Phase 3A 실전 설정(1종목/1주/지정가/하루 1회) — 계좌이벤트 링크에서 참조하므로 클라이언트 전에 로드 ──
+  let liveCfg: LiveConfig;
+  try { liveCfg = loadLiveConfig(); } catch (e) { log.error(String(e)); process.exit(1); return; }
+  const armedMode = liveCfg.armed;
+  // 실행 능력(3중): armed=true 가정 시 LIVE_TRADING + 취소TR(코드상수 false) + env 취소확인 모두 필요
+  const liveCapable = canExecuteLive(true, liveCfg.liveTrading, liveCfg.cancelConfirmed).execute;
+  log.info(`[LIVE-CFG] 대상=${liveCfg.liveExchange}:${liveCfg.liveSymbol}(exchcd=${liveCfg.liveExchcd}) maxQty=${liveCfg.maxQty} 하루매수=${liveCfg.dailyMaxBuys} 하루매도=${liveCfg.dailyMaxSells} 미체결타임아웃=${liveCfg.pendingTimeoutSec}s`);
+  log.info(`ARMED=${armedMode} · LS_LIVE_TRADING=${liveCfg.liveTrading} · 취소TR확인(env)=${liveCfg.cancelConfirmed}/(코드)=false → 실주문 ${liveCapable ? '가능' : '차단'}`);
+
   // ── 계좌 주문이벤트(AS0~AS4) 추적 저장 — 계좌 단위(전 종목). 재시작 시 원주문번호 기준 복원 ──
   const evStore = new OrderStore('__account_events__');
   evStore.load();
@@ -175,6 +184,9 @@ async function main() {
       evStore.recordResponse({ atMs: Date.now(), tr: trCd, rspCd: (ev as any).rejectReason || '', rspMsg: res.changed ? res.transition : `무시:${res.reason}`, ordNo: ev.ordNo || null, note: res.order?.status });
       evStore.flush();
       log.info(`[ACCT ${trCd}] ordNo=${ev.ordNo || '-'} org=${ev.orgOrdNo || '-'} ${res.changed ? res.transition : `무시(${res.reason})`} status=${res.order?.status ?? '-'}${trCd === 'AS3' ? ' (취소 결과확인 이벤트 · REST 취소요청 아님)' : ''}`);
+      // req10: AS 상태추적(주문번호)을 실전 종목 OrderStore pending 과 연결 — 종결이면 pending 해소.
+      const liveCtx = ctxs.get(liveCfg.liveSymbol);
+      if (liveCtx) { const done = linkTrackedToOrders(tracker, liveCtx.orders); if (done.length) log.info(`[ACCT-LINK ${liveCfg.liveSymbol}] pending 해소(주문번호 ${done.join(',')})`); }
     },
     onRegisterAck: (trCd, rspCd, rspMsg) => log.info(`[ACCT-REG] ${trCd} 등록응답 rsp_cd=${rspCd} rsp_msg=${scrub(rspMsg)}`),
     onGSC: (t) => {
@@ -205,19 +217,15 @@ async function main() {
   }, { accountEvents: true });   // AS0~AS4 계좌 이벤트 등록(tr_type=1) — 재연결 시 자동 재등록
   client.connect(us.ok.map(s => ({ exchcd: s.exchcd, symbol: s.symbol })));
 
-  // ── Phase 3A 실전 설정(1종목/1주/지정가/하루 1회) + ARMED 감시 ──
-  let liveCfg: LiveConfig;
-  try { liveCfg = loadLiveConfig(); } catch (e) { log.error(String(e)); process.exit(1); return; }
-  const armedMode = liveCfg.armed;
-  // 실행 능력(3중): armed=true 가정 시 LIVE_TRADING + 취소TR(코드상수 false) + env 취소확인 모두 필요
-  const liveCapable = canExecuteLive(true, liveCfg.liveTrading, liveCfg.cancelConfirmed).execute;
-  log.info(`[LIVE-CFG] 대상=${liveCfg.liveExchange}:${liveCfg.liveSymbol}(exchcd=${liveCfg.liveExchcd}) maxQty=${liveCfg.maxQty} 하루매수=${liveCfg.dailyMaxBuys} 하루매도=${liveCfg.dailyMaxSells} 미체결타임아웃=${liveCfg.pendingTimeoutSec}s`);
-  log.info(`ARMED=${armedMode} · LS_LIVE_TRADING=${liveCfg.liveTrading} · 취소TR확인(env)=${liveCfg.cancelConfirmed}/(코드)=false → 실주문 ${liveCapable ? '가능' : '차단'}`);
-
   const traderDeps: TraderDeps = {
     place: (pp) => placeLSUSBuyOrder(cfg, token, pp),
     query: (pp) => queryLSUSOrderExec(cfg, token, pp),
     cancel: (pp) => cancelLSUSOrder(cfg, token, pp),
+    // 현금(USD 예수금) 주문가능금액 — 신용/미수/증거금 미사용(cash-only). 부족하면 전송 금지.
+    cashOrderable: async () => {
+      try { const d = await getLSUSDeposit(cfg, token); return { ok: d.rspCd === '00000' && d.found, cash: d.usdDeposit }; }
+      catch (e) { log.warn(`[US] 현금 주문가능금액 조회 실패: ${scrub(String(e))}`); return { ok: false, cash: 0 }; }
+    },
     now: () => Date.now(),
     log: (m) => log.info(scrub(m)),
   };

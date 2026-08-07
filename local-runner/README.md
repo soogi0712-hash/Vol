@@ -229,6 +229,24 @@ READY · 미체결 시 신규 금지 · 동일봉 중복 금지 · 주문번호 
 
 **현재 실주문은 실행되지 않습니다** — 취소 TR 미확인으로 3중 차단 유지, `LS_LIVE_TRADING=false`.
 
+#### US 주문 중복방지 (KR 3중체결 사고 패턴 이식)
+
+국내에서 발생한 중복주문 사고 방지 패턴을 미국 주문 경로(`executeBuyOrder`)에도 동일 적용했습니다:
+
+- **`US_ORDER_POST_IDEMPOTENT`** — `COSAT00301` 전송 **직전**(응답 해석 전) candle lock 을 영구 저장+flush.
+  같은 확정봉 BUY 신호가 3번 반복돼도 **실제 POST 는 1회**. HTTP/timeout/500/parse/rsp_cd 오류 뒤에도 **재POST 0회**.
+- **`US_CASH_ONLY_GATE`** — 주문 직전 현금(USD 예수금 `COSOQ02701`) 재조회. `price*qty > 현금가능`이면
+  `COSAT00301` **미호출**. 신용/미수/증거금 레버리지는 사용하지 않습니다.
+- **`US_PENDING_REORDER_BLOCKED`** — pending 주문이 하나라도 있으면 신규 BUY 금지.
+- **`US_RESTART_RECONCILIATION`** — 주문 전 `COSAQ00102` 로 당일 실제 매수주문과 로컬 OrderStore 를
+  대사. 조회 실패 또는 로컬 미기록 주문 감지 시 신규 BUY 금지(재시작 후에도).
+- **`US_AS_EVENT_LINKED`** — AS0/AS1/AS3/AS4 상태추적을 **주문번호로 pending 과 연결**(`linkTrackedToOrders`).
+  종결(FILLED/CANCELLED/PFC/REJECTED) 이벤트 수신 시 해당 주문번호 pending 을 해소.
+- 성공 판정 = **OrdNo 존재 또는 성공코드(00000)**(`isUSOrderSuccess`) — 미확인 성공코드도 OrdNo 로 성공 처리.
+
+> 오늘 첫 미국 실전 대상: `LS_US_LIVE_SYMBOL`=NASDAQ:AAPL 1종목, 1주, 하루 BUY 1회.
+> 단, REST 취소 TR(COSAT00311) 미확인으로 **실주문 자체는 여전히 3중 차단**(`LS_LIVE_TRADING=false`).
+
 ### 해외 시세 구분(delaygb) — 미국 실시간 Non-Display 불가
 
 미국주식 **실시간 시세는 Non-Display(오픈API) 이용이 불가**합니다. 따라서 US 는 기본
