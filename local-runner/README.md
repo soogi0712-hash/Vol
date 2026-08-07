@@ -294,6 +294,12 @@ HTS 실제 "타통화+원화 가능수량" = **2주**. 후보 계산 결과:
   `qty>=1` + `cashOnly=true` 일 때만 AAPL qty=1 POST 허용. 추가매수 없음 / 하루 BUY 1회 / 미체결 수동취소.
 - 실제 POST 는 여전히 `LS_LIVE_TRADING=true`(사용자 런타임 스위치) 필요. 신용/미수/대출/증거금 절대 미사용.
 
+**최종 실거래 게이트 로그 `[US-LIVE-GATE AAPL]`**: `LS_LIVE_TRADING / US_LIVE_READY / CROSS_WON_VERIFIED /
+HTS_QTY / PROGRAM_QTY(최신 bestAsk 재계산) / cashOnly / paymentMode=CROSS_WON / POST_ALLOWED`. 시작 시 +
+최초 bestAsk 수신 시 + BUY 직전 출력. **POST_ALLOWED = LS_LIVE_TRADING && US_LIVE_READY && CROSS_WON_VERIFIED
+&& (WonCashMin programQty≥1 && cashOnly)**. 시작 로그의 "실주문 가능" 문구도 동일 최종 게이트와 일치하도록
+`US_LIVE_READY && CROSS_WON_VERIFIED && LS_LIVE_TRADING && 시작현금조회` 를 모두 만족할 때만 출력한다(P0-20 #12).
+
 ### COSAT00311(미체결 취소) 공식 필드 확인 결과 — 근거
 
 Phase 3A 완성을 위해 취소 TR 을 구현하려 했으나, **공식 필드를 확인하지 못했습니다.** 확인 경로와 결과:

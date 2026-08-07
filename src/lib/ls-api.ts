@@ -855,6 +855,15 @@ export function formatCrossWonCheck(symbol: string, e: CrossWonEval): string {
     + ` PROGRAM orderableQty=${e.adoptedField ? e.programQty : '미채택'} MATCH=${e.match == null ? 'N/A' : e.match}`
     + ` paymentMode=CROSS_WON cashOnly=${e.cashOnly} orderAllowed=${e.orderAllowed}${e.orderAllowed ? '' : ` (${e.reason})`}`;
 }
+// [US-LIVE-GATE] — 최종 실거래 게이트 로그(P0-20 활성화). POST_ALLOWED 는 실제 주문 허용 최종 판정.
+//   POST_ALLOWED = LS_LIVE_TRADING && US_LIVE_READY && CROSS_WON_VERIFIED && evaluateCrossWon.orderAllowed(qty>=1&&cashOnly).
+export function formatUSLiveGate(symbol: string, o: { liveTrading: boolean; usLiveReady: boolean; crossWonVerified: boolean; e: CrossWonEval }): string {
+  const postAllowed = o.liveTrading && o.usLiveReady && o.crossWonVerified && o.e.orderAllowed;
+  return `[US-LIVE-GATE ${symbol}] LS_LIVE_TRADING=${o.liveTrading} US_LIVE_READY=${o.usLiveReady}`
+    + ` CROSS_WON_VERIFIED=${o.crossWonVerified} HTS_QTY=${o.e.htsQty == null ? '미입력' : o.e.htsQty}`
+    + ` PROGRAM_QTY=${o.e.programQty} cashOnly=${o.e.cashOnly} paymentMode=CROSS_WON`
+    + ` POST_ALLOWED=${postAllowed}${postAllowed ? '' : ` (${o.e.orderAllowed ? 'GATE_OFF' : o.e.reason})`}`;
+}
 // [CROSS-WON-LIVE-CAND] — 최초 유효 bestAsk>0 수신 직후, 실계정 후보별 수량을 실측 대조용으로 출력(P0-19).
 export function formatCrossWonLiveCand(symbol: string, e: CrossWonEval): string {
   const lines = [`[CROSS-WON-LIVE-CAND ${symbol}]`, `bestAsk=${e.bestAsk.toFixed(2)}`, `BaseXchrat=${e.baseXchRate.toFixed(2)}`];

@@ -5,7 +5,7 @@ import {
   getLSUSTicks, getLSUSTicksPaged, lsOverseasChartRaw,
   placeLSUSBuyOrder, queryLSUSOrderExec, getLSUSDeposit, getLSUSHoldings, cancelLSUSOrder, LS_CANCEL_TR_CONFIRMED, isUSOrderSuccess,
   decideUSCashPayment, usCashOnlyUsdCap, usOrderableQty, formatCashOrderableLine,
-  evaluateCrossWon, formatCrossWonCheck, formatCrossWonLiveCand, maskLSResponse, CROSS_WON_ADOPTED_FIELD, LS_US_CROSS_WON_TR_CONFIRMED, type LSUSDeposit,
+  evaluateCrossWon, formatCrossWonCheck, formatCrossWonLiveCand, formatUSLiveGate, maskLSResponse, CROSS_WON_ADOPTED_FIELD, LS_US_CROSS_WON_TR_CONFIRMED, type LSUSDeposit,
   placeLSKRBuyOrder, queryLSKROrderExec, cancelLSKRBuyOrder, krIsuNo, isKROrderSuccess,
   toLSOverseasExchcd, LSApiError, configureLSRateLimiter, classifyChart,
   LS_G3203_MAX_QRYCNT_UNCOMPRESSED,
@@ -743,6 +743,50 @@ describe('해외 주문/체결/예수금 (공식 필드)', () => {
     const byKey = Object.fromEntries(e.candidates.map(c => [c.key, c]));
     expect(byKey['WonCashMin'].amount).toBe(500000);   // min(1000742, 500000)
     expect(byKey['WonCashMin'].qty).toBe(1);           // 500000/442169 → 1
+  });
+
+  // ── P0-20 최종 실거래 게이트([US-LIVE-GATE]) ──
+  const gateOn = { liveTrading: true, usLiveReady: true, crossWonVerified: true };
+  it('P0-20 실거래 허용: HTS=2/PROGRAM=2/cashOnly=true + 게이트 ON → POST_ALLOWED=true', () => {
+    const e = evaluateCrossWon(real(), 313.22, 2);
+    expect(e.programQty).toBe(2); expect(e.cashOnly).toBe(true); expect(e.orderAllowed).toBe(true);
+    const line = formatUSLiveGate('AAPL', { ...gateOn, e });
+    expect(line).toContain('[US-LIVE-GATE AAPL]');
+    expect(line).toContain('LS_LIVE_TRADING=true');
+    expect(line).toContain('US_LIVE_READY=true');
+    expect(line).toContain('CROSS_WON_VERIFIED=true');
+    expect(line).toContain('HTS_QTY=2');
+    expect(line).toContain('PROGRAM_QTY=2');
+    expect(line).toContain('cashOnly=true');
+    expect(line).toContain('paymentMode=CROSS_WON');
+    expect(line).toContain('POST_ALLOWED=true');
+  });
+  it('P0-20 차단: PROGRAM=0(원화현금 부족) → POST_ALLOWED=false', () => {
+    const e = evaluateCrossWon(dep({ usdOrderable: 0, krwCash: 100000, krwWithdrawable: 100000, baseXchRate: 1418.8 }), 313.22, null);
+    expect(e.programQty).toBe(0);
+    expect(formatUSLiveGate('AAPL', { ...gateOn, e })).toContain('POST_ALLOWED=false');
+  });
+  it('P0-20 차단: OvrsMgn>0 → POST_ALLOWED=false (NOT_CASH_ONLY)', () => {
+    const e = evaluateCrossWon(dep({ ...real(), overseasMargin: 1 } as any), 313.22, 2);
+    expect(e.orderAllowed).toBe(false); expect(e.reason).toBe('NOT_CASH_ONLY');
+    expect(formatUSLiveGate('AAPL', { ...gateOn, e })).toContain('POST_ALLOWED=false');
+  });
+  it('P0-20 차단: LoanAmt>0 → POST_ALLOWED=false (NOT_CASH_ONLY)', () => {
+    const e = evaluateCrossWon(dep({ ...real(), loanAmt: 1 } as any), 313.22, 2);
+    expect(e.orderAllowed).toBe(false); expect(e.reason).toBe('NOT_CASH_ONLY');
+    expect(formatUSLiveGate('AAPL', { ...gateOn, e })).toContain('POST_ALLOWED=false');
+  });
+  it('P0-20 차단: FcurrPldgAmt>0 → POST_ALLOWED=false (NOT_CASH_ONLY)', () => {
+    const e = evaluateCrossWon(dep({ ...real(), fcurrPldgAmt: 0.5 } as any), 313.22, 2);
+    expect(e.orderAllowed).toBe(false); expect(e.reason).toBe('NOT_CASH_ONLY');
+    expect(formatUSLiveGate('AAPL', { ...gateOn, e })).toContain('POST_ALLOWED=false');
+  });
+  it('P0-20 게이트 OFF: LS_LIVE_TRADING=false → 주문가능해도 POST_ALLOWED=false(GATE_OFF)', () => {
+    const e = evaluateCrossWon(real(), 313.22, 2);
+    expect(e.orderAllowed).toBe(true);
+    const line = formatUSLiveGate('AAPL', { liveTrading: false, usLiveReady: true, crossWonVerified: true, e });
+    expect(line).toContain('POST_ALLOWED=false');
+    expect(line).toContain('GATE_OFF');
   });
 
   it('P0-17 cashOrderable 로그: 성공/실패 두 형태만, "미조회" 절대 없음', () => {

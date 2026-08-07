@@ -11,7 +11,7 @@ import {
   getLSUS15MinPaged, getLSUSTicksPaged, getLSUSDeposit,
   placeLSUSBuyOrder, queryLSUSOrderExec, cancelLSUSOrder, LSApiError,
   decideUSCashPayment, usCashOnlyUsdCap, usOrderableQty, formatCashOrderableLine,
-  evaluateCrossWon, formatCrossWonCheck, formatCrossWonLiveCand, LS_US_CROSS_WON_TR_CONFIRMED, type LSUSDeposit,
+  evaluateCrossWon, formatCrossWonCheck, formatCrossWonLiveCand, formatUSLiveGate, LS_US_CROSS_WON_TR_CONFIRMED, type LSUSDeposit,
 } from '../src/lib/ls-api';
 import {
   LSUSRealtimeClient, RealtimeCandleBuilder, buildWsTrKey, evaluateReadiness, MIN_RT_CANDLES,
@@ -236,6 +236,7 @@ async function main() {
     const e = evaluateCrossWon(depFull, ctx.bestAsk, liveCfg.htsOrderableQty);
     log.info(formatCrossWonLiveCand(ctx.symbol, e));   // [CROSS-WON-LIVE-CAND] 요구 형식(bestAsk/BaseXchrat/후보별 qty/HTS)
     logCrossWon('CROSS-WON-LIVE', ctx.bestAsk);         // 후보 상세 + cashOnly + [CROSS-WON-CHECK]
+    log.info(formatUSLiveGate(ctx.symbol, { liveTrading: liveCfg.liveTrading, usLiveReady: computeUSP0Checklist(liveCfg).US_LIVE_READY, crossWonVerified: liveCfg.crossWonVerified, e }));   // [US-LIVE-GATE] 실제 bestAsk 기준
   }
 
   // ── P0-13/P0-15: 프로그램 시작 직후 BUY 여부와 무관하게 예수금 1회 조회 + 진단 로그. 실패면 LIVE 금지 ──
@@ -249,20 +250,21 @@ async function main() {
   logCrossWon('STARTUP-CROSS-WON', startupPrice);   // 후보필드별 수량 + [CROSS-WON-CHECK]
   const startupCashOk = depOk;
 
-  // ── P0-16 하드차단: 타통화+원화(통합증거금/선환전) 공식 필드 미확인 → US BUY 원천 차단(LS_LIVE_TRADING=true 여도) ──
-  // 확정 경로(USD 현금)만 신뢰. 실계정 USD현금=0 이면 사실상 오늘 US BUY 불가. 사용자 실측확인 후 코드상수 전환 시 해제.
-  if (!liveCfg.crossWonVerified) {
-    log.warn(`[P0-16] 타통화+원화 주문가능 공식 필드 미확인 → US BUY 하드차단(LS_US_CROSS_WON_TR_CONFIRMED=${LS_US_CROSS_WON_TR_CONFIRMED}). USD 현금 주문가능=${depFull ? depFull.usdOrderable.toFixed(2) : '0.00'}USD 로만 판정.`);
-  }
-
-  // 실행 능력: LIVE_TRADING + 취소모드(수동 허용) + 시작시 현금조회 성공(P0-13) 필요. (실제 BUY 는 확정 현금경로만 통과)
-  const liveCapable = canExecuteLive(true, liveCfg.liveTrading, { manualCancel: liveCfg.manualCancel, cancelEnvConfirmed: liveCfg.cancelConfirmed }).execute && startupCashOk;
-  // P0-10: 최종 체크리스트 출력
+  // P0-10: 최종 체크리스트 출력(먼저 계산 — 실주문 가능여부 판정에 US_LIVE_READY 반영, P0-20 #12)
   const p0 = computeUSP0Checklist(liveCfg);
   log.info(`[P0-CHECKLIST]\n${formatUSP0Checklist(p0)}`);
-  log.info(`[P0] US_LIVE_READY=${p0.US_LIVE_READY} · 시작현금조회=${startupCashOk} → 오늘 미국장 실전 ${p0.US_LIVE_READY && startupCashOk ? '가능(단, LS_LIVE_TRADING=true 필요)' : '불가/차단'}`);
+
+  // ── P0-20 #12: "실주문 가능" 은 최종 게이트 결과와 일치해야 한다 ──
+  // 실주문 능력(config-level) = LIVE_TRADING && US_LIVE_READY && CROSS_WON_VERIFIED && 시작현금조회 && 취소모드(수동 허용).
+  const canExec = canExecuteLive(true, liveCfg.liveTrading, { manualCancel: liveCfg.manualCancel, cancelEnvConfirmed: liveCfg.cancelConfirmed }).execute;
+  const liveCapable = canExec && p0.US_LIVE_READY && liveCfg.crossWonVerified && startupCashOk;
+  if (!liveCfg.crossWonVerified) log.warn(`[P0-20] CROSS_WON_VERIFIED=false(kill-switch 또는 코드상수 미확정) → 통합증거금 경로 비활성 → US BUY 차단.`);
+
+  log.info(`[P0] US_LIVE_READY=${p0.US_LIVE_READY} · CROSS_WON_VERIFIED=${liveCfg.crossWonVerified} · 시작현금조회=${startupCashOk} · LS_LIVE_TRADING=${liveCfg.liveTrading} → 오늘 미국장 ${liveCapable ? '실주문 가능(paymentMode=CROSS_WON)' : `실주문 차단${liveCfg.liveTrading ? '' : '(LS_LIVE_TRADING=false)'}`}`);
   log.info(`[LIVE-CFG] 대상=${liveCfg.liveExchange}:${liveCfg.liveSymbol}(exchcd=${liveCfg.liveExchcd}) maxQty=${liveCfg.maxQty} 하루매수=${liveCfg.dailyMaxBuys} 하루매도=${liveCfg.dailyMaxSells} 미체결타임아웃=${liveCfg.pendingTimeoutSec}s`);
-  log.info(`ARMED=${armedMode} · LS_LIVE_TRADING=${liveCfg.liveTrading} · 취소TR확인(env)=${liveCfg.cancelConfirmed}/(코드)=false → 실주문 ${liveCapable ? '가능' : '차단'}`);
+  log.info(`ARMED=${armedMode} · LS_LIVE_TRADING=${liveCfg.liveTrading} · US_LIVE_READY=${p0.US_LIVE_READY} · CROSS_WON_VERIFIED=${liveCfg.crossWonVerified} · 취소TR확인(env)=${liveCfg.cancelConfirmed}/(코드)=false → 실주문 ${liveCapable ? '가능' : '차단'}`);
+  // 시작 시점 US-LIVE-GATE(가격 미확보면 PROGRAM_QTY=0 — GSH 수신 후 재출력)
+  if (depFull) log.info(formatUSLiveGate(liveCfg.liveSymbol, { liveTrading: liveCfg.liveTrading, usLiveReady: p0.US_LIVE_READY, crossWonVerified: liveCfg.crossWonVerified, e: evaluateCrossWon(depFull, startupPrice, liveCfg.htsOrderableQty) }));
 
   // ── 계좌 주문이벤트(AS0~AS4) 추적 저장 — 계좌 단위(전 종목). 재시작 시 원주문번호 기준 복원 ──
   const evStore = new OrderStore('__account_events__');
@@ -356,6 +358,7 @@ async function main() {
       orderableQtyOk = usOrderAllowed(buyPrice).allowed || !!(crossWon && crossWon.orderAllowed);
       logUSCashDiag('BUY-US-CASH', buyPrice);              // BUY 직전 상세 진단(P0-16)
       logCrossWon('BUY-CROSS-WON', buyPrice);              // BUY 직전 통합증거금 실측대조(P0-18)
+      if (crossWon) log.info(formatUSLiveGate(ctx.symbol, { liveTrading: liveCfg.liveTrading, usLiveReady: computeUSP0Checklist(liveCfg).US_LIVE_READY, crossWonVerified: liveCfg.crossWonVerified, e: crossWon }));   // [US-LIVE-GATE] BUY 직전 최종(P0-20 #13)
     } else {
       await refreshDeposit();              // 60초 캐시 사용(만료 시에만 재조회) — 재조회 전엔 캐시 유지
     }
