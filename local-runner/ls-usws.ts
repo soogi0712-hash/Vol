@@ -10,6 +10,7 @@ import { makeScrubber } from './mask';
 import {
   getLSUS15MinPaged, getLSUSTicksPaged, getLSUSDeposit,
   placeLSUSBuyOrder, queryLSUSOrderExec, cancelLSUSOrder, LSApiError,
+  decideUSCashPayment, usCashOnlyUsdCap, type LSUSDeposit,
 } from '../src/lib/ls-api';
 import {
   LSUSRealtimeClient, RealtimeCandleBuilder, buildWsTrKey, evaluateReadiness, MIN_RT_CANDLES,
@@ -162,26 +163,40 @@ async function main() {
   try { liveCfg = loadLiveConfig(); } catch (e) { log.error(String(e)); process.exit(1); return; }
   const armedMode = liveCfg.armed;
 
-  // ── 현금 주문가능액(USD 예수금) 조회 캐시 + refreshDeposit ── 계좌 단위 60초 캐시. rsp_cd/rsp_msg/금액 보존.
+  // ── 현금 주문가능액(해외 예수금) 조회 캐시 + refreshDeposit ── 계좌 단위 60초 캐시. rsp_cd/rsp_msg/전체필드 보존.
+  // depCash = cash-only USD 주문가능 상한(USD현금 or 원화현금 선환전, 레버리지 제외, P0-15). depFull = 진단용 원본.
   let depAt = 0; let depCash = 0; let depOk = false; let depRspCd = ''; let depRspMsg = '';
+  let depFull: LSUSDeposit | null = null;
   async function refreshDeposit(force = false): Promise<void> {
     const now = Date.now();
     if (!force && now - depAt < 60_000) return;
     try {
       const d = await getLSUSDeposit(cfg, token);
-      depOk = d.ok; depCash = d.usdDeposit; depRspCd = d.rspCd; depRspMsg = d.rspMsg;   // ok = 성공코드(00000/00136) + 금액필드
+      depFull = d;
+      depOk = d.ok; depCash = usCashOnlyUsdCap(d); depRspCd = d.rspCd; depRspMsg = d.rspMsg;   // cash-only 상한(USD or 원화선환전)
     } catch (e) {
-      depOk = false; depCash = 0;
+      depFull = null; depOk = false; depCash = 0;
       if (e instanceof LSApiError) { depRspCd = e.rspCd ?? `ERR(${e.kind})`; depRspMsg = e.message; }
       else { depRspCd = 'EXCEPTION'; depRspMsg = String(e); }
     }
     depAt = now;
   }
+  // ── P0-15 진단 로그: USD/KRW 현금·환율·미수·1주 예상결제·결제모드·주문허용 여부를 한 줄로 출력 ──
+  function logUSCashDiag(tag: string, priceUsd: number): void {
+    if (!depOk || !depFull) { log.error(`[${tag} ${liveCfg.liveSymbol}] 예수금조회 실패 rsp_cd=${depRspCd} rsp_msg=${scrub(depRspMsg)} → 주문 차단`); return; }
+    const dec = decideUSCashPayment(depFull, priceUsd, liveCfg.maxQty);
+    const est = priceUsd > 0
+      ? `estimated ${liveCfg.liveSymbol} ${liveCfg.maxQty}share(USD)=${dec.estimatedUsd.toFixed(2)} / KRW=${Math.round(dec.estimatedKrw)}`
+      : `estimated=대기(가격미확보)`;
+    log.info(`[${tag}] USD cashOrderable=${depFull.usdCash.toFixed(2)} / KRW cashOrderable=${Math.round(depFull.krwCash)} / 선환전USD=${depFull.usdPrexchOrderable.toFixed(2)} / 기준환율=${depFull.baseXchRate.toFixed(2)} / 미수(OvrsMgn)=${Math.round(depFull.overseasMargin)} / ${est} / paymentMode=${dec.paymentMode} / orderAllowed=${dec.orderAllowed}${dec.orderAllowed ? '' : ` (${dec.reason})`} / rsp_cd=${depRspCd}`);
+  }
 
-  // ── P0-13: 프로그램 시작 직후 BUY 여부와 무관하게 AAPL cashOrderable 1회 조회 + 로그. 실패면 LIVE 금지 ──
+  // ── P0-13/P0-15: 프로그램 시작 직후 BUY 여부와 무관하게 예수금 1회 조회 + 진단 로그. 실패면 LIVE 금지 ──
   await refreshDeposit(true);
-  if (depOk) log.info(`[STARTUP-CASH ${liveCfg.liveSymbol}] cashOrderable=${depCash.toFixed(2)} USD rsp_cd=${depRspCd}`);
+  const startupPrice = ctxs.get(liveCfg.liveSymbol)?.lastPrice ?? 0;   // 시작 시 알 수 있는 참조가(시드/실시간). 없으면 0
+  if (depOk) log.info(`[STARTUP-CASH ${liveCfg.liveSymbol}] cashOrderable(cash-only)=${depCash.toFixed(2)} USD rsp_cd=${depRspCd}`);
   else log.error(`[STARTUP-CASH ${liveCfg.liveSymbol}] cashOrderable 조회실패 rsp_cd=${depRspCd} rsp_msg=${scrub(depRspMsg)} → LIVE 금지`);
+  logUSCashDiag('STARTUP-US-CASH', startupPrice);
   const startupCashOk = depOk;
 
   // 실행 능력: armed 가정 시 LIVE_TRADING + 취소모드(수동 허용) + 시작시 현금조회 성공(P0-13) 모두 필요
@@ -249,9 +264,9 @@ async function main() {
     place: (pp) => placeLSUSBuyOrder(cfg, token, pp),
     query: (pp) => queryLSUSOrderExec(cfg, token, pp),
     cancel: (pp) => cancelLSUSOrder(cfg, token, pp),
-    // 현금(USD 예수금) 주문가능금액 — 신용/미수/증거금 미사용(cash-only). 부족하면 전송 금지.
+    // 현금 주문가능금액 — USD현금 or 원화현금 선환전(cash-only, 신용/미수/증거금 절대 미사용). 부족하면 전송 금지.
     cashOrderable: async () => {
-      try { const d = await getLSUSDeposit(cfg, token); return { ok: d.ok, cash: d.usdDeposit }; }
+      try { const d = await getLSUSDeposit(cfg, token); return { ok: d.ok, cash: usCashOnlyUsdCap(d) }; }
       catch (e) { log.warn(`[US] 현금 주문가능금액 조회 실패: ${scrub(String(e))}`); return { ok: false, cash: 0 }; }
     },
     now: () => Date.now(),
@@ -273,10 +288,13 @@ async function main() {
     let cashLog = 'cashOrderable=미조회';
     if (sig.action === 'BUY' && ctx.builder.confirmedCount >= MIN_RT_CANDLES) {
       await refreshDeposit();
-      orderableQtyOk = depOk && buyPrice > 0 && depCash >= need;   // 조회성공 AND 1주 매수 가능
-      cashLog = depOk
-        ? `cashOrderable=${depCash.toFixed(2)} USD (필요=${need.toFixed(2)}, rsp_cd=${depRspCd})`
+      // cash-only 결제 판정(USD현금 or 원화현금 선환전). orderAllowed=false 면 주문 차단.
+      const dec = depFull ? decideUSCashPayment(depFull, buyPrice, liveCfg.maxQty) : null;
+      orderableQtyOk = !!(depOk && buyPrice > 0 && dec && dec.orderAllowed);   // 조회성공 AND cash-only 1주 결제가능
+      cashLog = depOk && dec
+        ? `cashOrderable(cash-only)=${depCash.toFixed(2)} USD (필요=${need.toFixed(2)}, mode=${dec.paymentMode}, allowed=${dec.orderAllowed}${dec.orderAllowed ? '' : `:${dec.reason}`}, rsp_cd=${depRspCd})`
         : `cashOrderable 조회실패 rsp_cd=${depRspCd} rsp_msg=${scrub(depRspMsg)}`;
+      logUSCashDiag('BUY-US-CASH', buyPrice);   // BUY 직전 재조회 진단(P0-15)
     }
 
     const state: GateState = {

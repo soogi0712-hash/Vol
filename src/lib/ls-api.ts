@@ -601,27 +601,98 @@ export async function queryLSUSOrderExec(
   return { rspCd, rspMsg, rows, diag };
 }
 
-// ── USD 예수금 조회 (COSOQ02701, /overseas-stock/accno) — 주문가능 판정용 ──
-// InBlock1(공식): RecCnt/CrcyCode. OutBlock2(통화별 리스트): CrcyCode/PrsmptFcurrDps1(추정 외화예수금) 등.
-// ⚠️ '주문가능금액' 정확한 필드는 공식 문서에 단일 확정값이 없어 PrsmptFcurrDps1(추정 예수금)을 사용한다.
-//     실주문 전 사용자 검증 필요(README 참고).
-// ok = 성공코드(00000/00136, allow-list 기준) AND USD 행에 금액필드(PrsmptFcurrDps1) 존재.
-//   OutBlock 없음/USD 행 없음/금액필드 없음 → ok=false(INVALID_RESPONSE 성격, LIVE 차단). 메시지 문자열로 판정하지 않는다.
-export interface LSUSDeposit { ok: boolean; rspCd: string; rspMsg: string; usdDeposit: number; found: boolean; diag: LSHttpDiag; }
+// ── 해외 예수금/주문가능 조회 (COSOQ02701, /overseas-stock/accno) — 현금(cash-only) 주문가능 판정용 ──
+// 공식 resExample(카탈로그) 확인 완료. 신용/미수/대출/증거금(레버리지) 절대 미사용. P0-15.
+//   OutBlock3(통화·국가별 리스트): USD 행
+//     · FcurrDps            = 외화예수금(순수 USD 현금)
+//     · FcurrOrdAbleAmt     = 외화주문가능금액(USD 현금 기준 주문가능)
+//     · PrexchOrdAbleAmt    = 선환전 주문가능금액(원화현금 자동환전으로 주문가능한 USD, LS가 환haircut 반영해 산출)
+//     · BaseXchrat          = 기준환율(USD→KRW)
+//   OutBlock4(원화 요약):
+//     · WonDpsBalAmt        = 원화예수금잔고(실제 보유 KRW 현금)
+//     · MnyoutAbleAmt       = 출금가능금액(전액 출금가능 == 순수현금 근거)
+//     · WonPrexchAbleAmt    = 원화 선환전 가능금액(원화주문에 쓸 수 있는 KRW 현금)
+//     · OvrsMgn             = 해외증거금(미수/레버리지 사용액) — 반드시 0 이어야 cash-only 로 허용
+// ok = 성공코드(00000/00136 allow-list) AND USD 행 존재+FcurrDps 필드 존재 AND OutBlock4(WonDpsBalAmt) 존재.
+//   블록/필드 누락 → ok=false(INVALID_RESPONSE, LIVE 차단). 메시지 문자열로 판정하지 않는다.
+export interface LSUSDeposit {
+  ok: boolean; rspCd: string; rspMsg: string; found: boolean; diag: LSHttpDiag;
+  usdCash: number;            // OutBlock3 USD FcurrDps (순수 USD 현금예수금)
+  usdOrderable: number;       // OutBlock3 USD FcurrOrdAbleAmt (USD 현금 주문가능)
+  usdPrexchOrderable: number; // OutBlock3 USD PrexchOrdAbleAmt (선환전 주문가능 USD, 원화현금 환산)
+  baseXchRate: number;        // OutBlock3 USD BaseXchrat (기준환율)
+  krwCash: number;            // OutBlock4 WonDpsBalAmt (실제 KRW 현금예수금)
+  krwWithdrawable: number;    // OutBlock4 MnyoutAbleAmt (출금가능 — 순수현금 근거)
+  krwPrexchable: number;      // OutBlock4 WonPrexchAbleAmt (원화 선환전 가능 KRW 현금)
+  overseasMargin: number;     // OutBlock4 OvrsMgn (해외증거금/미수 — 0 이어야 cash-only)
+  usdDeposit: number;         // 하위호환: = usdCash
+}
 export async function getLSUSDeposit(cfg: LSConfig, token: string): Promise<LSUSDeposit> {
   const { data, rspCd, rspMsg, diag } = await lsPost(token, '/overseas-stock/accno', 'COSOQ02701', {
     COSOQ02701InBlock1: { RecCnt: 1, CrcyCode: 'ALL' },
   });
   const codeOk = (LS_SUCCESS_CODES.COSOQ02701 ?? ['00000']).includes(rspCd);   // rsp_cd allow-list 기준(00136 포함)
-  const rows: any[] = data.COSOQ02701OutBlock2 || [];
-  const usd = rows.find(r => String(r.CrcyCode).toUpperCase() === 'USD');
-  const hasAmount = !!usd && Object.prototype.hasOwnProperty.call(usd, 'PrsmptFcurrDps1');   // 금액필드 존재 여부
+  const ob3: any[] = data.COSOQ02701OutBlock3 || [];
+  const usd = ob3.find(r => String(r.CrcyCode).toUpperCase() === 'USD');
+  const ob4: any = data.COSOQ02701OutBlock4 || null;
+  const usdHasCash = !!usd && Object.prototype.hasOwnProperty.call(usd, 'FcurrDps');
+  const krwHasCash = !!ob4 && Object.prototype.hasOwnProperty.call(ob4, 'WonDpsBalAmt');
+  const usdCash = usdHasCash ? toNum(usd.FcurrDps) : 0;
   return {
-    ok: codeOk && hasAmount,   // 00136 이어도 OutBlock/금액필드 없으면 false(차단)
-    rspCd, rspMsg,
-    usdDeposit: hasAmount ? toNum(usd.PrsmptFcurrDps1) : 0,
-    found: !!usd, diag,
+    ok: codeOk && usdHasCash && krwHasCash,   // 성공코드 + USD현금필드 + 원화요약 모두 있어야 정상(아니면 차단)
+    rspCd, rspMsg, found: !!usd, diag,
+    usdCash,
+    usdOrderable: usd ? toNum(usd.FcurrOrdAbleAmt) : 0,
+    usdPrexchOrderable: usd ? toNum(usd.PrexchOrdAbleAmt) : 0,
+    baseXchRate: usd ? toNum(usd.BaseXchrat) : 0,
+    krwCash: ob4 ? toNum(ob4.WonDpsBalAmt) : 0,
+    krwWithdrawable: ob4 ? toNum(ob4.MnyoutAbleAmt) : 0,
+    krwPrexchable: ob4 ? toNum(ob4.WonPrexchAbleAmt) : 0,
+    overseasMargin: ob4 ? toNum(ob4.OvrsMgn) : 0,
+    usdDeposit: usdCash,   // 하위호환
   };
+}
+
+// ── cash-only 결제 판정 (P0-15) — USD 현금 우선, 부족 시 원화현금 선환전. 신용/미수/증거금 절대 미사용 ──
+// 안전원칙: (1) overseasMargin(OvrsMgn) > 0 이면 즉시 차단(계좌에 미수/증거금 사용 흔적) →
+//           (2) USD 현금(FcurrDps) 이 필요금액을 덮으면 USD 결제, (3) 아니면 원화현금 선환전:
+//               · 공식 USD 선환전주문가능(PrexchOrdAbleAmt) ≥ 필요 USD  그리고
+//               · 실제 원화현금(min(WonDpsBalAmt, WonPrexchAbleAmt)) ≥ 필요USD × 기준환율  둘 다 충족.
+//           원화현금은 실제 예수금을 초과할 수 없도록 min 으로 캡(레버리지 유입 차단).
+export type USPaymentMode = 'USD' | 'KRW' | 'NONE';
+export interface USCashDecision {
+  paymentMode: USPaymentMode; orderAllowed: boolean; reason: string;
+  usdCash: number; krwCash: number; baseXchRate: number; overseasMargin: number;
+  estimatedUsd: number; estimatedKrw: number; cashOnlyUsdCap: number;
+}
+// 계좌가 순수현금으로 결제 가능한 최대 USD 명목금액(레버리지 제외). 가격 무관.
+export function usCashOnlyUsdCap(dep: LSUSDeposit): number {
+  if (!dep.ok || dep.overseasMargin > 0) return 0;   // 미수/증거금 사용 계좌 → cash-only 불가
+  const krwCashOnly = Math.min(dep.krwCash, dep.krwPrexchable);   // 실제 예수금 초과 금지(레버리지 캡)
+  const krwPathUsd = (dep.baseXchRate > 0 && krwCashOnly > 0)
+    ? Math.min(dep.usdPrexchOrderable, krwCashOnly / dep.baseXchRate)   // 공식 선환전가능 vs 원화현금 환산 중 작은 값
+    : 0;
+  return Math.max(dep.usdCash, krwPathUsd);
+}
+export function decideUSCashPayment(dep: LSUSDeposit, priceUsd: number, qty: number): USCashDecision {
+  const estimatedUsd = priceUsd * qty;
+  const base = {
+    usdCash: dep.usdCash, krwCash: dep.krwCash, baseXchRate: dep.baseXchRate, overseasMargin: dep.overseasMargin,
+    estimatedUsd, estimatedKrw: estimatedUsd * (dep.baseXchRate > 0 ? dep.baseXchRate : 0),
+    cashOnlyUsdCap: usCashOnlyUsdCap(dep),
+  };
+  if (!dep.ok) return { ...base, paymentMode: 'NONE', orderAllowed: false, reason: 'INVALID_RESPONSE' };
+  if (dep.overseasMargin > 0) return { ...base, paymentMode: 'NONE', orderAllowed: false, reason: 'MARGIN_PRESENT' };
+  if (!(priceUsd > 0) || !(qty > 0)) return { ...base, paymentMode: 'NONE', orderAllowed: false, reason: 'INVALID_PRICE' };
+  // (2) USD 현금 결제
+  if (dep.usdCash >= estimatedUsd) return { ...base, paymentMode: 'USD', orderAllowed: true, reason: 'USD_CASH' };
+  // (3) 원화현금 선환전 결제 — 공식 선환전가능(USD) AND 실제 원화현금(KRW) 둘 다 충족
+  const krwCashOnly = Math.min(dep.krwCash, dep.krwPrexchable);
+  const krwOk = dep.baseXchRate > 0 && krwCashOnly > 0
+    && dep.usdPrexchOrderable >= estimatedUsd
+    && krwCashOnly >= base.estimatedKrw;
+  if (krwOk) return { ...base, paymentMode: 'KRW', orderAllowed: true, reason: 'KRW_PREXCH_CASH' };
+  return { ...base, paymentMode: 'NONE', orderAllowed: false, reason: 'KRW_CASH_INSUFFICIENT' };
 }
 
 // ── 미체결 취소 (COSAT00311) — ⚠️ 공식 카탈로그에 필드(reqExample/InBlock) 미수록 ──

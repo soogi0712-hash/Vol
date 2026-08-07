@@ -4,6 +4,7 @@ import {
   getLSKRPrice, getLSUSPrice, getLSKR15Min, getLSUS15Min, getLSUS15MinPaged,
   getLSUSTicks, getLSUSTicksPaged, lsOverseasChartRaw,
   placeLSUSBuyOrder, queryLSUSOrderExec, getLSUSDeposit, getLSUSHoldings, cancelLSUSOrder, LS_CANCEL_TR_CONFIRMED, isUSOrderSuccess,
+  decideUSCashPayment, usCashOnlyUsdCap, type LSUSDeposit,
   placeLSKRBuyOrder, queryLSKROrderExec, cancelLSKRBuyOrder, krIsuNo, isKROrderSuccess,
   toLSOverseasExchcd, LSApiError, configureLSRateLimiter, classifyChart,
   LS_G3203_MAX_QRYCNT_UNCOMPRESSED,
@@ -484,42 +485,116 @@ describe('해외 주문/체결/예수금 (공식 필드)', () => {
     expect(r.rows[0]).toMatchObject({ ordNo: '141', symbol: 'TSLA', ordQty: 10, execQty: 4, unfilledQty: 6, ordPtnCode: '02' });
   });
 
-  it('COSOQ02701 USD 예수금 조회(rsp_cd=00000) — ok=true, PrsmptFcurrDps1 파싱', async () => {
+  // COSOQ02701 공식 응답 모의(OutBlock3 통화별 + OutBlock4 원화요약). USD현금/선환전/환율/원화현금/미수 지정.
+  function depBody(over: { rspCd?: string; usdCash?: string; usdOrdable?: string; prexchUsd?: string; rate?: string;
+                          wonCash?: number; wonOutable?: number; wonPrexch?: number; ovrsMgn?: number;
+                          noOb3?: boolean; noUsd?: boolean; noUsdCash?: boolean; noOb4?: boolean } = {}) {
+    const usd: any = {
+      CrcyCode: 'USD', FcurrDps: over.usdCash ?? '0.0000', FcurrOrdAbleAmt: over.usdOrdable ?? '0.0000',
+      PrexchOrdAbleAmt: over.prexchUsd ?? '9245.8800', BaseXchrat: over.rate ?? '1434.6000',
+    };
+    if (over.noUsdCash) delete usd.FcurrDps;
+    const ob4: any = {
+      RecCnt: 1, WonDpsBalAmt: over.wonCash ?? 13927349, MnyoutAbleAmt: over.wonOutable ?? (over.wonCash ?? 13927349),
+      WonPrexchAbleAmt: over.wonPrexch ?? (over.wonCash ?? 13927349), OvrsMgn: over.ovrsMgn ?? 0,
+    };
+    const json: any = { rsp_cd: over.rspCd ?? '00136', rsp_msg: '조회가 완료되었습니다.' };
+    if (!over.noOb3) json.COSOQ02701OutBlock3 = over.noUsd ? [{ CrcyCode: 'HKD', FcurrDps: '0.0000' }] : [usd];
+    if (!over.noOb4) json.COSOQ02701OutBlock4 = ob4;
+    return json;
+  }
+
+  it('COSOQ02701 해외예수금(rsp_cd=00000) — OutBlock3 USD현금/선환전 + OutBlock4 원화현금 파싱', async () => {
     stubFetch((url, init) => {
       expect(init.headers['tr_cd']).toBe('COSOQ02701');
-      return { json: { rsp_cd: '00000', COSOQ02701OutBlock2: [
-        { CrcyCode: 'JPY', PrsmptFcurrDps1: '0.0000' },
-        { CrcyCode: 'USD', PrsmptFcurrDps1: '3300.5000' },
-      ] } };
+      return { json: depBody({ rspCd: '00000', usdCash: '3300.5000', prexchUsd: '9245.8800', rate: '1434.6000', wonCash: 13927349 }) };
     });
     const r = await getLSUSDeposit(cfg, 'T');
     expect(r.ok).toBe(true);
     expect(r.found).toBe(true);
-    expect(r.usdDeposit).toBeCloseTo(3300.5);
+    expect(r.usdCash).toBeCloseTo(3300.5);
+    expect(r.usdDeposit).toBeCloseTo(3300.5);      // 하위호환 = usdCash
+    expect(r.usdPrexchOrderable).toBeCloseTo(9245.88);
+    expect(r.baseXchRate).toBeCloseTo(1434.6);
+    expect(r.krwCash).toBe(13927349);
+    expect(r.overseasMargin).toBe(0);
   });
-  it('P0-14: rsp_cd=00136(조회 완료) + 금액 존재 → ok=true (실계정 사고 수정)', async () => {
-    stubFetch(() => ({ json: { rsp_cd: '00136', rsp_msg: '조회가 완료되었습니다.', COSOQ02701OutBlock2: [
-      { CrcyCode: 'USD', PrsmptFcurrDps1: '5234.1500' },
-    ] } }));
+  it('P0-14: rsp_cd=00136(조회 완료) + 정상 블록 → ok=true (실계정 사고 수정)', async () => {
+    stubFetch(() => ({ json: depBody({ rspCd: '00136', usdCash: '5234.1500' }) }));
     const r = await getLSUSDeposit(cfg, 'T');
     expect(r.ok).toBe(true);                 // 00136 도 정상(allow-list)
     expect(r.rspCd).toBe('00136');
-    expect(r.usdDeposit).toBeCloseTo(5234.15);
+    expect(r.usdCash).toBeCloseTo(5234.15);
   });
-  it('P0-14: rsp_cd=00136 + OutBlock 없음 → ok=false(차단)', async () => {
+  it('P0-15: USD현금=0 이어도 OutBlock3/OutBlock4 정상이면 ok=true (원화현금 경로 조회 가능)', async () => {
+    stubFetch(() => ({ json: depBody({ usdCash: '0.0000', wonCash: 13927349 }) }));
+    const r = await getLSUSDeposit(cfg, 'T');
+    expect(r.ok).toBe(true);
+    expect(r.usdCash).toBe(0);
+    expect(r.krwCash).toBe(13927349);
+  });
+  it('P0-14/15: rsp_cd=00136 + OutBlock 없음 → ok=false(차단)', async () => {
     stubFetch(() => ({ json: { rsp_cd: '00136', rsp_msg: '조회가 완료되었습니다.' } }));
     const r = await getLSUSDeposit(cfg, 'T');
-    expect(r.ok).toBe(false);                // 금액필드 없음 → 차단
-    expect(r.usdDeposit).toBe(0);
+    expect(r.ok).toBe(false);                // 블록 없음 → 차단
+    expect(r.usdCash).toBe(0);
   });
-  it('P0-14: rsp_cd=00136 + USD 행에 금액필드 없음 → ok=false', async () => {
-    stubFetch(() => ({ json: { rsp_cd: '00136', COSOQ02701OutBlock2: [{ CrcyCode: 'USD' }] } }));
+  it('P0-15: OutBlock3 있으나 USD현금 필드 없음 → ok=false', async () => {
+    stubFetch(() => ({ json: depBody({ noUsdCash: true }) }));
+    const r = await getLSUSDeposit(cfg, 'T');
+    expect(r.ok).toBe(false);
+  });
+  it('P0-15: OutBlock4(원화요약) 없음 → ok=false(원화현금 판정 불가 → 차단)', async () => {
+    stubFetch(() => ({ json: depBody({ noOb4: true }) }));
     const r = await getLSUSDeposit(cfg, 'T');
     expect(r.ok).toBe(false);
   });
   it('P0-14: 기타 코드(성공목록 아님) → lsPost throw → failure', async () => {
-    stubFetch(() => ({ json: { rsp_cd: 'IZAA999', rsp_msg: '오류', COSOQ02701OutBlock2: [{ CrcyCode: 'USD', PrsmptFcurrDps1: '100' }] } }));
+    stubFetch(() => ({ json: depBody({ rspCd: 'IZAA999' }) }));
     await expect(getLSUSDeposit(cfg, 'T')).rejects.toThrow();
+  });
+
+  // ── P0-15: cash-only 결제 판정(decideUSCashPayment / usCashOnlyUsdCap) ──
+  function dep(over: Partial<LSUSDeposit> = {}): LSUSDeposit {
+    return {
+      ok: true, rspCd: '00136', rspMsg: '', found: true, diag: {} as any,
+      usdCash: 0, usdOrderable: 0, usdPrexchOrderable: 9245.88, baseXchRate: 1434.6,
+      krwCash: 13927349, krwWithdrawable: 13927349, krwPrexchable: 13927349, overseasMargin: 0,
+      usdDeposit: 0, ...over,
+    };
+  }
+  it('P0-15 결제판정: USD현금이 충분 → paymentMode=USD, orderAllowed=true', () => {
+    const d = decideUSCashPayment(dep({ usdCash: 500, usdDeposit: 500 }), 200, 1);
+    expect(d.paymentMode).toBe('USD');
+    expect(d.orderAllowed).toBe(true);
+  });
+  it('P0-15 결제판정: USD현금=0 이지만 원화현금 선환전 충분 → paymentMode=KRW, orderAllowed=true', () => {
+    const d = decideUSCashPayment(dep({ usdCash: 0 }), 200, 1);   // 필요 200USD, 선환전가능 9245.88, 원화 1392만
+    expect(d.paymentMode).toBe('KRW');
+    expect(d.orderAllowed).toBe(true);
+    expect(d.estimatedKrw).toBeCloseTo(200 * 1434.6);
+  });
+  it('P0-15 결제판정: OvrsMgn>0(미수/증거금 사용) → 즉시 차단(MARGIN_PRESENT)', () => {
+    const d = decideUSCashPayment(dep({ usdCash: 0, overseasMargin: 100000 }), 200, 1);
+    expect(d.orderAllowed).toBe(false);
+    expect(d.reason).toBe('MARGIN_PRESENT');
+    expect(usCashOnlyUsdCap(dep({ usdCash: 0, overseasMargin: 100000 }))).toBe(0);
+  });
+  it('P0-15 결제판정: 원화현금 부족(예상결제 > 원화현금) → 차단(KRW_CASH_INSUFFICIENT)', () => {
+    // 필요 200USD, 원화현금 10000원(=선환전 매우 작음) → 부족
+    const d = decideUSCashPayment(dep({ usdCash: 0, krwCash: 10000, krwPrexchable: 10000, usdPrexchOrderable: 7 }), 200, 1);
+    expect(d.orderAllowed).toBe(false);
+    expect(d.reason).toBe('KRW_CASH_INSUFFICIENT');
+  });
+  it('P0-15 결제판정: 응답 실패(ok=false) → 차단(INVALID_RESPONSE)', () => {
+    const d = decideUSCashPayment(dep({ ok: false }), 200, 1);
+    expect(d.orderAllowed).toBe(false);
+    expect(d.reason).toBe('INVALID_RESPONSE');
+  });
+  it('P0-15 cash-only 상한: 원화현금은 실제 예수금(min WonDps/WonPrexch) 초과 불가(레버리지 캡)', () => {
+    // WonPrexchAbleAmt(선환전가능)가 실제 예수금보다 큼 → 레버리지 의심 → 실제 예수금으로 캡
+    const cap = usCashOnlyUsdCap(dep({ usdCash: 0, krwCash: 1434600, krwPrexchable: 99999999, usdPrexchOrderable: 99999 }));
+    expect(cap).toBeCloseTo(1434600 / 1434.6, 1);   // = min(krwCash, krwPrexch)/rate = 1000 USD 근사
   });
 
   it('cancelLSUSOrder — 공식 취소 필드 미확인 → 예외(추측 금지)', async () => {

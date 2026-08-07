@@ -165,14 +165,36 @@ AAPL 1종목에 대해 `g3203 / g3202 / g3103 / g3204` 를 각 1회 호출해
 **구현된 주문 기능(공식 필드 확인분, 단위테스트 완료):**
 - 지정가 매수 `COSAT00301`(OrdPtnCode=02 매수, OrdprcPtnCode=00 지정가)
 - 체결/미체결 조회 `COSAQ00102`(OrdNo/ExecQty/UnercQty)
-- USD 예수금 조회 `COSOQ02701`(주문가능 판정)
+- 해외 예수금/주문가능 조회 `COSOQ02701`(cash-only 결제 판정 — 공식 필드 확인분: OutBlock3 USD `FcurrDps`(USD현금)·`PrexchOrdAbleAmt`(선환전 주문가능)·`BaseXchrat`(기준환율), OutBlock4 `WonDpsBalAmt`(원화현금)·`WonPrexchAbleAmt`(원화 선환전)·`OvrsMgn`(해외증거금))
 - 주문상태 영구저장 `order-store`(하루 매수1/매도1 한도, 동일봉 중복방지, 미체결 추적, **재시작 중복주문 방지**)
 - 오케스트레이션 `trader`(전송→기록→체결확인→미체결취소, 방어적 재검증)
 
 **미확인(공식 필드 확보 후 구현 예정 — 그전까지 LIVE 차단):**
 - 미체결 취소/정정 `COSAT00311` (카탈로그에 요청 필드 없음)
 - 매도상환 `COSMT00300` (카탈로그에 요청 필드 없음)
-- 예수금 `PrsmptFcurrDps1` 를 주문가능액으로 사용 — 실주문 전 사용자 검증 권장.
+
+### P0-15 — 해외주식 cash-only 결제(USD 현금 OR 원화현금 선환전) 판정 근거
+
+실계정 `COSOQ02701` 이 `rsp_cd=00136`·USD `FcurrDps=0.00`(USD 현금 0)을 반환했으나, 해당 계좌는
+**원화현금 선환전(원화주문)** 으로 미국주식 주문이 가능하다. **오늘 국내장 실제 미수 사고**가 있었으므로
+`USD=0` 을 이유로 안전장치를 우회하거나 **신용/미수/대출/증거금(레버리지)** 을 절대 사용하지 않는다.
+공식 카탈로그 `COSOQ02701` resExample 로 아래 필드를 확인해 두 경로로 판정한다(추측 없음):
+
+| 블록 | 필드 | 의미 | 용도 |
+|---|---|---|---|
+| OutBlock3(USD) | `FcurrDps` | 외화예수금(순수 USD 현금) | USD 결제 경로 |
+| OutBlock3(USD) | `PrexchOrdAbleAmt` | 선환전 주문가능(USD, LS가 환haircut 반영) | 원화결제 경로 상한(USD) |
+| OutBlock3(USD) | `BaseXchrat` | 기준환율(USD→KRW) | 원화환산 |
+| OutBlock4 | `WonDpsBalAmt` | 원화예수금잔고(실제 KRW 현금) | 원화결제 경로 현금근거 |
+| OutBlock4 | `MnyoutAbleAmt` | 출금가능금액(전액출금=순수현금 근거) | — |
+| OutBlock4 | `WonPrexchAbleAmt` | 원화 선환전 가능(KRW) | 원화결제 경로 현금 |
+| OutBlock4 | `OvrsMgn` | 해외증거금(미수/레버리지) | **>0 이면 즉시 차단** |
+
+판정(`decideUSCashPayment`): ① `OvrsMgn>0` → 차단 ② USD현금 ≥ 필요USD → **USD 결제**
+③ 아니면 공식 선환전가능(USD) ≥ 필요USD **그리고** `min(WonDpsBalAmt, WonPrexchAbleAmt)` ≥ 필요USD×환율
+→ **원화현금 선환전 결제**, 아니면 `KRW_CASH_INSUFFICIENT` 차단. 원화현금은 실제 예수금을 초과할 수
+없도록 `min` 으로 캡해 레버리지 유입을 차단한다. 진단 로그 `[STARTUP-US-CASH]`/`[BUY-US-CASH]`:
+`USD cashOrderable / KRW cashOrderable / 선환전USD / 기준환율 / 미수(OvrsMgn) / estimated 1share / paymentMode / orderAllowed`.
 
 ### COSAT00311(미체결 취소) 공식 필드 확인 결과 — 근거
 
@@ -235,8 +257,10 @@ READY · 미체결 시 신규 금지 · 동일봉 중복 금지 · 주문번호 
 
 - **`US_ORDER_POST_IDEMPOTENT`** — `COSAT00301` 전송 **직전**(응답 해석 전) candle lock 을 영구 저장+flush.
   같은 확정봉 BUY 신호가 3번 반복돼도 **실제 POST 는 1회**. HTTP/timeout/500/parse/rsp_cd 오류 뒤에도 **재POST 0회**.
-- **`US_CASH_ONLY_GATE`** — 주문 직전 현금(USD 예수금 `COSOQ02701`) 재조회. `price*qty > 현금가능`이면
-  `COSAT00301` **미호출**. 신용/미수/증거금 레버리지는 사용하지 않습니다.
+- **`US_CASH_ONLY_GATE`** — 주문 직전 예수금(`COSOQ02701`) 재조회. **두 경로**로 현금결제 판정
+  (`decideUSCashPayment`): ① USD 현금(`FcurrDps`) 충분 → USD 결제 ② USD=0 이면 **원화현금 선환전**
+  (`PrexchOrdAbleAmt`/`WonPrexchAbleAmt`, 실제 예수금 min 캡). `orderAllowed=false`이면 `COSAT00301`
+  **미호출**. **`OvrsMgn`(해외증거금)>0 이면 즉시 차단** — 신용/미수/대출/증거금 레버리지 절대 미사용. (P0-15)
 - **`US_PENDING_REORDER_BLOCKED`** — pending 주문이 하나라도 있으면 신규 BUY 금지.
 - **`US_RESTART_RECONCILIATION`** — 주문 전 `COSAQ00102` 로 당일 실제 매수주문과 로컬 OrderStore 를
   대사. 조회 실패 또는 로컬 미기록 주문 감지 시 신규 BUY 금지(재시작 후에도).
