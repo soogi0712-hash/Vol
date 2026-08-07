@@ -350,9 +350,9 @@ async function main() {
     const isBuySignal = sig.action === 'BUY' && ctx.builder.confirmedCount >= MIN_RT_CANDLES;
     if (isBuySignal) {
       await refreshDeposit(true);          // BUY 직전 강제 재조회(P0-17 #4,#6 / P0-18 #9 재검증)
-      // 통합증거금(타통화+원화) 경로: 실측대조·cash-only 재확인. 채택필드+코드상수 확정 전까지 하드차단.
+      // 통합증거금(타통화+원화, 채택=WonCashMin) 경로: BUY 직전 재조회로 cash-only·가능수량 재확인(P0-20).
       const crossWon = depFull ? evaluateCrossWon(depFull, buyPrice, liveCfg.htsOrderableQty) : null;
-      // 확정경로(USD현금) 또는 확정된 통합증거금 경로 중 하나라도 허용이면 통과(현재 둘 다 하드차단).
+      // 확정경로(USD현금) 또는 통합증거금 경로(qty>=1 && cashOnly) 중 하나라도 허용이면 통과.
       orderableQtyOk = usOrderAllowed(buyPrice).allowed || !!(crossWon && crossWon.orderAllowed);
       logUSCashDiag('BUY-US-CASH', buyPrice);              // BUY 직전 상세 진단(P0-16)
       logCrossWon('BUY-CROSS-WON', buyPrice);              // BUY 직전 통합증거금 실측대조(P0-18)

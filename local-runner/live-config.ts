@@ -2,7 +2,7 @@
 //   대상 1종목(NASDAQ:AAPL), 최대 1주, 지정가만, 하루 매수/매도 각 1회.
 // ⚠️ 자동취소 REST(COSAT00311)는 공식 필드 미확인 → AUTO_CANCEL_MODE 불가.
 //    대신 MANUAL_CANCEL_MODE(수동취소)로 운영: 미체결 시 사용자 수동취소 요구, AS3 수신 시에만 다음 BUY.
-import { toLSOverseasExchcd, LS_CANCEL_TR_CONFIRMED, LS_US_CROSS_WON_TR_CONFIRMED } from '../src/lib/ls-api';
+import { toLSOverseasExchcd, LS_CANCEL_TR_CONFIRMED, LS_US_CROSS_WON_TR_CONFIRMED, CROSS_WON_ADOPTED_FIELD } from '../src/lib/ls-api';
 
 export interface LiveConfig {
   liveSymbol: string;          // 'AAPL'
@@ -50,8 +50,9 @@ export function loadLiveConfig(): LiveConfig {
     pendingTimeoutSec: intEnv('LS_US_PENDING_TIMEOUT_SEC', 60, 5, 600),
     // HTS 관찰값(참고용) — 설정 시 프로그램 계산값과 불일치하면 차단(안전방향). 허용의 근거로는 쓰지 않는다.
     htsOrderableQty: (() => { const v = process.env.LS_US_HTS_ORDERABLE_QTY; if (v == null || v.trim() === '') return null; const n = parseInt(v, 10); return Number.isFinite(n) ? Math.max(0, n) : null; })(),
-    // 타통화+원화 경로 실측확인 — env 요청 AND 코드상수(공식 필드 확인). 코드상수 false → 항상 false → 해당 경로 LIVE 하드차단.
-    crossWonVerified: process.env.LS_US_CROSS_WON_VERIFIED === 'true' && LS_US_CROSS_WON_TR_CONFIRMED,
+    // 타통화+원화 경로 실측확인(P0-20 완료) — 코드상수(공식 필드 확정) AND 채택필드 지정 시 true.
+    //   안전 kill-switch: env LS_US_CROSS_WON_VERIFIED='false' 로 강제 비활성 가능.
+    crossWonVerified: LS_US_CROSS_WON_TR_CONFIRMED && CROSS_WON_ADOPTED_FIELD != null && process.env.LS_US_CROSS_WON_VERIFIED !== 'false',
   };
 }
 

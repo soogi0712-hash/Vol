@@ -277,8 +277,22 @@ HTS 실제 "타통화+원화 가능수량" = **2주**. 후보 계산 결과:
 **WonDpsBalAmt vs MnyoutAbleAmt(둘 다 2)**: 어느 필드가 "실제 현금 주문가능" 공식 기준인지 확정 전까지
 **임의 채택 금지**. 안전 우선 합성 후보 `WonCashMin=min(WonDpsBalAmt,MnyoutAbleAmt)` 를 함께 계산해
 초과주문을 원천 방지한다(실계정에선 둘이 같아 2). `OvrsMgn=0`·`LoanAmt=0`·`FcurrPldgAmt=0` cash-only 유지.
-실계정 로그로 `HTS=2 / PROGRAM=2 / MATCH=true / cashOnly=true` 확인 시 그때 `CROSS_WON_ADOPTED_FIELD` 확정 +
-`LS_US_CROSS_WON_TR_CONFIRMED=true` 전환(BUY 직전 동일 재검증).
+
+### P0-20 — 실측 검증 완료 → WonCashMin 채택·통합증거금 경로 활성
+
+실계정 로그로 `HTS=2 / PROGRAM(WonDpsBalAmt·MnyoutAbleAmt·WonCashMin)=2 / MATCH=true / cashOnly=true`
+확인 완료. 안전 우선으로 **`CROSS_WON_ADOPTED_FIELD='WonCashMin'`**(=min(WonDpsBalAmt,MnyoutAbleAmt)) 확정,
+**`LS_US_CROSS_WON_TR_CONFIRMED=true`** 코드상수 전환, **`US_CROSS_WON_VERIFIED=true`** (kill-switch:
+`LS_US_CROSS_WON_VERIFIED=false` 로 강제 비활성 가능).
+
+- **주문가능 판정**(`evaluateCrossWon`): 확정 후엔 `programQty = floor(WonCashMin ÷ (bestAsk×BaseXchrat)) ≥ 1`
+  **그리고** cashOnly=true 이면 `orderAllowed=true`. HTS 값(`LS_US_HTS_ORDERABLE_QTY`)이 주어지면 불일치 시 차단.
+  `OvrsMgn`/`LoanAmt`/`FcurrPldgAmt` 중 하나라도 >0 → `NOT_CASH_ONLY` 차단. 가능수량 0 → `CROSS_WON_INSUFFICIENT`.
+- **trader 현금게이트**: USD 명목 게이트가 KRW 통합증거금 결제능력을 과소평가하지 않도록 `usCashOnlyUsdCap` 이
+  채택필드(WonCashMin)의 USD 환산치(`WonCashMin÷BaseXchrat`)를 포함(verified 시). cash-only 아니면 0.
+- **BUY 직전 재검증**(#9): `COSOQ02701` 재조회 + 최신 `bestAsk` + `programQty` 재계산 + HTS 검증(제공 시) +
+  `qty>=1` + `cashOnly=true` 일 때만 AAPL qty=1 POST 허용. 추가매수 없음 / 하루 BUY 1회 / 미체결 수동취소.
+- 실제 POST 는 여전히 `LS_LIVE_TRADING=true`(사용자 런타임 스위치) 필요. 신용/미수/대출/증거금 절대 미사용.
 
 ### COSAT00311(미체결 취소) 공식 필드 확인 결과 — 근거
 
@@ -341,11 +355,10 @@ READY · 미체결 시 신규 금지 · 동일봉 중복 금지 · 주문번호 
 
 - **`US_ORDER_POST_IDEMPOTENT`** — `COSAT00301` 전송 **직전**(응답 해석 전) candle lock 을 영구 저장+flush.
   같은 확정봉 BUY 신호가 3번 반복돼도 **실제 POST 는 1회**. HTTP/timeout/500/parse/rsp_cd 오류 뒤에도 **재POST 0회**.
-- **`US_CASH_ONLY_GATE`** — 주문 직전 예수금(`COSOQ02701`) 재조회. **확정 경로(거래국가 통화=USD현금)만**
-  주문 허용: 가능수량=`FcurrOrdAbleAmt÷주문가`. 타통화+원화(통합증거금/선환전) 경로는 공식 필드 실측확인
-  전까지 **하드차단**(코드상수 `LS_US_CROSS_WON_TR_CONFIRMED=false`) → 실계정 USD현금=0 이면 `LS_LIVE_TRADING=true`
-  여도 US BUY 원천 차단. **`OvrsMgn`(해외증거금)>0 이면 즉시 차단** — 신용/미수/대출/증거금 레버리지 절대
-  미사용. HTS 관찰값(`LS_US_HTS_ORDERABLE_QTY`)은 참고용(불일치 시 차단만). (P0-15/16)
+- **`US_CASH_ONLY_GATE`** — 주문 직전 예수금(`COSOQ02701`) 재조회. 두 경로: ① 거래국가 통화(USD현금)
+  `FcurrOrdAbleAmt÷주문가` ② **통합증거금(타통화+원화)** 채택필드 `WonCashMin÷(주문가×환율)`(P0-20 실측 확정).
+  **`OvrsMgn`/`LoanAmt`/`FcurrPldgAmt` 중 하나라도 >0 이면 차단** — 신용/미수/대출/증거금 절대 미사용(현금 범위만).
+  HTS 관찰값(`LS_US_HTS_ORDERABLE_QTY`) 제공 시 불일치면 차단. 가능수량 0 → 차단. (P0-15/16/18/19/20)
 - **`US_PENDING_REORDER_BLOCKED`** — pending 주문이 하나라도 있으면 신규 BUY 금지.
 - **`US_RESTART_RECONCILIATION`** — 주문 전 `COSAQ00102` 로 당일 실제 매수주문과 로컬 OrderStore 를
   대사. 조회 실패 또는 로컬 미기록 주문 감지 시 신규 BUY 금지(재시작 후에도).

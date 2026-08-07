@@ -687,9 +687,12 @@ export async function getLSUSDeposit(cfg: LSConfig, token: string): Promise<LSUS
 //     HTS 버튼을 실제로 눌렀을 때 어떤 필드/팝업이 수량을 결정하는지 사용자 실측 확인 전까지 이 경로는 신뢰하지 않는다.
 //   · OvrsMgn==0 은 '현재 미수 잔액 없음' 을 뜻할 수 있어도, PrexchOrdAbleAmt 가 전체 통합증거금 주문가능액이라는
 //     근거가 되지 못한다(별개 사실). 따라서 코드상수로 봉인한다.
-// LS_US_CROSS_WON_TR_CONFIRMED=false 인 동안: 타통화+원화(선환전/통합증거금) 경로로는 절대 LIVE 허용 불가.
-//   → USD 현금(FcurrOrdAbleAmt) 이 필요수량을 덮는 경우에만 결제 가능. 실계정 USD현금=0 이므로 사실상 US BUY 하드차단.
-export const LS_US_CROSS_WON_TR_CONFIRMED = false;   // 사용자 실측으로 공식 필드 확인 시 true 로 전환
+// ── P0-20: 실계정 실측 검증 완료 → 통합증거금(타통화+원화) 경로 확정 ──
+// HTS "타통화+원화 가능수량"=2 와 프로그램 WonDpsBalAmt/MnyoutAbleAmt/WonCashMin qty=2 정확 일치 확인.
+// cashOnly=true(OvrsMgn=0/LoanAmt=0/FcurrPldgAmt=0). 안전 우선으로 WonCashMin=min(WonDpsBalAmt,MnyoutAbleAmt) 채택.
+//   → LS_US_CROSS_WON_TR_CONFIRMED=true 전환. CROSS_WON_ADOPTED_FIELD='WonCashMin'(아래).
+// 통합증거금이라도 신용/미수/대출 금지·현금 범위만: OvrsMgn/LoanAmt/FcurrPldgAmt 중 하나라도 >0 이면 차단.
+export const LS_US_CROSS_WON_TR_CONFIRMED = true;   // 실측 검증 완료(P0-20)
 export type USPaymentMode = 'USD' | 'KRW' | 'NONE';
 export interface USCashDecision {
   paymentMode: USPaymentMode; orderAllowed: boolean; reason: string;
@@ -700,11 +703,12 @@ export interface USCashDecision {
   crossWonVerified: boolean;   // 타통화+원화 경로 실측확인 여부(=env AND 코드상수). false 면 해당 경로 LIVE 차단.
 }
 // 계좌가 순수현금으로 결제 가능한 최대 USD 명목금액. OvrsMgn>0 → 0.
-// 기본: USD 현금(FcurrOrdAbleAmt)만. 타통화+원화 선환전은 실측확인(crossWonVerified)된 경우에만 포함.
+// 기본: USD 현금(FcurrOrdAbleAmt)만. 타통화+원화(채택필드) 는 실측확인(crossWonVerified)된 경우에만 USD환산 포함.
+//   trader 의 USD 명목 현금게이트가 통합증거금(KRW) 결제 능력을 과소평가해 정상주문을 막지 않도록 채택필드 USD환산치를 합산.
 export function usCashOnlyUsdCap(dep: LSUSDeposit, opts: { crossWonVerified?: boolean } = {}): number {
   if (!dep.ok || dep.overseasMargin > 0) return 0;   // 미수/증거금 사용 계좌 → cash-only 불가
   const verified = !!opts.crossWonVerified && LS_US_CROSS_WON_TR_CONFIRMED;
-  return verified ? Math.max(dep.usdOrderable, dep.usdPrexchOrderable) : dep.usdOrderable;
+  return verified ? Math.max(dep.usdOrderable, crossWonAdoptedUsdCap(dep)) : dep.usdOrderable;
 }
 // 진단표시용 주문가능수량(거래국가/타통화+원화). qtyCrossWon 은 참고용일 뿐 LIVE 판정 근거가 아니다.
 export function usOrderableQty(dep: LSUSDeposit, priceUsd: number): { qtyCountry: number; qtyCrossWon: number } {
@@ -743,10 +747,9 @@ export function formatCashOrderableLine(s: { ok: boolean; cash: number; rspCd: s
     : `cashOrderable=조회실패 rsp_cd=${s.rspCd} rsp_msg=${s.rspMsg}`;
 }
 
-// ── 통합증거금(타통화+원화) 주문가능수량 실측대조 엔진 (P0-18) ──
-// 목표: HTS 에서 실제 "타통화+원화 가능수량" 버튼으로 표시되는 수량과, 같은 시각·같은 주문가(bestAsk)로
-//       각 후보 필드에서 계산한 프로그램 수량을 대조하여, "정확히 일치하는" 공식 필드/조합만 채택한다(추측 금지).
-// 채택 전까지 CROSS_WON_ADOPTED_FIELD=null → programQty 판정 불가 → LIVE 하드차단 유지.
+// ── 통합증거금(타통화+원화) 주문가능수량 실측대조 엔진 (P0-18/19/20) ──
+// P0-20 실측 검증 완료: HTS "타통화+원화 가능수량"=2 ↔ WonDpsBalAmt/MnyoutAbleAmt/WonCashMin qty=2 정확 일치.
+//   안전 우선 WonCashMin=min(WonDpsBalAmt,MnyoutAbleAmt) 채택(초과주문 방지). cashOnly=true 확인.
 // cash-only 원칙: 신용/미수/대출/증거금(담보) 잔액이 하나라도 >0 이면 cashOnly=false → 주문 금지.
 export type CrossWonFieldKey =
   | 'FcurrOrdAbleAmt' | 'PrexchOrdAbleAmt' | 'FcurrOrdAmt' | 'FcurrMxchgAbleAmt' | 'T4FcurrDps'
@@ -768,8 +771,32 @@ export interface CrossWonEval {
   orderAllowed: boolean;
   reason: string;
 }
-// ⚠️ 실측으로 HTS 수량과 일치하는 필드가 확정되기 전까지 null(채택 없음) 유지 — 추측 금지.
-export const CROSS_WON_ADOPTED_FIELD: CrossWonFieldKey | null = null;
+// P0-20: 실측 검증 완료 → 안전 우선 WonCashMin(=min(WonDpsBalAmt,MnyoutAbleAmt)) 채택.
+export const CROSS_WON_ADOPTED_FIELD: CrossWonFieldKey | null = 'WonCashMin';
+
+// 채택 필드의 금액(원자료)과 통화기준. usCashOnlyUsdCap 이 trader USD 명목게이트용으로 USD 환산에 사용.
+export function crossWonAdoptedAmount(dep: LSUSDeposit): { amount: number; basis: 'USD' | 'KRW' } | null {
+  switch (CROSS_WON_ADOPTED_FIELD) {
+    case 'FcurrOrdAbleAmt': return { amount: dep.usdOrderable, basis: 'USD' };
+    case 'PrexchOrdAbleAmt': return { amount: dep.usdPrexchOrderable, basis: 'USD' };
+    case 'FcurrOrdAmt': return { amount: dep.fcurrOrdAmt, basis: 'USD' };
+    case 'FcurrMxchgAbleAmt': return { amount: dep.fcurrMxchgAbleAmt, basis: 'USD' };
+    case 'T4FcurrDps': return { amount: dep.t4FcurrDps, basis: 'USD' };
+    case 'WonPrexchAbleAmt': return { amount: dep.krwPrexchable, basis: 'KRW' };
+    case 'WonDpsBalAmt': return { amount: dep.krwCash, basis: 'KRW' };
+    case 'MnyoutAbleAmt': return { amount: dep.krwWithdrawable, basis: 'KRW' };
+    case 'WonCashMin': return { amount: Math.min(dep.krwCash, dep.krwWithdrawable), basis: 'KRW' };
+    default: return null;
+  }
+}
+// 채택 통합증거금 경로의 cash-only USD 환산 상한. 확정(코드상수)·cashOnly 아니면 0.
+export function crossWonAdoptedUsdCap(dep: LSUSDeposit): number {
+  if (!dep.ok || dep.overseasMargin > 0 || dep.loanAmt > 0 || dep.fcurrPldgAmt > 0) return 0;   // cash-only 아니면 0
+  if (!LS_US_CROSS_WON_TR_CONFIRMED || CROSS_WON_ADOPTED_FIELD == null) return 0;
+  const a = crossWonAdoptedAmount(dep);
+  if (!a) return 0;
+  return a.basis === 'USD' ? a.amount : (dep.baseXchRate > 0 ? a.amount / dep.baseXchRate : 0);
+}
 
 export function evaluateCrossWon(dep: LSUSDeposit, bestAsk: number, htsQty: number | null): CrossWonEval {
   const rate = dep.baseXchRate;
@@ -806,15 +833,15 @@ export function evaluateCrossWon(dep: LSUSDeposit, bestAsk: number, htsQty: numb
   const match = (htsQty != null && adopted != null) ? programQty === htsQty : null;
   const crossWonConfirmed = LS_US_CROSS_WON_TR_CONFIRMED;
 
+  // P0-20 게이트: 확정(코드상수)+채택필드 이후에는 HTS 값 제공 시에만 불일치 차단(BUY 게이트는 qty>=1 && cashOnly).
   let reason = 'OK';
   if (!dep.ok) reason = 'INVALID_RESPONSE';
   else if (!(bestAsk > 0)) reason = 'PRICE_UNAVAILABLE';
   else if (!crossWonConfirmed) reason = 'CROSS_WON_UNCONFIRMED';   // 코드상수 미확정 → 하드차단
   else if (adopted == null) reason = 'NO_ADOPTED_FIELD';
-  else if (htsQty == null) reason = 'HTS_QTY_MISSING';
-  else if (match !== true) reason = 'HTS_QTY_MISMATCH';
-  else if (!cashOnly) reason = 'NOT_CASH_ONLY';
-  else if (programQty < 1) reason = 'CROSS_WON_INSUFFICIENT';
+  else if (htsQty != null && programQty !== htsQty) reason = 'HTS_QTY_MISMATCH';   // 제공된 경우에만 불일치 차단
+  else if (!cashOnly) reason = 'NOT_CASH_ONLY';                    // 신용/미수/대출/담보 잔액 있으면 차단
+  else if (programQty < 1) reason = 'CROSS_WON_INSUFFICIENT';      // 가능수량 0 → 차단
   const orderAllowed = reason === 'OK';
 
   return {

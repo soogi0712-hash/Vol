@@ -583,12 +583,12 @@ describe('해외 주문/체결/예수금 (공식 필드)', () => {
     expect(d.orderAllowed).toBe(false);
     expect(d.reason).toBe('CROSS_WON_UNVERIFIED');
   });
-  it('P0-16: opts.crossWonVerified=true 여도 코드상수 봉인(LS_US_CROSS_WON_TR_CONFIRMED=false) → 여전히 차단', () => {
-    expect(LS_US_CROSS_WON_TR_CONFIRMED).toBe(false);
+  it('P0-20: 코드상수 확정(LS_US_CROSS_WON_TR_CONFIRMED=true) → crossWonVerified 경로 활성', () => {
+    expect(LS_US_CROSS_WON_TR_CONFIRMED).toBe(true);
     const d = decideUSCashPayment(dep({ usdOrderable: 0, usdPrexchOrderable: 9245.88 }), 200, 1, { crossWonVerified: true });
-    expect(d.crossWonVerified).toBe(false);   // 코드상수 AND 결과 → false
-    expect(d.orderAllowed).toBe(false);
-    expect(d.reason).toBe('CROSS_WON_UNVERIFIED');
+    expect(d.crossWonVerified).toBe(true);    // 코드상수 확정 → 경로 활성
+    expect(d.orderAllowed).toBe(true);        // qtyCrossWon=46 ≥ 1
+    expect(d.reason).toBe('CROSS_WON_PREXCH_VERIFIED');
   });
   it('P0-16: 거래국가 통화(USD현금)로 충분 → paymentMode=USD (확정 경로만 허용)', () => {
     const d = decideUSCashPayment(dep({ usdOrderable: 700, usdCash: 700 }), 311, 1);
@@ -610,11 +610,15 @@ describe('해외 주문/체결/예수금 (공식 필드)', () => {
     expect(d.orderAllowed).toBe(false);
     expect(d.reason).toBe('INVALID_RESPONSE');
   });
-  it('P0-16 cash-only 상한: 기본은 거래국가통화(USD현금)만, 타통화+원화는 제외(봉인)', () => {
-    // 선환전 참고값이 커도 미확인이므로 상한에 포함하지 않는다(=USD현금 FcurrOrdAbleAmt).
+  it('P0-20 cash-only 상한: 기본은 거래국가통화(USD현금)만, verified 면 채택필드(WonCashMin) USD환산 포함', () => {
+    // 기본(opts 없음): USD현금(FcurrOrdAbleAmt)만
     expect(usCashOnlyUsdCap(dep({ usdOrderable: 100, usdPrexchOrderable: 9245.88 }))).toBeCloseTo(100);
-    expect(usCashOnlyUsdCap(dep({ usdOrderable: 100, usdPrexchOrderable: 9245.88 }), { crossWonVerified: true })).toBeCloseTo(100);  // 코드상수 봉인
-    expect(usCashOnlyUsdCap(dep({ usdOrderable: 0, usdPrexchOrderable: 9245.88 }))).toBe(0);   // 실계정: USD현금 0 → 상한 0
+    // verified: max(USD현금, 채택 WonCashMin/환율). krwCash=krwWithdrawable=13927349 / 1434.6 = 9708
+    expect(usCashOnlyUsdCap(dep({ usdOrderable: 100 }), { crossWonVerified: true })).toBeCloseTo(13927349 / 1434.6, 0);
+    // 실계정: USD현금 0 이어도 verified 면 원화현금(WonCashMin) 환산치 반영 → trader 게이트 통과 가능
+    expect(usCashOnlyUsdCap(dep({ usdOrderable: 0, krwCash: 1000742, krwWithdrawable: 1000742, baseXchRate: 1418.8 }), { crossWonVerified: true })).toBeCloseTo(1000742 / 1418.8, 0);
+    // cashOnly 아님(미수>0) → 0
+    expect(usCashOnlyUsdCap(dep({ overseasMargin: 5000 }), { crossWonVerified: true })).toBe(0);
   });
 
   // ── P0-18: 통합증거금(타통화+원화) 실측대조 엔진 ──
@@ -625,9 +629,9 @@ describe('해외 주문/체결/예수금 (공식 필드)', () => {
     expect(m.COSOQ02701OutBlock1.RecCnt).toBe(1);
     expect(m.COSOQ02701OutBlock3[0].PrexchOrdAbleAmt).toBe('97.29');
   });
-  it('P0-18 채택필드 없음(null) → 실측 전 하드차단 유지', () => {
-    expect(CROSS_WON_ADOPTED_FIELD).toBeNull();
-    expect(LS_US_CROSS_WON_TR_CONFIRMED).toBe(false);
+  it('P0-20 채택필드 확정 = WonCashMin, 코드상수 확정 = true', () => {
+    expect(CROSS_WON_ADOPTED_FIELD).toBe('WonCashMin');
+    expect(LS_US_CROSS_WON_TR_CONFIRMED).toBe(true);
   });
   it('P0-18 후보 수량: 같은 bestAsk 로 각 필드 수량 산출(USD/KRW 기준) + HTS 일치 표시', () => {
     // 실계정: PrexchOrdAbleAmt=97.29, bestAsk=311 → 선환전 qty=0. 원화선환전 1392만/(311*1434.6)=31.
@@ -640,11 +644,13 @@ describe('해외 주문/체결/예수금 (공식 필드)', () => {
     expect(byKey['PrexchOrdAbleAmt'].match).toBe(true);
     expect(e.matchedKeys).toContain('PrexchOrdAbleAmt');
   });
-  it('P0-18 실계정 재현: 채택필드 없음 → orderAllowed=false (CROSS_WON_UNCONFIRMED)', () => {
+  it('P0-20 채택 확정 후: HTS 값 제공 시 프로그램과 불일치면 차단(HTS_QTY_MISMATCH)', () => {
+    // 채택=WonCashMin, dep 기본 원화현금 1392만 → qty=31. HTS=0 제공 → 불일치 차단.
     const e = evaluateCrossWon(dep({ usdPrexchOrderable: 97.29 }), 311, 0);
+    expect(e.adoptedField).toBe('WonCashMin');
+    expect(e.programQty).toBe(Math.floor(13927349 / (311 * 1434.6)));   // 31
     expect(e.orderAllowed).toBe(false);
-    expect(e.reason).toBe('CROSS_WON_UNCONFIRMED');   // 코드상수 미확정이 최우선 차단
-    expect(e.programQty).toBe(0);                      // 미채택 → 0
+    expect(e.reason).toBe('HTS_QTY_MISMATCH');
   });
   it('P0-18 cash-only: 미수/대출/담보 잔액 있으면 cashOnly=false + 차단필드 보고', () => {
     const e = evaluateCrossWon(dep({ overseasMargin: 5000, loanAmt: 100, fcurrPldgAmt: 3.5 }), 311, 2);
@@ -656,16 +662,15 @@ describe('해외 주문/체결/예수금 (공식 필드)', () => {
     expect(e.cashOnly).toBe(true);
     expect(e.cashOnlyBlockers).toEqual([]);
   });
-  it('P0-18 [CROSS-WON-CHECK] 로그 형식(요구 필드 포함)', () => {
-    const e = evaluateCrossWon(dep({ usdPrexchOrderable: 97.29 }), 311, 0);
+  it('P0-20 [CROSS-WON-CHECK] 로그 형식(채택 확정 → PROGRAM 수량 표시)', () => {
+    const e = evaluateCrossWon(dep({ usdPrexchOrderable: 97.29 }), 311, null);
     const line = formatCrossWonCheck('AAPL', e);
     expect(line).toContain('[CROSS-WON-CHECK AAPL]');
     expect(line).toContain('bestAsk=311.00');
-    expect(line).toContain('HTS orderableQty=0');
-    expect(line).toContain('PROGRAM orderableQty=미채택');
+    expect(line).toContain('HTS orderableQty=미입력');
+    expect(line).toContain(`PROGRAM orderableQty=${Math.floor(13927349 / (311 * 1434.6))}`);   // 채택필드 수량
     expect(line).toContain('paymentMode=CROSS_WON');
     expect(line).toContain('cashOnly=true');
-    expect(line).toContain('orderAllowed=false');
   });
   it('P0-18 HTS 미입력 → match=N/A, 후보 match=null', () => {
     const e = evaluateCrossWon(dep(), 311, null);
@@ -695,12 +700,32 @@ describe('해외 주문/체결/예수금 (공식 필드)', () => {
     expect(e.matchedKeys).not.toContain('PrexchOrdAbleAmt');
     expect(e.matchedKeys).not.toContain('WonPrexchAbleAmt');
   });
-  it('P0-19 실계정: 채택필드 미확정 → orderAllowed=false, 하드차단 유지', () => {
+  it('P0-20 실계정: 채택 확정(WonCashMin) + HTS=2 일치 + cashOnly → orderAllowed=true', () => {
     const e = evaluateCrossWon(real(), 311.65, 2);
-    expect(e.adoptedField).toBeNull();
+    expect(e.adoptedField).toBe('WonCashMin');
+    expect(e.programQty).toBe(2);
+    expect(e.match).toBe(true);          // HTS=2 == PROGRAM=2
+    expect(e.cashOnly).toBe(true);       // OvrsMgn/Loan/Pldg 전부 0
+    expect(e.orderAllowed).toBe(true);
+    expect(e.reason).toBe('OK');
+  });
+  it('P0-20 실계정: HTS 미입력이어도 채택+cashOnly+qty>=1 이면 허용(BUY 게이트)', () => {
+    const e = evaluateCrossWon(real(), 311.65, null);   // HTS 값 없이
+    expect(e.programQty).toBe(2);
+    expect(e.orderAllowed).toBe(true);   // 확정 후엔 qty>=1 && cashOnly 로 허용
+    expect(e.reason).toBe('OK');
+  });
+  it('P0-20 차단: cashOnly=false(미수/대출/담보) → NOT_CASH_ONLY', () => {
+    const e = evaluateCrossWon(dep({ ...real(), overseasMargin: 1 } as any), 311.65, 2);
     expect(e.orderAllowed).toBe(false);
-    expect(e.reason).toBe('CROSS_WON_UNCONFIRMED');   // 코드상수·채택 확정 전
-    expect(e.cashOnly).toBe(true);                     // OvrsMgn/Loan/Pldg 전부 0
+    expect(e.reason).toBe('NOT_CASH_ONLY');
+  });
+  it('P0-20 차단: 가능수량 0(원화현금 부족) → CROSS_WON_INSUFFICIENT', () => {
+    // 원화현금 10만 → 1주비용 44만 → qty 0
+    const e = evaluateCrossWon(dep({ usdOrderable: 0, krwCash: 100000, krwWithdrawable: 100000, baseXchRate: 1418.8 }), 311.65, null);
+    expect(e.programQty).toBe(0);
+    expect(e.orderAllowed).toBe(false);
+    expect(e.reason).toBe('CROSS_WON_INSUFFICIENT');
   });
   it('P0-19 [CROSS-WON-LIVE-CAND] 형식(요구 필드 포함)', () => {
     const line = formatCrossWonLiveCand('AAPL', evaluateCrossWon(real(), 311.65, 2));
