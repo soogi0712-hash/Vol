@@ -430,9 +430,14 @@ async function main() {
   log.info(`[BOOT-STEP] 8 ws-connect (${usOk.length}종목)`);
   client.connect(usOk.map(s => ({ exchcd: s.exchcd, symbol: s.symbol })));
 
+  // P0-27a: COSAQ00102 "자료없음(정상 빈 조회)" rsp_cd 는 실계정 실측 확인분만 등록(추측 금지, fail-closed).
+  //   기본 없음 → unknown 업무코드는 BUSINESS_ERROR 로 차단. 실측([US-RECON-DIAG]) 후 이 env 에 콤마구분 추가.
+  const ordExecEmptyCodes = (process.env.LS_US_ORDEREXEC_EMPTY_CODES || '').split(',').map((s: string) => s.trim()).filter(Boolean);
+  if (ordExecEmptyCodes.length) log.info(`[US-RECON-CFG] COSAQ00102 실측확인 empty 코드=[${ordExecEmptyCodes.join(',')}] (SUCCESS/EMPTY 만 POST 허용)`);
+  else log.info('[US-RECON-CFG] COSAQ00102 empty 코드 미등록 → 00000(SUCCESS) 외 모든 non-00000 은 BUSINESS_ERROR 로 차단(fail-closed). 실측 후 LS_US_ORDEREXEC_EMPTY_CODES 에 추가.');
   const traderDeps: TraderDeps = {
     place: (pp) => placeLSUSBuyOrder(cfg, token, pp),
-    query: (pp) => queryLSUSOrderExec(cfg, token, pp),
+    query: (pp) => queryLSUSOrderExec(cfg, token, pp, { emptyCodes: ordExecEmptyCodes }),
     cancel: (pp) => cancelLSUSOrder(cfg, token, pp),
     // 현금 주문가능금액 — 확정 경로(USD현금)만. 타통화+원화 선환전은 실측확인 전까지 제외(cash-only, 레버리지 절대 미사용).
     cashOrderable: async () => {
@@ -442,6 +447,19 @@ async function main() {
     now: () => Date.now(),
     log: (m) => log.info(scrub(m)),
   };
+
+  // ── P0-27a req1: 시작 시 COSAQ00102 실계정 조회를 "주문 전송 없이" 1회 실행 → 오늘 주문 0건 상태의 실제 응답 계측 ──
+  //   실제 rsp_cd/rsp_msg/OutBlock 존재/rows 수/classification 을 [US-RECON-DIAG] 로 남긴다(추측 금지·실측 확보용).
+  //   LS_US_RECON_DIAG=false 로 끌 수 있음(기본 실행). ⚠️ 읽기전용 — 주문 함수 호출 안 함.
+  if (process.env.LS_US_RECON_DIAG !== 'false') {
+    const diagExchcd = liveCfg.liveExchcd || '82';
+    const diagOrdDate = etDateStr(Date.now());
+    try {
+      const q = await queryLSUSOrderExec(cfg, token, { exchcd: diagExchcd, symbol: liveCfg.liveSymbol, ordDate: diagOrdDate }, { emptyCodes: ordExecEmptyCodes });
+      log.info(`[US-RECON-DIAG ${liveCfg.liveSymbol}] rsp_cd=${q.rspCd} rsp_msg=${scrub(q.rspMsg)} queryOk=${q.queryOk} classification=${q.classification} hasEnvelope=${q.hasEnvelope} outBlock3=${q.hasEnvelope ? '존재' : '없음'} rawRows=${q.rows.length} httpStatus=${q.httpStatus ?? '-'}${q.kind ? ` kind=${q.kind}` : ''} ordDate=${diagOrdDate} exchcd=${diagExchcd} (주문 없음)`);
+      if (q.classification === 'BUSINESS_ERROR') log.warn(`[US-RECON-DIAG] ⚠️ 위 rsp_cd=${q.rspCd} 가 "정상 자료없음" 임이 LS 응답구조로 확인되면 LS_US_ORDEREXEC_EMPTY_CODES 에 추가해야 POST 허용됨(현재 fail-closed 차단). 확인 전 실거래 시 이 종목 BUY 는 RECONCILIATION_FAILED 로 차단.`);
+    } catch (e) { log.error(`[US-RECON-DIAG] 조회 예외(무시): ${scrub(String(e))}`); }
+  }
 
   // ── P0-26: 과거 확정봉 백필 — READY 풀 가속 ──────────────────────────────
   //   중앙 단일 REST 큐(동시 REST 금지) + rate limiter 로 g3203 개인 1req/s 절대 미초과.

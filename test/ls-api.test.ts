@@ -3,7 +3,7 @@ import {
   getLSAccessToken, getLSKRBalance, getLSUSBalance,
   getLSKRPrice, getLSUSPrice, getLSKR15Min, getLSUS15Min, getLSUS15MinPaged,
   getLSUSTicks, getLSUSTicksPaged, lsOverseasChartRaw,
-  placeLSUSBuyOrder, queryLSUSOrderExec, getLSUSDeposit, getLSUSHoldings, cancelLSUSOrder, LS_CANCEL_TR_CONFIRMED, isUSOrderSuccess,
+  placeLSUSBuyOrder, queryLSUSOrderExec, classifyOrderExec, getLSUSDeposit, getLSUSHoldings, cancelLSUSOrder, LS_CANCEL_TR_CONFIRMED, isUSOrderSuccess,
   decideUSCashPayment, usCashOnlyUsdCap, usOrderableQty, formatCashOrderableLine,
   evaluateCrossWon, formatCrossWonCheck, formatCrossWonLiveCand, formatUSLiveGate, maskLSResponse, CROSS_WON_ADOPTED_FIELD, LS_US_CROSS_WON_TR_CONFIRMED, type LSUSDeposit,
   placeLSKRBuyOrder, queryLSKROrderExec, cancelLSKRBuyOrder, krIsuNo, isKROrderSuccess, getLSKRStockMaster,
@@ -484,28 +484,42 @@ describe('해외 주문/체결/예수금 (공식 필드)', () => {
     });
     const r = await queryLSUSOrderExec(cfg, 'T', { exchcd: '82', symbol: 'TSLA', ordDate: '20260706' });
     expect(r.queryOk).toBe(true);
+    expect(r.classification).toBe('SUCCESS');
     expect(r.rows).toHaveLength(1);
     expect(r.rows[0]).toMatchObject({ ordNo: '141', symbol: 'TSLA', ordQty: 10, execQty: 4, unfilledQty: 6, ordPtnCode: '02' });
   });
-  it('P0-27: 주문 0건(HTTP200 + 미허용 업무 rsp_cd) → queryOk=true rows=[] (0건 정상, throw 안 함)', async () => {
-    // 오늘 주문 없던 계좌: COSAQ00102 가 00000 아닌 "조회할 자료 없음" 업무코드 + 빈 OutBlock3 를 HTTP 200 으로 반환.
+  it('P0-27a: 00000 + rows0 → SUCCESS(queryOk=true)', async () => {
+    stubFetch(() => ({ status: 200, json: { rsp_cd: '00000', rsp_msg: '정상', COSAQ00102OutBlock3: [] } }));
+    const r = await queryLSUSOrderExec(cfg, 'T', { exchcd: '82', symbol: 'AAPL', ordDate: '20260810' });
+    expect(r.classification).toBe('SUCCESS'); expect(r.queryOk).toBe(true); expect(r.rows).toEqual([]);
+  });
+  it('P0-27a: 실측 확인된 empty code + rows0 → EMPTY(queryOk=true) — emptyCodes 주입 시에만', async () => {
     stubFetch(() => ({ status: 200, json: { rsp_cd: '00600', rsp_msg: '조회할 자료가 없습니다.' } }));
-    const r = await queryLSUSOrderExec(cfg, 'T', { exchcd: '82', symbol: 'AAPL', ordDate: '20260810' });
-    expect(r.queryOk).toBe(true);       // ★ 서버 왕복 성공 = 0건 정상(신규 POST 가능)
-    expect(r.rows).toEqual([]);
-    expect(r.rspCd).toBe('00600');
+    const r = await queryLSUSOrderExec(cfg, 'T', { exchcd: '82', symbol: 'AAPL', ordDate: '20260810' }, { emptyCodes: ['00600'] });
+    expect(r.classification).toBe('EMPTY'); expect(r.queryOk).toBe(true); expect(r.rows).toEqual([]);
   });
-  it('P0-27: 조회 API 실패(HTTP 500) → queryOk=false (안전차단 신호, 0건 아님)', async () => {
-    stubFetch(() => ({ status: 500, statusText: 'ERR', json: { rsp_cd: 'IGW00099', rsp_msg: '서버오류' } }));
-    const r = await queryLSUSOrderExec(cfg, 'T', { exchcd: '82', symbol: 'AAPL', ordDate: '20260810' });
-    expect(r.queryOk).toBe(false);      // ★ HTTP>=400 은 soft 여도 실패
-    expect(r.rows).toEqual([]);
+  it('P0-27a: 임의 unknown non-00000 + HTTP200 JSON → BUSINESS_ERROR 차단(fail-closed, 미등록)', async () => {
+    stubFetch(() => ({ status: 200, json: { rsp_cd: '00600', rsp_msg: '조회할 자료가 없습니다.' } }));
+    const r = await queryLSUSOrderExec(cfg, 'T', { exchcd: '82', symbol: 'AAPL', ordDate: '20260810' });   // emptyCodes 미주입
+    expect(r.classification).toBe('BUSINESS_ERROR'); expect(r.queryOk).toBe(false); expect(r.rows).toEqual([]);
   });
-  it('P0-27: 빈 응답 본문 → queryOk=false (INVALID_RESPONSE)', async () => {
+  it('P0-27a: malformed(빈 본문) → TRANSPORT_ERROR 차단', async () => {
     stubFetch(() => ({ status: 200, text: '' }));
     const r = await queryLSUSOrderExec(cfg, 'T', { exchcd: '82', symbol: 'AAPL', ordDate: '20260810' });
-    expect(r.queryOk).toBe(false);
-    expect(r.kind).toBe('INVALID_RESPONSE');
+    expect(r.classification).toBe('TRANSPORT_ERROR'); expect(r.queryOk).toBe(false); expect(r.kind).toBe('INVALID_RESPONSE');
+  });
+  it('P0-27a: network/HTTP 500 → TRANSPORT_ERROR 차단', async () => {
+    stubFetch(() => ({ status: 500, statusText: 'ERR', json: { rsp_cd: 'IGW00099', rsp_msg: '서버오류' } }));
+    const r = await queryLSUSOrderExec(cfg, 'T', { exchcd: '82', symbol: 'AAPL', ordDate: '20260810' });
+    expect(r.classification).toBe('TRANSPORT_ERROR'); expect(r.queryOk).toBe(false);
+  });
+  it('P0-27a: classifyOrderExec 순수함수 — 4분류 fail-closed', () => {
+    const sc = ['00000']; const ec = ['00600'];
+    expect(classifyOrderExec({ rspCd: '00000', successCodes: sc, emptyCodes: ec })).toBe('SUCCESS');
+    expect(classifyOrderExec({ rspCd: '00600', successCodes: sc, emptyCodes: ec })).toBe('EMPTY');
+    expect(classifyOrderExec({ rspCd: '99999', successCodes: sc, emptyCodes: ec })).toBe('BUSINESS_ERROR');   // unknown → 차단
+    expect(classifyOrderExec({ rspCd: '00600', successCodes: sc, emptyCodes: [] })).toBe('BUSINESS_ERROR');   // 미등록 → 차단
+    expect(classifyOrderExec({ transportError: true, rspCd: '00000', successCodes: sc, emptyCodes: ec })).toBe('TRANSPORT_ERROR');
   });
 
   // COSOQ02701 공식 응답 모의(OutBlock3 통화별 + OutBlock4 원화요약). USD현금/선환전/환율/원화현금/미수 지정.

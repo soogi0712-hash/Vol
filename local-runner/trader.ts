@@ -55,18 +55,20 @@ export async function executeBuyOrder(deps: TraderDeps, p: BuyParams): Promise<B
     p.orders.recordResponse({ atMs: deps.now(), tr: 'COSAQ00102', rspCd: 'EXCEPTION', rspMsg: msg, ordNo: null, note: '주문전 대사 예외(조회실패)' }); p.orders.flush();
     return abort('주문내역 대사 조회 실패(예외/timeout) → 안전차단(전송 금지)', 'RECONCILIATION_FAILED');
   }
-  p.orders.recordResponse({ atMs: deps.now(), tr: 'COSAQ00102', rspCd: chk.rspCd, rspMsg: chk.rspMsg, ordNo: null, note: `주문전 대사 queryOk=${chk.queryOk}` });
+  p.orders.recordResponse({ atMs: deps.now(), tr: 'COSAQ00102', rspCd: chk.rspCd, rspMsg: chk.rspMsg, ordNo: null, note: `주문전 대사 class=${chk.classification}` });
   const actualBuys = chk.rows.filter(r => r.symbol === p.symbol && r.ordPtnCode === '02').length;
   const pendingBuys = chk.rows.filter(r => r.symbol === p.symbol && r.ordPtnCode === '02' && r.unfilledQty > 0).length;
   const localBuys = p.orders.buyCountToday(p.etDate);
-  const decision = !chk.queryOk ? 'RECONCILIATION_FAILED'
+  // ⚠️ P0-27a: POST 허용은 classification=SUCCESS|EMPTY 에서만. UNKNOWN/BUSINESS_ERROR/TRANSPORT_ERROR = fail-closed 차단.
+  const postAllowedByQuery = chk.classification === 'SUCCESS' || chk.classification === 'EMPTY';
+  const decision = !postAllowedByQuery ? `RECONCILIATION_FAILED(${chk.classification})`
     : actualBuys > localBuys ? 'UNRECORDED_ORDER(전송금지)'
     : (actualBuys >= p.dailyMaxBuys && p.dailyMaxBuys > 0) ? 'DAILY_LIMIT(전송금지)'
     : 'POST_ALLOWED';
-  // req2·6 [US-RECON] 진단(주문 전 조회만): queryOk/rsp_cd/rsp_msg/HTTP status/raw order count/pending/today/요청파라미터/조회기간/종목/continuation/decision
-  deps.log(`[US-RECON ${p.symbol}] queryOk=${chk.queryOk} rsp_cd=${chk.rspCd} rsp_msg=${chk.rspMsg} httpStatus=${chk.httpStatus ?? '-'}${chk.kind ? ` kind=${chk.kind}` : ''} rawOrders=${chk.rows.length} actualBuys=${actualBuys} pending=${pendingBuys} todayLocal=${localBuys} ordDate=${p.etDate} exchcd=${p.exchcd} symbol=${p.symbol} trCont=${chk.diag?.trCont ?? '-'} trContKey=${chk.diag?.trContKey ?? '-'} decision=${decision}`);
-  // 조회 API 실패(queryOk=false)만 안전차단. 0건은 정상 통과.
-  if (!chk.queryOk) { p.orders.flush(); return abort(`주문내역 대사 조회 실패(${chk.kind ?? 'API'} rsp_cd=${chk.rspCd}) → 안전차단(전송 금지)`, 'RECONCILIATION_FAILED'); }
+  // req4 [US-RECON] 진단(주문 전 조회만): rsp_cd/rsp_msg/queryOk/classification/rawRows/pending/todayBuyCount/decision (+요청파라미터/조회기간/종목/HTTP/continuation)
+  deps.log(`[US-RECON ${p.symbol}] rsp_cd=${chk.rspCd} rsp_msg=${chk.rspMsg} queryOk=${chk.queryOk} classification=${chk.classification} rawRows=${chk.rows.length} pending=${pendingBuys} todayBuyCount=${localBuys} actualBuys=${actualBuys} hasEnvelope=${chk.hasEnvelope} httpStatus=${chk.httpStatus ?? '-'}${chk.kind ? ` kind=${chk.kind}` : ''} ordDate=${p.etDate} exchcd=${p.exchcd} symbol=${p.symbol} trCont=${chk.diag?.trCont ?? '-'} decision=${decision}`);
+  // SUCCESS/EMPTY 아니면(=unknown 업무코드/transport 실패) 전송 금지. 0건 정상만 통과.
+  if (!postAllowedByQuery) { p.orders.flush(); return abort(`주문내역 대사 ${chk.classification}(rsp_cd=${chk.rspCd}${chk.kind ? ` kind=${chk.kind}` : ''}) → 안전차단(전송 금지)`, 'RECONCILIATION_FAILED'); }
   if (actualBuys > localBuys) { p.orders.flush(); return abort(`거래소 당일 매수주문 ${actualBuys} > 로컬 ${localBuys} → 미기록 주문 감지, 전송 금지(대사)`, 'UNRECORDED_ORDER'); }
   if (actualBuys >= p.dailyMaxBuys && p.dailyMaxBuys > 0) { p.orders.flush(); return abort(`거래소 당일 매수주문 ${actualBuys}(≥한도) → 전송 금지`, 'DAILY_LIMIT'); }
 
@@ -127,9 +129,9 @@ export async function reconcilePending(
     let exec: LSOrderExecResult;
     try { exec = await deps.query({ exchcd: p.exchcd, symbol: po.symbol, ordDate: p.ordDate }); }
     catch (e) { out.push({ ordNo: po.ordNo, status: 'waiting', reason: `재조회 예외(${e instanceof Error ? e.message : String(e)}) → 상태 유지(액션 없음)` }); continue; }
-    p.orders.recordResponse({ atMs: deps.now(), tr: 'COSAQ00102', rspCd: exec.rspCd, rspMsg: exec.rspMsg, ordNo: po.ordNo, note: `미체결 재조회 queryOk=${exec.queryOk}` });
-    // 조회 API 실패(queryOk=false)면 rows 를 신뢰할 수 없으므로 취소/해소하지 않고 상태 유지(0건 아님).
-    if (!exec.queryOk) { out.push({ ordNo: po.ordNo, status: 'waiting', reason: `재조회 실패(${exec.kind ?? 'API'} rsp_cd=${exec.rspCd}) → 상태 유지(액션 없음)` }); continue; }
+    p.orders.recordResponse({ atMs: deps.now(), tr: 'COSAQ00102', rspCd: exec.rspCd, rspMsg: exec.rspMsg, ordNo: po.ordNo, note: `미체결 재조회 class=${exec.classification}` });
+    // SUCCESS/EMPTY 아니면 rows 를 신뢰할 수 없으므로 취소/해소하지 않고 상태 유지(fail-closed).
+    if (!exec.queryOk) { out.push({ ordNo: po.ordNo, status: 'waiting', reason: `재조회 ${exec.classification}(${exec.kind ?? ''} rsp_cd=${exec.rspCd}) → 상태 유지(액션 없음)` }); continue; }
     const row = exec.rows.find(r => r.ordNo === po.ordNo) ?? null;
     if (row && row.execQty >= po.qty) {
       p.orders.resolvePending(po.ordNo); p.orders.flush();

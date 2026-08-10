@@ -12,7 +12,8 @@ afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
 
 type ExecRow = { ordNo: string; orgOrdNo: string; symbol: string; ordQty: number; execQty: number; unfilledQty: number; ordPrc: number; ordPtnCode: string; trxNm: string };
 const row = (o: Partial<ExecRow>): ExecRow => ({ ordNo: '141', orgOrdNo: '0', symbol: 'AAPL', ordQty: 1, execQty: 0, unfilledQty: 1, ordPrc: 100, ordPtnCode: '02', trxNm: '접수', ...o });
-const execRes = (rows: ExecRow[] = [], rspCd = '00000', queryOk = true) => ({ queryOk, rspCd, rspMsg: '', rows, diag: {} as any });
+const execRes = (rows: ExecRow[] = [], rspCd = '00000', queryOk = true) =>
+  ({ queryOk, classification: (queryOk ? 'SUCCESS' : 'TRANSPORT_ERROR') as const, rspCd, rspMsg: '', rows, hasEnvelope: true, diag: {} as any });
 
 let clock = 1_000_000;
 function deps(over: Partial<TraderDeps> = {}): TraderDeps {
@@ -145,17 +146,45 @@ describe('P0-27 reconciliation 구분 — 0건 정상 vs API 실패', () => {
     expect(placed).toBe(true);
   });
 
-  it('조회 API 실패(queryOk=false, 예외 아님) → POST 차단 + abortCode=RECONCILIATION_FAILED', async () => {
+  it('조회 API 실패(TRANSPORT_ERROR) → POST 차단 + abortCode=RECONCILIATION_FAILED', async () => {
     const orders = new OrderStore('AAPL', dir);
     let placed = false;
     const d = deps({
       place: async () => { placed = true; return { rspCd: '00000', rspMsg: 'ok', ordNo: '141', raw: {}, diag: {} as any }; },
-      query: async () => ({ queryOk: false, rspCd: 'ERR(NETWORK)', rspMsg: 'timeout', rows: [], diag: {} as any, kind: 'NETWORK' as const }),
+      query: async () => ({ queryOk: false, classification: 'TRANSPORT_ERROR' as const, rspCd: 'ERR(NETWORK)', rspMsg: 'timeout', rows: [], hasEnvelope: false, diag: {} as any, kind: 'NETWORK' as const }),
     });
     const r = await executeBuyOrder(d, buyParams(orders));
     expect(r.status).toBe('aborted');
     expect(r.abortCode).toBe('RECONCILIATION_FAILED');
     expect(placed).toBe(false);   // ★ 안전차단(전송 금지)
+  });
+  it('P0-27a: unknown 업무코드(BUSINESS_ERROR) → POST 차단(fail-closed, 0건 오인 금지)', async () => {
+    const orders = new OrderStore('AAPL', dir);
+    let placed = false;
+    const msgs: string[] = [];
+    const d = deps({
+      place: async () => { placed = true; return { rspCd: '00000', rspMsg: 'ok', ordNo: '141', raw: {}, diag: {} as any }; },
+      query: async () => ({ queryOk: false, classification: 'BUSINESS_ERROR' as const, rspCd: '77777', rspMsg: '알수없는 업무오류', rows: [], hasEnvelope: true, diag: {} as any }),
+      log: (m) => msgs.push(m),
+    });
+    const r = await executeBuyOrder(d, buyParams(orders));
+    expect(r.status).toBe('aborted');
+    expect(r.abortCode).toBe('RECONCILIATION_FAILED');
+    expect(placed).toBe(false);   // ★ unknown 코드를 0건으로 오인해 통과시키지 않음
+    expect(msgs.some(m => /classification=BUSINESS_ERROR/.test(m))).toBe(true);
+  });
+  it('P0-27a: 실측 empty code(EMPTY) + rows0 → POST 허용', async () => {
+    const orders = new OrderStore('AAPL', dir);
+    let placed = false;
+    const d = deps({
+      place: async () => { placed = true; return { rspCd: '00000', rspMsg: 'ok', ordNo: '141', raw: {}, diag: {} as any }; },
+      query: async () => placed
+        ? { queryOk: true, classification: 'SUCCESS' as const, rspCd: '00000', rspMsg: '', rows: [row({ execQty: 1, unfilledQty: 0 })], hasEnvelope: true, diag: {} as any }
+        : { queryOk: true, classification: 'EMPTY' as const, rspCd: '00600', rspMsg: '조회할 자료가 없습니다.', rows: [], hasEnvelope: true, diag: {} as any },
+    });
+    const r = await executeBuyOrder(d, buyParams(orders));
+    expect(r.status).toBe('placed-filled');   // ★ EMPTY(정상 0건)는 허용
+    expect(placed).toBe(true);
   });
 
   it('조회 예외(throw) → POST 차단 + abortCode=RECONCILIATION_FAILED', async () => {
@@ -279,7 +308,7 @@ describe('reconcilePending — 타임아웃 취소(BUY→PENDING→CANCELLED 모
     clock = 1_000_000 + 30_000;
     let cancelled = false;
     const early = await reconcilePending(
-      deps({ query: async () => ({ queryOk: true, rspCd: '00000', rspMsg: '', rows: [row({ execQty: 0, unfilledQty: 1 })], diag: {} as any }), cancel: async () => { cancelled = true; return { rspCd: '00000', rspMsg: '' }; } }),
+      deps({ query: async () => ({ queryOk: true, classification: 'SUCCESS' as const, hasEnvelope: true, rspCd: '00000', rspMsg: '', rows: [row({ execQty: 0, unfilledQty: 1 })], diag: {} as any }), cancel: async () => { cancelled = true; return { rspCd: '00000', rspMsg: '' }; } }),
       { orders, exchcd: '82', ordDate: '20260706', timeoutMs: 60_000, autoCancel: true },
     );
     expect(early[0].status).toBe('waiting');
@@ -289,7 +318,7 @@ describe('reconcilePending — 타임아웃 취소(BUY→PENDING→CANCELLED 모
     // ③ 타임아웃 경과 → 취소 완료
     clock = 1_000_000 + 61_000;
     const late = await reconcilePending(
-      deps({ query: async () => ({ queryOk: true, rspCd: '00000', rspMsg: '', rows: [row({ execQty: 0, unfilledQty: 1 })], diag: {} as any }), cancel: async () => ({ rspCd: '00000', rspMsg: '취소완료' }) }),
+      deps({ query: async () => ({ queryOk: true, classification: 'SUCCESS' as const, hasEnvelope: true, rspCd: '00000', rspMsg: '', rows: [row({ execQty: 0, unfilledQty: 1 })], diag: {} as any }), cancel: async () => ({ rspCd: '00000', rspMsg: '취소완료' }) }),
       { orders, exchcd: '82', ordDate: '20260706', timeoutMs: 60_000, autoCancel: true },
     );
     expect(late[0].status).toBe('cancelled');
@@ -304,7 +333,7 @@ describe('reconcilePending — 타임아웃 취소(BUY→PENDING→CANCELLED 모
     clock = 1_000_000 + 61_000;
     let cancelled = false;
     const r = await reconcilePending(
-      deps({ query: async () => ({ queryOk: true, rspCd: '00000', rspMsg: '', rows: [row({ execQty: 1, unfilledQty: 0 })], diag: {} as any }), cancel: async () => { cancelled = true; return { rspCd: '00000', rspMsg: '' }; } }),
+      deps({ query: async () => ({ queryOk: true, classification: 'SUCCESS' as const, hasEnvelope: true, rspCd: '00000', rspMsg: '', rows: [row({ execQty: 1, unfilledQty: 0 })], diag: {} as any }), cancel: async () => { cancelled = true; return { rspCd: '00000', rspMsg: '' }; } }),
       { orders, exchcd: '82', ordDate: '20260706', timeoutMs: 60_000, autoCancel: true },
     );
     expect(r[0].status).toBe('filled');
@@ -318,7 +347,7 @@ describe('reconcilePending — 타임아웃 취소(BUY→PENDING→CANCELLED 모
     orders.flush();
     clock = 1_000_000 + 61_000;
     const r = await reconcilePending(
-      deps({ query: async () => ({ queryOk: true, rspCd: '00000', rspMsg: '', rows: [row({ execQty: 0, unfilledQty: 1 })], diag: {} as any }), cancel: async () => { throw new Error('COSAT00311 공식 필드 미확인'); } }),
+      deps({ query: async () => ({ queryOk: true, classification: 'SUCCESS' as const, hasEnvelope: true, rspCd: '00000', rspMsg: '', rows: [row({ execQty: 0, unfilledQty: 1 })], diag: {} as any }), cancel: async () => { throw new Error('COSAT00311 공식 필드 미확인'); } }),
       { orders, exchcd: '82', ordDate: '20260706', timeoutMs: 60_000, autoCancel: true },
     );
     expect(r[0].status).toBe('cancel-failed');
@@ -333,7 +362,7 @@ describe('reconcilePending — 타임아웃 취소(BUY→PENDING→CANCELLED 모
     let cancelled = false;
     const msgs: string[] = [];
     const r = await reconcilePending(
-      deps({ query: async () => ({ queryOk: true, rspCd: '00000', rspMsg: '', rows: [row({ execQty: 0, unfilledQty: 1 })], diag: {} as any }), cancel: async () => { cancelled = true; return { rspCd: '00000', rspMsg: '' }; }, log: (m) => msgs.push(m) }),
+      deps({ query: async () => ({ queryOk: true, classification: 'SUCCESS' as const, hasEnvelope: true, rspCd: '00000', rspMsg: '', rows: [row({ execQty: 0, unfilledQty: 1 })], diag: {} as any }), cancel: async () => { cancelled = true; return { rspCd: '00000', rspMsg: '' }; }, log: (m) => msgs.push(m) }),
       { orders, exchcd: '82', ordDate: '20260706', timeoutMs: 60_000, autoCancel: false },
     );
     expect(r[0].status).toBe('manual-cancel-required');
@@ -345,7 +374,7 @@ describe('reconcilePending — 타임아웃 취소(BUY→PENDING→CANCELLED 모
     const orders = new OrderStore('AAPL', dir);
     orders.recordPlaced('buy', '20260706093000', '20260706', { ordNo: '141', symbol: 'AAPL', qty: 1, price: 100, placedAtMs: 1_000_000 });
     const r = await reconcilePending(
-      deps({ query: async () => ({ queryOk: true, rspCd: '00000', rspMsg: '', rows: [row({ execQty: 1, unfilledQty: 0 })], diag: {} as any }) }),
+      deps({ query: async () => ({ queryOk: true, classification: 'SUCCESS' as const, hasEnvelope: true, rspCd: '00000', rspMsg: '', rows: [row({ execQty: 1, unfilledQty: 0 })], diag: {} as any }) }),
       { orders, exchcd: '82', ordDate: '20260706', timeoutMs: 60_000, autoCancel: false },
     );
     expect(r[0].status).toBe('filled');

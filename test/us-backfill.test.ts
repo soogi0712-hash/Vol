@@ -3,6 +3,7 @@ import {
   pickBackfillTarget, computeBackfillCapacity, computeBackfillDelta, BackfillStats,
   BACKFILL_MIN_CONFIRMED, BACKFILL_TARGET, type BackfillCand,
 } from '../local-runner/us-backfill';
+import { RealtimeCandleBuilder, evaluateReadiness, MIN_RT_CANDLES } from '../local-runner/ls-us-websocket';
 
 describe('P0-26 백필 대상 선정(요구 1·3·7)', () => {
   const mk = (symbol: string, confirmed: number, failedUntilMs = 0): BackfillCand => ({ symbol, confirmed, failedUntilMs });
@@ -121,5 +122,53 @@ describe('P0-27 issue2 newUnique 계산(무한루프 방지 req1·2·5)', () => 
       const d = computeBackfillDelta(existing, ['x1', 'x2', 'x3', 'x4']);
       expect(d.newUnique).toBe(0);   // 매 호출 진전 0 → 러너는 backoff 후 다음 종목으로 이동해야 함
     }
+  });
+});
+
+// P0-27a req7: 백필 16→20→READY 전환을 실제 builder + readiness 로 결정적 재현(실계정 등가 증명).
+describe('P0-27a 백필 16→20→READY 결정적 재현(req7)', () => {
+  const c = (ts: string, px: number) => ({ datetime: ts, open: px, high: px, low: px, close: px, volume: 100 });
+  const freshWs = (confirmedCount: number) => evaluateReadiness({
+    websocketConnected: true, lastGSCatMs: 1_000, lastGSHatMs: 1_000,
+    lastPrice: 200, bestBid: 199, bestAsk: 201, confirmedCount, storeCorrupted: false,
+  }, 2_000);   // GSC/GSH 신선(1s 전)
+
+  // 최신 16개 확정봉(HHMM 0505..0520) — 14자리 timestamp
+  const have16 = () => Array.from({ length: 16 }, (_, i) => c(`202608101305${String(i).padStart(2, '0')}`, 10 + i));
+
+  it('확정봉 16 → warmup(READY 아님), 백필로 과거 4봉 추가 → 20 → READY', () => {
+    const b = new RealtimeCandleBuilder();
+    const have = have16();   // 130500..130515
+    b.seed(have);
+    expect(b.confirmedCount).toBe(16);
+    let r = freshWs(b.confirmedCount);
+    expect(r.warmup).toBe(true); expect(r.ready).toBe(false);   // 확정봉<20 → 아직 아님
+
+    // 백필: g3203 가 과거 4봉(130101..130104) + 중복 2봉(130500,130501) 반환 → newUnique=4
+    const fetched = [
+      c('20260810130101', 6), c('20260810130102', 7), c('20260810130103', 8), c('20260810130104', 9),
+      c('20260810130500', have[0].close), c('20260810130501', have[1].close),   // 이미 보유(중복)
+    ];
+    const delta = computeBackfillDelta(have.map(x => x.datetime), fetched.map(x => x.datetime));
+    expect(delta.rawRows).toBe(6);
+    expect(delta.newUnique).toBe(4);   // ★ rawRows=6 이 아니라 newUnique=4 로 진전 판정
+    expect(delta.after).toBe(20);
+
+    b.seed(fetched);                    // 신규 unique 병합(중복 dedup) → 20
+    expect(b.confirmedCount).toBe(20);
+    r = freshWs(b.confirmedCount);
+    expect(r.warmup).toBe(false); expect(r.ready).toBe(true);   // ★ 16→20 → READY 전환(가짜봉 없음)
+    expect(b.confirmedCount).toBe(MIN_RT_CANDLES);
+  });
+
+  it('newUnique=0(전부 중복)면 confirmedCount 불변 → READY 전환 없음(무한 16 방지)', () => {
+    const b = new RealtimeCandleBuilder();
+    const have = have16();
+    b.seed(have);
+    const before = b.confirmedCount;
+    const delta = computeBackfillDelta(have.map(x => x.datetime), have.map(x => x.datetime));   // 전부 중복
+    expect(delta.newUnique).toBe(0);
+    b.seed(have);   // dedup → 변화 없음
+    expect(b.confirmedCount).toBe(before);   // 16 유지 → 러너는 backoff 후 다음 종목
   });
 });

@@ -684,11 +684,30 @@ export async function placeLSUSBuyOrder(
 //                 ExecYn/CrcyCode/ThdayBnsAppYn/LoanBalHldYn
 // OutBlock3(리스트): OrdNo/OrgOrdNo/ShtnIsuNo/OrdQty/ExecQty/UnercQty/OvrsOrdPrc/OrdPtnCode/OrdprcPtnCode ...
 export interface LSOrderExec { ordNo: string; orgOrdNo: string; symbol: string; ordQty: number; execQty: number; unfilledQty: number; ordPrc: number; ordPtnCode: string; trxNm: string; }
-// queryOk: 서버 왕복 성공(=주문내역을 열거 가능, rows 가 0건이어도 정상). false 는 실제 조회 실패(네트워크/timeout/
-//   빈응답/JSON오류/HTTP>=400/호출제한)뿐이다. ⚠️ "조회 성공 + 0건" 과 "조회 API 실패" 를 절대 같은 실패로 취급하지 않는다(P0-27 req3).
-export interface LSOrderExecResult { queryOk: boolean; rspCd: string; rspMsg: string; rows: LSOrderExec[]; diag: LSHttpDiag; kind?: LSErrorKind; httpStatus?: number; }
+
+// ── P0-27a: COSAQ00102 응답 분류(fail-closed) ──────────────────────────────────
+// queryOk 를 "HTTP200+JSM" 으로만 판정하지 않는다. 실제 업무오류를 "주문 0건" 으로 오인하면 신규 주문이 잘못 통과되므로
+// 아래 4분류로 엄격 판정하고, POST 허용은 호출측이 SUCCESS/EMPTY 에서만 한다.
+//   SUCCESS         = rspCd 가 공식 성공코드(00000 등) → rows 신뢰
+//   EMPTY           = rspCd 가 "실계정 실측 확인된 자료없음" 코드 → rows=0 정상
+//   BUSINESS_ERROR  = HTTP200+JSON 이나 성공/empty 목록에 없는 unknown 업무코드 → fail-closed 차단
+//   TRANSPORT_ERROR = network/timeout/HTTP>=400/빈응답/parse/호출제한 → 차단
+export type OrderExecClassification = 'SUCCESS' | 'EMPTY' | 'BUSINESS_ERROR' | 'TRANSPORT_ERROR';
+export function classifyOrderExec(input: { transportError?: boolean; rspCd: string; successCodes: string[]; emptyCodes: string[] }): OrderExecClassification {
+  if (input.transportError) return 'TRANSPORT_ERROR';
+  if (input.successCodes.includes(input.rspCd)) return 'SUCCESS';
+  if (input.emptyCodes.includes(input.rspCd)) return 'EMPTY';
+  return 'BUSINESS_ERROR';   // unknown non-success → 절대 통과 금지(fail-closed)
+}
+// queryOk 는 SUCCESS/EMPTY 에서만 true. (POST 허용은 호출측이 classification 으로 재확인)
+export interface LSOrderExecResult {
+  queryOk: boolean; classification: OrderExecClassification;
+  rspCd: string; rspMsg: string; rows: LSOrderExec[]; hasEnvelope: boolean;
+  diag: LSHttpDiag; kind?: LSErrorKind; httpStatus?: number;
+}
 export async function queryLSUSOrderExec(
   cfg: LSConfig, token: string, p: { exchcd: string; symbol?: string; ordDate: string; execYn?: '0' | '1' | '2' },
+  opts: { emptyCodes?: string[] } = {},
 ): Promise<LSOrderExecResult> {
   // ExecYn: 0=전체, 1=체결, 2=미체결 (공식 InBlock 필드). SrtOrdNo=999999999(전체). QryTpCode/BkseqTpCode=1.
   const inb = {
@@ -698,22 +717,29 @@ export async function queryLSUSOrderExec(
       CrcyCode: '000', ThdayBnsAppYn: '0', LoanBalHldYn: '0',
     },
   };
+  const successCodes = LS_SUCCESS_CODES['COSAQ00102'] ?? ['00000'];
+  const emptyCodes = opts.emptyCodes ?? [];   // ⚠️ 실계정 실측 확인분만. 기본 없음(unknown 은 fail-closed 차단).
   try {
-    // soft=true: HTTP 200 이면 "조회할 자료 없음" 업무코드여도 throw 없이 반환 → 0건 정상으로 처리(P0-27 req3·4·5).
+    // soft=true: HTTP 200 이면 업무코드여도 throw 없이 반환(호출측 classifyOrderExec 로 엄격 분류). transport 오류는 여전히 throw.
     const { data, rspCd, rspMsg, diag } = await lsPost(token, '/overseas-stock/accno', 'COSAQ00102', inb, { soft: true });
-    const rows: LSOrderExec[] = (data.COSAQ00102OutBlock3 || []).map((r: any) => ({
+    const outBlock3 = data.COSAQ00102OutBlock3;
+    const hasEnvelope = data != null && (rspCd !== '' || outBlock3 !== undefined);
+    const rows: LSOrderExec[] = (outBlock3 || []).map((r: any) => ({
       ordNo: String(r.OrdNo ?? ''), orgOrdNo: String(r.OrgOrdNo ?? ''),
       symbol: String(r.ShtnIsuNo ?? r.IsuNo ?? ''),
       ordQty: toNum(r.OrdQty), execQty: toNum(r.ExecQty), unfilledQty: toNum(r.UnercQty),
       ordPrc: toNum(r.OvrsOrdPrc), ordPtnCode: String(r.OrdPtnCode ?? ''), trxNm: String(r.OrdTrxPtnNm ?? ''),
     }));
-    return { queryOk: true, rspCd, rspMsg, rows, diag, httpStatus: diag.status };   // 서버 왕복 성공(rows 0건이어도 정상)
+    const classification = classifyOrderExec({ rspCd, successCodes, emptyCodes });
+    const queryOk = classification === 'SUCCESS' || classification === 'EMPTY';
+    // BUSINESS_ERROR(unknown 코드)면 rows 를 신뢰하지 않는다(비워서 반환) — 잘못된 0건 통과 방지.
+    return { queryOk, classification, rspCd, rspMsg, rows: queryOk ? rows : [], hasEnvelope, diag, httpStatus: diag.status };
   } catch (e) {
-    // 여기 도달 = 실제 조회 실패(네트워크/timeout/빈응답/JSON오류/HTTP>=400/호출제한). 안전차단 신호.
+    // 여기 도달 = transport 실패(네트워크/timeout/빈응답/JSON오류/HTTP>=400/호출제한). 안전차단.
     const kind: LSErrorKind = e instanceof LSApiError ? e.kind : 'INVALID_RESPONSE';
     const rspCd = e instanceof LSApiError ? (e.rspCd ?? `ERR(${e.kind})`) : 'EXCEPTION';
     const diag = (e instanceof LSApiError ? e.diag : undefined) ?? ({} as LSHttpDiag);
-    return { queryOk: false, rspCd, rspMsg: e instanceof Error ? e.message : String(e), rows: [], diag, kind, httpStatus: diag.status };
+    return { queryOk: false, classification: 'TRANSPORT_ERROR', rspCd, rspMsg: e instanceof Error ? e.message : String(e), rows: [], hasEnvelope: false, diag, kind, httpStatus: diag.status };
   }
 }
 
