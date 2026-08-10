@@ -9,7 +9,7 @@ import { loadUSSymbols } from './universe';
 import { makeScrubber } from './mask';
 import {
   getLSUS15MinPaged, getLSUSTicksPaged, getLSUSDeposit, getLSUSStockMasterPage,
-  placeLSUSBuyOrder, queryLSUSOrderExec, cancelLSUSOrder, LSApiError,
+  placeLSUSBuyOrder, queryLSUSOrderExec, cancelLSUSOrder, LSApiError, LS_US_ORDEREXEC_EMPTY_CODES,
   decideUSCashPayment, usCashOnlyUsdCap, usOrderableQty, formatCashOrderableLine,
   evaluateCrossWon, formatCrossWonCheck, formatCrossWonLiveCand, formatUSLiveGate, LS_US_CROSS_WON_TR_CONFIRMED, type LSUSDeposit,
 } from '../src/lib/ls-api';
@@ -432,9 +432,10 @@ async function main() {
 
   // P0-27a: COSAQ00102 "자료없음(정상 빈 조회)" rsp_cd 는 실계정 실측 확인분만 등록(추측 금지, fail-closed).
   //   기본 없음 → unknown 업무코드는 BUSINESS_ERROR 로 차단. 실측([US-RECON-DIAG]) 후 이 env 에 콤마구분 추가.
+  // P0-27b: COSAQ00102 "자료없음" 기본 EMPTY 코드=02679(실계정 실측 확정) 는 라이브러리 기본 적용(env 없어도).
+  //   추가 코드는 LS_US_ORDEREXEC_EMPTY_CODES 로 병합. 여전히 rows=0+정상 envelope 일 때만 EMPTY 통과.
   const ordExecEmptyCodes = (process.env.LS_US_ORDEREXEC_EMPTY_CODES || '').split(',').map((s: string) => s.trim()).filter(Boolean);
-  if (ordExecEmptyCodes.length) log.info(`[US-RECON-CFG] COSAQ00102 실측확인 empty 코드=[${ordExecEmptyCodes.join(',')}] (SUCCESS/EMPTY 만 POST 허용)`);
-  else log.info('[US-RECON-CFG] COSAQ00102 empty 코드 미등록 → 00000(SUCCESS) 외 모든 non-00000 은 BUSINESS_ERROR 로 차단(fail-closed). 실측 후 LS_US_ORDEREXEC_EMPTY_CODES 에 추가.');
+  log.info(`[US-RECON-CFG] COSAQ00102 EMPTY 코드=기본[${LS_US_ORDEREXEC_EMPTY_CODES.join(',')}]${ordExecEmptyCodes.length ? ` + env[${ordExecEmptyCodes.join(',')}]` : ''} (SUCCESS/EMPTY 만 POST 허용, EMPTY 는 rows=0+정상 envelope 조건). unknown non-00000 = BUSINESS_ERROR 차단.`);
   const traderDeps: TraderDeps = {
     place: (pp) => placeLSUSBuyOrder(cfg, token, pp),
     query: (pp) => queryLSUSOrderExec(cfg, token, pp, { emptyCodes: ordExecEmptyCodes }),

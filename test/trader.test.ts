@@ -215,6 +215,31 @@ describe('P0-27 reconciliation 구분 — 0건 정상 vs API 실패', () => {
     expect(h.placeCalls).toBe(0);
   });
 
+  it('P0-27b: 02679(EMPTY)+rawRows0 → [US-RECON] classification=EMPTY decision=POST_ALLOWED, POST 허용 + 안전장치 유지', async () => {
+    const orders = new OrderStore('AAPL', dir);
+    let placed = false;
+    const msgs: string[] = [];
+    const d = deps({
+      place: async () => { placed = true; return { rspCd: '00000', rspMsg: 'ok', ordNo: '141', raw: {}, diag: {} as any }; },
+      // 전송 전 대사 = 02679 EMPTY(rows0), 전송 후 체결조회 = filled
+      query: async () => placed
+        ? { queryOk: true, classification: 'SUCCESS' as const, rspCd: '00000', rspMsg: '', rows: [row({ execQty: 1, unfilledQty: 0 })], hasEnvelope: true, diag: {} as any }
+        : { queryOk: true, classification: 'EMPTY' as const, rspCd: '02679', rspMsg: '조회내역이 없습니다.', rows: [], hasEnvelope: true, diag: {} as any },
+      log: (m) => msgs.push(m),
+    });
+    const r = await executeBuyOrder(d, buyParams(orders));
+    const recon = msgs.find(m => m.includes('[US-RECON'));
+    expect(recon).toMatch(/rsp_cd=02679/);
+    expect(recon).toMatch(/classification=EMPTY/);
+    expect(recon).toMatch(/rawRows=0/);
+    expect(recon).toMatch(/decision=POST_ALLOWED/);
+    expect(r.status).toBe('placed-filled');   // EMPTY(정상 0건) → 허용
+    // 안전장치 유지: candle lock, 일일카운트, pending 해소
+    expect(orders.hasOrderedCandle('20260706093000', 'buy')).toBe(true);
+    expect(orders.buyCountToday('20260706')).toBe(1);
+    expect(orders.hasPending()).toBe(false);
+  });
+
   it('[US-RECON] 진단 로그가 queryOk/rsp_cd/order count/decision 을 출력', async () => {
     const orders = new OrderStore('AAPL', dir);
     const msgs: string[] = [];

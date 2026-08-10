@@ -693,11 +693,19 @@ export interface LSOrderExec { ordNo: string; orgOrdNo: string; symbol: string; 
 //   BUSINESS_ERROR  = HTTP200+JSON 이나 성공/empty 목록에 없는 unknown 업무코드 → fail-closed 차단
 //   TRANSPORT_ERROR = network/timeout/HTTP>=400/빈응답/parse/호출제한 → 차단
 export type OrderExecClassification = 'SUCCESS' | 'EMPTY' | 'BUSINESS_ERROR' | 'TRANSPORT_ERROR';
-export function classifyOrderExec(input: { transportError?: boolean; rspCd: string; successCodes: string[]; emptyCodes: string[] }): OrderExecClassification {
+// ── P0-27b: COSAQ00102 "정상 자료없음" EMPTY 코드 기본값 — 실계정 실측 확정분 ──
+//   02679 "조회내역이 없습니다." = 오늘 주문 0건 상태의 정상 응답(HTTP200·envelope 존재·rawRows=0, 실측 확인).
+//   ⚠️ 이 목록의 코드는 rows=0 + 정상 envelope 일 때만 EMPTY. rows>0/비정상 envelope 이면 fail-closed(BUSINESS_ERROR).
+export const LS_US_ORDEREXEC_EMPTY_CODES: string[] = ['02679'];
+export function classifyOrderExec(input: { transportError?: boolean; rspCd: string; successCodes: string[]; emptyCodes: string[]; rowCount?: number; hasEnvelope?: boolean }): OrderExecClassification {
   if (input.transportError) return 'TRANSPORT_ERROR';
-  if (input.successCodes.includes(input.rspCd)) return 'SUCCESS';
-  if (input.emptyCodes.includes(input.rspCd)) return 'EMPTY';
-  return 'BUSINESS_ERROR';   // unknown non-success → 절대 통과 금지(fail-closed)
+  if (input.successCodes.includes(input.rspCd)) return 'SUCCESS';   // 공식 성공코드 — rows 신뢰(주문 있으면 rows>0 정상)
+  if (input.emptyCodes.includes(input.rspCd)) {
+    // EMPTY 코드는 "자료없음" 이 응답구조로도 일치할 때만 통과: rows=0 + envelope 정상. 아니면 fail-closed.
+    if ((input.rowCount ?? 0) === 0 && input.hasEnvelope !== false) return 'EMPTY';
+    return 'BUSINESS_ERROR';   // 02679 인데 rows>0 또는 envelope 비정상 → 통과 금지
+  }
+  return 'BUSINESS_ERROR';   // 그 밖의 unknown non-success → 절대 통과 금지(fail-closed)
 }
 // queryOk 는 SUCCESS/EMPTY 에서만 true. (POST 허용은 호출측이 classification 으로 재확인)
 export interface LSOrderExecResult {
@@ -718,7 +726,8 @@ export async function queryLSUSOrderExec(
     },
   };
   const successCodes = LS_SUCCESS_CODES['COSAQ00102'] ?? ['00000'];
-  const emptyCodes = opts.emptyCodes ?? [];   // ⚠️ 실계정 실측 확인분만. 기본 없음(unknown 은 fail-closed 차단).
+  // 실측 확정 기본값(02679) 은 항상 포함 + 사용자 env 추가분 병합(req1·6 — 별도 설정 없어도 02679 적용).
+  const emptyCodes = [...LS_US_ORDEREXEC_EMPTY_CODES, ...(opts.emptyCodes ?? [])];
   try {
     // soft=true: HTTP 200 이면 업무코드여도 throw 없이 반환(호출측 classifyOrderExec 로 엄격 분류). transport 오류는 여전히 throw.
     const { data, rspCd, rspMsg, diag } = await lsPost(token, '/overseas-stock/accno', 'COSAQ00102', inb, { soft: true });
@@ -730,9 +739,10 @@ export async function queryLSUSOrderExec(
       ordQty: toNum(r.OrdQty), execQty: toNum(r.ExecQty), unfilledQty: toNum(r.UnercQty),
       ordPrc: toNum(r.OvrsOrdPrc), ordPtnCode: String(r.OrdPtnCode ?? ''), trxNm: String(r.OrdTrxPtnNm ?? ''),
     }));
-    const classification = classifyOrderExec({ rspCd, successCodes, emptyCodes });
+    // rows/envelope 를 함께 판정 — 02679 라도 rows>0/비정상 envelope 이면 EMPTY 아님(fail-closed, req3).
+    const classification = classifyOrderExec({ rspCd, successCodes, emptyCodes, rowCount: rows.length, hasEnvelope });
     const queryOk = classification === 'SUCCESS' || classification === 'EMPTY';
-    // BUSINESS_ERROR(unknown 코드)면 rows 를 신뢰하지 않는다(비워서 반환) — 잘못된 0건 통과 방지.
+    // BUSINESS_ERROR(unknown 코드/불일치)면 rows 를 신뢰하지 않는다(비워서 반환) — 잘못된 0건 통과 방지.
     return { queryOk, classification, rspCd, rspMsg, rows: queryOk ? rows : [], hasEnvelope, diag, httpStatus: diag.status };
   } catch (e) {
     // 여기 도달 = transport 실패(네트워크/timeout/빈응답/JSON오류/HTTP>=400/호출제한). 안전차단.

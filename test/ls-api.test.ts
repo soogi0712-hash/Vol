@@ -3,7 +3,7 @@ import {
   getLSAccessToken, getLSKRBalance, getLSUSBalance,
   getLSKRPrice, getLSUSPrice, getLSKR15Min, getLSUS15Min, getLSUS15MinPaged,
   getLSUSTicks, getLSUSTicksPaged, lsOverseasChartRaw,
-  placeLSUSBuyOrder, queryLSUSOrderExec, classifyOrderExec, getLSUSDeposit, getLSUSHoldings, cancelLSUSOrder, LS_CANCEL_TR_CONFIRMED, isUSOrderSuccess,
+  placeLSUSBuyOrder, queryLSUSOrderExec, classifyOrderExec, LS_US_ORDEREXEC_EMPTY_CODES, getLSUSDeposit, getLSUSHoldings, cancelLSUSOrder, LS_CANCEL_TR_CONFIRMED, isUSOrderSuccess,
   decideUSCashPayment, usCashOnlyUsdCap, usOrderableQty, formatCashOrderableLine,
   evaluateCrossWon, formatCrossWonCheck, formatCrossWonLiveCand, formatUSLiveGate, maskLSResponse, CROSS_WON_ADOPTED_FIELD, LS_US_CROSS_WON_TR_CONFIRMED, type LSUSDeposit,
   placeLSKRBuyOrder, queryLSKROrderExec, cancelLSKRBuyOrder, krIsuNo, isKROrderSuccess, getLSKRStockMaster,
@@ -516,10 +516,37 @@ describe('해외 주문/체결/예수금 (공식 필드)', () => {
   it('P0-27a: classifyOrderExec 순수함수 — 4분류 fail-closed', () => {
     const sc = ['00000']; const ec = ['00600'];
     expect(classifyOrderExec({ rspCd: '00000', successCodes: sc, emptyCodes: ec })).toBe('SUCCESS');
-    expect(classifyOrderExec({ rspCd: '00600', successCodes: sc, emptyCodes: ec })).toBe('EMPTY');
+    expect(classifyOrderExec({ rspCd: '00600', successCodes: sc, emptyCodes: ec, rowCount: 0, hasEnvelope: true })).toBe('EMPTY');
     expect(classifyOrderExec({ rspCd: '99999', successCodes: sc, emptyCodes: ec })).toBe('BUSINESS_ERROR');   // unknown → 차단
     expect(classifyOrderExec({ rspCd: '00600', successCodes: sc, emptyCodes: [] })).toBe('BUSINESS_ERROR');   // 미등록 → 차단
     expect(classifyOrderExec({ transportError: true, rspCd: '00000', successCodes: sc, emptyCodes: ec })).toBe('TRANSPORT_ERROR');
+  });
+  it('P0-27b: 기본 EMPTY allow-list 에 02679 영구 등록', () => {
+    expect(LS_US_ORDEREXEC_EMPTY_CODES).toContain('02679');
+  });
+  it('P0-27b: classifyOrderExec — 02679 는 rows=0+정상envelope 만 EMPTY, rows>0/비정상 envelope 은 fail-closed', () => {
+    const sc = ['00000']; const ec = ['02679'];
+    expect(classifyOrderExec({ rspCd: '02679', successCodes: sc, emptyCodes: ec, rowCount: 0, hasEnvelope: true })).toBe('EMPTY');
+    expect(classifyOrderExec({ rspCd: '02679', successCodes: sc, emptyCodes: ec, rowCount: 2, hasEnvelope: true })).toBe('BUSINESS_ERROR');   // rows>0 → 차단
+    expect(classifyOrderExec({ rspCd: '02679', successCodes: sc, emptyCodes: ec, rowCount: 0, hasEnvelope: false })).toBe('BUSINESS_ERROR'); // envelope 비정상 → 차단
+  });
+  it('P0-27b: 실계정 02679(조회내역 없음)+rawRows0+envelope → EMPTY·queryOk=true (env 없이 기본 적용, req1·2·6)', async () => {
+    stubFetch(() => ({ status: 200, json: { rsp_cd: '02679', rsp_msg: '조회내역이 없습니다.', COSAQ00102OutBlock3: [] } }));
+    const r = await queryLSUSOrderExec(cfg, 'T', { exchcd: '82', symbol: 'AAPL', ordDate: '20260810' });   // ★ emptyCodes 미주입
+    expect(r.classification).toBe('EMPTY');
+    expect(r.queryOk).toBe(true);
+    expect(r.rows).toEqual([]);
+    expect(r.rspCd).toBe('02679');
+    expect(r.hasEnvelope).toBe(true);
+  });
+  it('P0-27b: 02679 인데 rows>0(비정상) → BUSINESS_ERROR 차단(fail-closed, req3)', async () => {
+    stubFetch(() => ({ status: 200, json: { rsp_cd: '02679', rsp_msg: '조회내역이 없습니다.', COSAQ00102OutBlock3: [
+      { OrdNo: 5, ShtnIsuNo: 'AAPL', OrdQty: 1, ExecQty: 0, UnercQty: 1, OrdPtnCode: '02' },
+    ] } }));
+    const r = await queryLSUSOrderExec(cfg, 'T', { exchcd: '82', symbol: 'AAPL', ordDate: '20260810' });
+    expect(r.classification).toBe('BUSINESS_ERROR');
+    expect(r.queryOk).toBe(false);
+    expect(r.rows).toEqual([]);   // 신뢰하지 않음
   });
 
   // COSOQ02701 공식 응답 모의(OutBlock3 통화별 + OutBlock4 원화요약). USD현금/선환전/환율/원화현금/미수 지정.
