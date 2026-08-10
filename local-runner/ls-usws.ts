@@ -106,22 +106,27 @@ async function main() {
     log.info(`[BOOT-STEP] 2 load-us-universe-start exgubun=[${exgubunList.join(',')}]`);
     try {
       const uni = await loadUSUniverse(cfg, token, exgubunList, getLSUSStockMasterPage, {
-        includeEtf, maxPages: 40, readcnt: 500, timeoutMs: 10000,
-        // 요구 1: 각 g3190 요청/응답을 단계별로 계측(어디서 멈추는지 즉시 확인)
+        includeEtf, maxPages: 60, readcnt: 500, timeoutMs: 10000,
+        // 요구 1: 각 g3190 요청/응답(시장별 page/cts/rows/신규행/종료사유)을 계측
         onPage: (i) => {
-          log.info(`[BOOT-STEP] 3 g3190-request exgubun=${i.exgubun} page=${i.page} cts='${i.ctsIn}'`);
-          log.info(`[BOOT-STEP] 4 g3190-response exgubun=${i.exgubun} page=${i.page} rows=${i.rows} rsp_cd=${i.rspCd} ctsOut='${i.ctsOut}'${i.stop ? ` stop=${i.stop}` : ''}`);
+          log.info(`[BOOT-STEP] 3 g3190-request exgubun=${i.exgubun} page=${i.page} tr_cont=${i.trContIn} tr_cont_key='${i.trContKeyIn}'`);
+          log.info(`[BOOT-STEP] 4 g3190-response exgubun=${i.exgubun} page=${i.page} rows=${i.rows} newRows=${i.newRows} rsp_cd=${i.rspCd} resTrCont='${i.resTrCont}'${i.stop ? ` stop=${i.stop}` : ''}`);
         },
       });
       const exSum = Object.entries(uni.excludedByReason).map(([k, v]) => `${k}=${v}`).join(' ');
-      log.info(`[BOOT-STEP] 5 load-us-universe-done total=${uni.total} eligible=${uni.eligible.length} ok=${uni.ok}`);
-      if (!uni.ok) log.error(`[US-UNIVERSE] 일부/전체 로드 실패 — ${uni.note}`);
-      log.info(`[US-UNIVERSE] total=${uni.total} eligible=${uni.eligible.length} NASDAQ=${uni.eligiblePerExchange.NASDAQ} NYSE_AMEX=${uni.eligiblePerExchange.NYSE_AMEX} excluded=${uni.excluded} (${exSum || '없음'}) · ${uni.note}`);
+      const allMarkets = uni.eligiblePerExchange.NASDAQ > 0 && uni.eligiblePerExchange.NYSE_AMEX > 0;
+      const complete = uni.ok && uni.complete !== false && allMarkets;
+      log.info(`[BOOT-STEP] 5 load-us-universe-done total=${uni.total} eligible=${uni.eligible.length} ok=${uni.ok} complete=${complete}`);
+      // 요구 2·3: continuation 오류/미완료면 성공/준비완료로 보고 금지, 명확히 오류 표기.
+      if (uni.complete === false) log.error(`[US-UNIVERSE] ⚠️ continuation 오류/미완료 — 전체 유니버스 아님(중복페이지 또는 상한). ${uni.note}`);
+      if (!allMarkets) log.error(`[US-UNIVERSE] ⚠️ 전체시장 아님 — NASDAQ=${uni.eligiblePerExchange.NASDAQ} NYSE_AMEX(81)=${uni.eligiblePerExchange.NYSE_AMEX}. exgubun=[${exgubunList.join(',')}] 로 NYSE/AMEX 미포함 가능 → LS_US_MASTER_EXGUBUN 로 시장별 값 추가 필요(공식 값 미기재).`);
+      log.info(`[US-UNIVERSE] total=${uni.total} eligible=${uni.eligible.length} NASDAQ=${uni.eligiblePerExchange.NASDAQ} NYSE_AMEX(81=NYSE+AMEX)=${uni.eligiblePerExchange.NYSE_AMEX} excluded=${uni.excluded} (${exSum || '없음'}) complete=${complete} · ${uni.note}`);
+      if (complete) log.info('[US-UNIVERSE] 전체 유니버스 준비 완료(모든 시장·연속조회 정상 종료)');
+      else log.warn('[US-UNIVERSE] 전체 유니버스 미완료 — "준비 완료" 아님(위 오류 참조). 로드된 부분으로만 관찰 진행.');
       // 라운드로빈 등록: 오늘은 첫 배치(wsMaxSubs)만 구독. 전체는 배치 순환으로 커버(요구 4·6).
       const capReq = Math.max(1, parseInt(process.env.LS_US_REST_REQ_PER_SEC || '1', 10) || 1);   // g3203 개인 1/s·법인 10/s
       const cap = computeScanCapacity(uni.eligible.length, capReq, wsMaxSubs, 900);
-      log.info(`[US-CAPACITY] eligible=${cap.eligible} WS배치=${wsMaxSubs} REST시드/s=${capReq} 전체REST시드1순환=${cap.fullCycleSec}s(${(cap.fullCycleSec / 60).toFixed(1)}분) 15분내전종목평가가능=${cap.coversWithinCandle}`);
-      if (!cap.coversWithinCandle) log.warn(`[US-CAPACITY] ⚠️ 개인계정 REST ${capReq}/s 로는 eligible ${cap.eligible} 종목의 15분봉 워밍/평가를 15분(900s) 안에 전부 못함(약 ${(cap.fullCycleSec / 60).toFixed(1)}분). WS 배치 순환으로 순차 커버. 법인(10/s) 필요.`);
+      log.info(`[US-CAPACITY] eligible=${cap.eligible}(${complete ? '전체시장' : '부분/미완료'}) WS배치=${wsMaxSubs} REST시드/s=${capReq} 전체REST시드1순환=${cap.fullCycleSec}s(${(cap.fullCycleSec / 60).toFixed(1)}분) 15분내전종목평가가능=${cap.coversWithinCandle}${complete ? '' : ' ⚠️(부분집합 기준 — 성공 아님)'}`);
       const uniSubs = uni.eligible.slice(0, wsMaxSubs).map(r => ({ symbol: r.symbol, exchange: r.market === 'NASDAQ' ? 'NASDAQ' : 'NYSE', exchcd: r.exchcd }));
       const merged = new Map(subs.map(s => [s.symbol, s]));
       for (const s of uniSubs) if (!merged.has(s.symbol)) merged.set(s.symbol, s);

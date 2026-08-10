@@ -409,14 +409,15 @@ export function parseLSUSMasterRow(r: any): LSUSMasterRow {
     marketcap: toNum(r.marketcap),
   };
 }
-// 한 페이지(readcnt) 조회. cts_value='' 로 시작, 응답 cts_value 를 다음 호출에 넘겨 페이징.
-export async function getLSUSStockMasterPage(cfg: LSConfig, token: string, p: { natcode?: string; exgubun: string; readcnt?: number; ctsValue?: string; delaygb?: string; timeoutMs?: number }): Promise<{ rspCd: string; rspMsg: string; rows: LSUSMasterRow[]; ctsValue: string; recCount: number; diag: LSHttpDiag }> {
+// 한 페이지(readcnt) 조회. ⚠️ LS REST 연속조회는 HTTP 헤더 tr_cont='Y' + tr_cont_key(이전 응답 헤더) 방식이
+//   공식(g3203 과 동일, 라인 493 확인). body cts_value 는 응답값을 echo(보조). 응답 헤더 tr_cont/tr_cont_key 로 종료판정.
+export async function getLSUSStockMasterPage(cfg: LSConfig, token: string, p: { natcode?: string; exgubun: string; readcnt?: number; ctsValue?: string; trCont?: string; trContKey?: string; delaygb?: string; timeoutMs?: number }): Promise<{ rspCd: string; rspMsg: string; rows: LSUSMasterRow[]; ctsValue: string; recCount: number; resTrCont: string; resTrContKey: string; diag: LSHttpDiag }> {
   const { data, rspCd, rspMsg, diag } = await lsPost(token, '/overseas-stock/market-data', 'g3190', {
     g3190InBlock: { delaygb: p.delaygb ?? 'R', natcode: p.natcode ?? 'US', exgubun: p.exgubun, readcnt: p.readcnt ?? 500, cts_value: p.ctsValue ?? '' },
-  }, { timeoutMs: p.timeoutMs ?? 10000 });   // g3190 페이지당 10s 타임아웃(무한대기 방지)
+  }, { trCont: p.trCont ?? 'N', trContKey: p.trContKey ?? '', timeoutMs: p.timeoutMs ?? 10000 });   // 공식 헤더 연속조회 + 10s 타임아웃
   const raw: any[] = data.g3190OutBlock1 || [];
   const ob = data.g3190OutBlock || {};
-  return { rspCd, rspMsg, rows: raw.map(parseLSUSMasterRow), ctsValue: String(ob.cts_value ?? ''), recCount: toNum(ob.rec_count), diag };
+  return { rspCd, rspMsg, rows: raw.map(parseLSUSMasterRow), ctsValue: String(ob.cts_value ?? ''), recCount: toNum(ob.rec_count), resTrCont: diag.trCont, resTrContKey: diag.trContKey, diag };
 }
 
 // ── 해외 15분봉 (g3203, ncnt=15) — OutBlock1: date/loctime/open/high/low/close/exevol ──

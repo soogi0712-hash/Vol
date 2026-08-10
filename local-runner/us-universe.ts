@@ -28,6 +28,7 @@ export function classifyUSSymbol(row: LSUSMasterRow, opts: USUniverseOpts = {}):
 
 export interface USUniverse {
   ok: boolean;
+  complete?: boolean;   // 모든 exgubun 이 공식 헤더 종료(tr_cont≠'Y')로 완료됐는가. continuation 오류/상한이면 false.
   total: number;
   eligible: LSUSMasterRow[];
   excluded: number;
@@ -55,10 +56,10 @@ export function buildUSUniverse(rows: LSUSMasterRow[], opts: USUniverseOpts = {}
 // g3190 페이징 로드(cts_value 연속조회) → 전 종목 병합(keysymbol dedup) → 필터.
 //   exgubunList: 공식 exgubun 값 목록(값 의미 미기재 → 주입). 각 값을 페이징 로드해 병합.
 export interface USUniverseLoadOpts extends USUniverseOpts {
-  maxPages?: number;      // exgubun 당 최대 페이지(무한루프 방지). 기본 40
+  maxPages?: number;      // exgubun 당 최대 페이지(무한루프 방지). 기본 60
   readcnt?: number;       // 페이지당 요청 행수. 기본 500
   timeoutMs?: number;     // g3190 요청당 타임아웃. 기본 10000
-  onPage?: (info: { exgubun: string; page: number; ctsIn: string; ctsOut: string; rows: number; rspCd: string; stop: string | null }) => void;
+  onPage?: (info: { exgubun: string; page: number; trContIn: string; trContKeyIn: string; resTrCont: string; rows: number; newRows: number; rspCd: string; stop: string | null }) => void;
 }
 export async function loadUSUniverse(
   cfg: LSConfig, token: string,
@@ -66,43 +67,45 @@ export async function loadUSUniverse(
   fetchPage: typeof getLSUSStockMasterPage = getLSUSStockMasterPage,
   opts: USUniverseLoadOpts = {},
 ): Promise<USUniverse> {
-  const maxPages = opts.maxPages ?? 40;
+  const maxPages = opts.maxPages ?? 60;
   const readcnt = opts.readcnt ?? 500;
   const timeoutMs = opts.timeoutMs ?? 10000;
   const seen = new Map<string, LSUSMasterRow>();
   const notes: string[] = [];
   let ok = true;
+  let complete = true;   // 모든 exgubun 이 헤더 종료(tr_cont≠'Y')로 깔끔히 끝나야 true. 오류/중복/상한이면 false.
   for (const exgubun of exgubunList) {
-    let cts = '';
-    let pages = 0;
-    let rowsForGubun = 0;
+    let trCont = 'N'; let trContKey = ''; let cts = '';
+    let pages = 0; let rowsForGubun = 0;
     try {
       for (;;) {
-        const ctsIn = cts;
-        const r = await fetchPage(cfg, token, { exgubun, ctsValue: cts, readcnt, timeoutMs });
-        for (const row of r.rows) if (row.keysymbol && !seen.has(row.keysymbol)) seen.set(row.keysymbol, row);
-        rowsForGubun += r.rows.length;
+        const r = await fetchPage(cfg, token, { exgubun, trCont, trContKey, ctsValue: cts, readcnt, timeoutMs });
         pages++;
-        const ctsOut = (r.ctsValue ?? '').trim();
-        // 종료조건(무한루프 방지, 요구 2·4): 여러 공식/방어 조건 중 하나라도 만족 시 종료.
+        let newRows = 0;
+        for (const row of r.rows) if (row.keysymbol && !seen.has(row.keysymbol)) { seen.set(row.keysymbol, row); newRows++; }
+        rowsForGubun += r.rows.length;
+        const resTrCont = (r.resTrCont ?? '').trim();
+        const resTrContKey = (r.resTrContKey ?? '').trim();
+        // ── 종료/오류 판정 — 공식 헤더 연속조회 기준(요구 1·2·4) ──
         let stop: string | null = null;
-        if (r.rows.length === 0) stop = 'ROWS_0';                       // 빈 페이지
-        else if (r.rows.length < readcnt) stop = 'LAST_PAGE(rows<readcnt)'; // 마지막 페이지(요청보다 적음)
-        else if (ctsOut === '' ) stop = 'CTS_EMPTY';                    // 연속키 없음
-        else if (/^0+$/.test(ctsOut)) stop = 'CTS_ZERO';               // 연속키 0
-        else if (ctsOut === ctsIn.trim()) stop = 'CTS_UNCHANGED';       // ★ 연속키 안 바뀜 → 서버가 끝났거나 버그 → 종료
-        else if (pages >= maxPages) stop = `MAX_PAGES(${maxPages})`;    // 상한 도달
-        opts.onPage?.({ exgubun, page: pages, ctsIn, ctsOut, rows: r.rows.length, rspCd: r.rspCd, stop });
+        if (r.rows.length === 0) stop = 'ROWS_0';                                  // 빈 페이지 → 종료(정상)
+        else if (resTrCont !== 'Y' || !resTrContKey) stop = 'DONE(tr_cont≠Y)';    // ★ 공식 종료 신호(헤더) → 정상 완료
+        else if (pages > 1 && newRows === 0) { stop = 'CONTINUATION_DUP'; ok = false; complete = false; }   // 연속페이지인데 전부 중복 → continuation 오류(요구 2)
+        else if (resTrContKey === trContKey && trContKey !== '') { stop = 'CONTINUATION_STUCK'; ok = false; complete = false; }   // tr_cont_key 안 바뀜 → 진행 불가
+        else if (pages >= maxPages) { stop = `MAX_PAGES(${maxPages})`; complete = false; }   // 상한(전체 다 못 읽음) → 미완료
+        opts.onPage?.({ exgubun, page: pages, trContIn: trCont, trContKeyIn: trContKey, resTrCont, rows: r.rows.length, newRows, rspCd: r.rspCd, stop });
         if (stop) break;
-        cts = ctsOut;
+        // 다음 페이지: 공식 헤더 연속조회
+        trCont = 'Y'; trContKey = resTrContKey; cts = (r.ctsValue ?? '').trim();
       }
-      notes.push(`exgubun=${exgubun} pages=${pages} rows=${rowsForGubun}`);
+      notes.push(`exgubun=${exgubun} pages=${pages} rows=${rowsForGubun} new=${[...seen.keys()].length}`);
     } catch (e) {
-      ok = false;
+      ok = false; complete = false;
       notes.push(`exgubun=${exgubun} 조회실패:${e instanceof Error ? e.message : String(e)}`);
     }
   }
-  return buildUSUniverse([...seen.values()], opts, ok, notes.join(' · '));
+  const u = buildUSUniverse([...seen.values()], opts, ok, notes.join(' · '));
+  return { ...u, complete };
 }
 
 // ── LIVE 후보 선정(요구 11) — AAPL 하드코딩 제거. 랭킹 1위부터 준비완료+eligible 후보를 선택 ──

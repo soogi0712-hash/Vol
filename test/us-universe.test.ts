@@ -58,49 +58,51 @@ describe('P0-23 US 유니버스 eligibility 필터', () => {
     expect(u.eligiblePerExchange.NYSE_AMEX).toBe(1);
   });
 
-  it('P0-23 anti-hang: cts_value 안 바뀌면 무한루프 아니라 CTS_UNCHANGED 로 종료', async () => {
-    let call = 0; const stops: (string | null)[] = [];
-    const stuck = async (_c: any, _t: string, p: { exgubun: string; ctsValue?: string }) => {
-      call++;
-      return { rspCd: '00000', rspMsg: '', diag: {} as any, recCount: 2, ctsValue: 'SAME', rows: [row({ keysymbol: '82A' + call, symbol: 'A' + call }), row({ keysymbol: '82B' + call, symbol: 'B' + call })] };
+  it('P0-23 continuation: 공식 헤더(tr_cont/tr_cont_key)로 페이징 + tr_cont≠Y 에서 정상 종료', async () => {
+    const conts: string[] = []; const keys: string[] = []; const stops: (string | null)[] = [];
+    let call = 0;
+    const page = async (_c: any, _t: string, p: { exgubun: string; trCont?: string; trContKey?: string }) => {
+      call++; conts.push(p.trCont ?? ''); keys.push(p.trContKey ?? '');
+      if (call === 1) return { rspCd: '00000', rspMsg: '', diag: {} as any, recCount: 2, ctsValue: '', resTrCont: 'Y', resTrContKey: 'KEY1', rows: [row({ keysymbol: '82AAPL', symbol: 'AAPL' }), row({ keysymbol: '82MSFT', symbol: 'MSFT' })] };
+      return { rspCd: '00000', rspMsg: '', diag: {} as any, recCount: 1, ctsValue: '', resTrCont: 'N', resTrContKey: '', rows: [row({ keysymbol: '81BA', symbol: 'BA', exchcd: '81', market: 'NYSE_AMEX' })] };
     };
-    const u = await loadUSUniverse({} as any, 'T', ['2'], stuck as any, { readcnt: 2, onPage: (i) => stops.push(i.stop) });
-    expect(call).toBe(2);                     // ★ page1(cts='')→page2(cts='SAME')→ 같은 cts 반복 감지 종료
-    expect(stops[1]).toBe('CTS_UNCHANGED');   // 무한루프 아님
-    expect(u.ok).toBe(true);
+    const u = await loadUSUniverse({} as any, 'T', ['2'], page as any, { readcnt: 2, onPage: (i) => stops.push(i.stop) });
+    expect(conts).toEqual(['N', 'Y']);        // page2 는 헤더 tr_cont='Y'
+    expect(keys).toEqual(['', 'KEY1']);       // page2 는 이전 응답 tr_cont_key
+    expect(stops[1]).toBe('DONE(tr_cont≠Y)'); // 공식 종료 신호
+    expect(u.total).toBe(3);
+    expect(u.ok).toBe(true); expect(u.complete).toBe(true);
   });
-  it('P0-23 anti-hang: rows<readcnt → LAST_PAGE 로 종료(1페이지)', async () => {
-    let call = 0;
-    const last = async () => { call++; return { rspCd: '00000', rspMsg: '', diag: {} as any, recCount: 1, ctsValue: 'X', rows: [row({ keysymbol: '82AAPL', symbol: 'AAPL' })] }; };
-    const u = await loadUSUniverse({} as any, 'T', ['2'], last as any, { readcnt: 500 });
-    expect(call).toBe(1);
-    expect(u.eligible.length).toBe(1);
+  it('P0-23 continuation 오류: 연속페이지가 전부 중복 → CONTINUATION_DUP, ok=false/complete=false (성공 아님)', async () => {
+    const dupPage = async () => ({ rspCd: '00000', rspMsg: '', diag: {} as any, recCount: 2, ctsValue: '', resTrCont: 'Y', resTrContKey: 'SAME', rows: [row({ keysymbol: '82AAPL', symbol: 'AAPL' }), row({ keysymbol: '82MSFT', symbol: 'MSFT' })] });
+    const stops: (string | null)[] = [];
+    const u = await loadUSUniverse({} as any, 'T', ['2'], dupPage as any, { readcnt: 2, onPage: (i) => stops.push(i.stop) });
+    // page1 신규2 → page2 tr_cont_key 'SAME' 반복 → CONTINUATION_STUCK 또는 DUP
+    expect(u.ok).toBe(false); expect(u.complete).toBe(false);
+    expect(stops.at(-1)).toMatch(/CONTINUATION/);
   });
-  it('P0-23 anti-hang: maxPages 상한 도달 시 종료(무한 아님)', async () => {
+  it('P0-23 anti-hang: maxPages 상한 → complete=false (미완료로 표기)', async () => {
     let call = 0;
-    const infinite = async () => { call++; return { rspCd: '00000', rspMsg: '', diag: {} as any, recCount: 2, ctsValue: 'C' + call, rows: [row({ keysymbol: '82S' + call, symbol: 'S' + call }), row({ keysymbol: '82T' + call, symbol: 'T' + call })] }; };
+    const infinite = async () => { call++; return { rspCd: '00000', rspMsg: '', diag: {} as any, recCount: 2, ctsValue: '', resTrCont: 'Y', resTrContKey: 'K' + call, rows: [row({ keysymbol: '82S' + call, symbol: 'S' + call }), row({ keysymbol: '82T' + call, symbol: 'T' + call })] }; };
     const u = await loadUSUniverse({} as any, 'T', ['2'], infinite as any, { readcnt: 2, maxPages: 5 });
-    expect(call).toBe(5);   // ★ cts 매번 달라도 maxPages 에서 종료
-    expect(u.ok).toBe(true);
+    expect(call).toBe(5);
+    expect(u.complete).toBe(false);   // 상한 = 전체 못 읽음
   });
-  it('P0-23 anti-hang: 요청 실패(타임아웃 등) → ok=false + 조회실패 note (무한대기 아님)', async () => {
+  it('P0-23 anti-hang: 요청 실패(타임아웃) → ok=false + complete=false + 조회실패 note', async () => {
     const boom = async () => { throw new Error('타임아웃(10000ms 초과)'); };
     const u = await loadUSUniverse({} as any, 'T', ['2'], boom as any, {});
-    expect(u.ok).toBe(false);
+    expect(u.ok).toBe(false); expect(u.complete).toBe(false);
     expect(u.note).toMatch(/조회실패/);
   });
-
-  it('loadUSUniverse — cts_value 페이징 + keysymbol dedup', async () => {
-    let call = 0;
-    const fakePage = async (_c: any, _t: string, p: { exgubun: string; ctsValue?: string }) => {
-      call++;
-      if (p.ctsValue === '' || p.ctsValue == null) return { rspCd: '00000', rspMsg: '', diag: {} as any, recCount: 2, ctsValue: 'PAGE2', rows: [row({ keysymbol: '82AAPL', symbol: 'AAPL' }), row({ keysymbol: '82MSFT', symbol: 'MSFT' })] };
-      return { rspCd: '00000', rspMsg: '', diag: {} as any, recCount: 1, ctsValue: '0000', rows: [row({ keysymbol: '82MSFT', symbol: 'MSFT' }), row({ keysymbol: '81BA', symbol: 'BA', exchcd: '81', market: 'NYSE_AMEX' })] };
+  it('P0-23 다시장: exgubun 여러 값 로드 시 NASDAQ+NYSE_AMEX 병합', async () => {
+    const page = async (_c: any, _t: string, p: { exgubun: string }) => {
+      if (p.exgubun === '2') return { rspCd: '00000', rspMsg: '', diag: {} as any, recCount: 1, ctsValue: '', resTrCont: 'N', resTrContKey: '', rows: [row({ keysymbol: '82AAPL', symbol: 'AAPL', exchcd: '82', market: 'NASDAQ' })] };
+      return { rspCd: '00000', rspMsg: '', diag: {} as any, recCount: 1, ctsValue: '', resTrCont: 'N', resTrContKey: '', rows: [row({ keysymbol: '81BA', symbol: 'BA', exchcd: '81', market: 'NYSE_AMEX' })] };
     };
-    const u = await loadUSUniverse({} as any, 'T', ['2'], fakePage as any, { readcnt: 2 });
-    expect(call).toBe(2);                 // page1(cts='',2행)→page2(cts=PAGE2,2행)→cts=0000 종료
-    expect(u.total).toBe(3);              // AAPL, MSFT(dedup), BA
-    expect(u.eligible.length).toBe(3);
+    const u = await loadUSUniverse({} as any, 'T', ['2', '3'], page as any, {});
+    expect(u.eligiblePerExchange.NASDAQ).toBe(1);
+    expect(u.eligiblePerExchange.NYSE_AMEX).toBe(1);
+    expect(u.complete).toBe(true);
   });
 });
 
