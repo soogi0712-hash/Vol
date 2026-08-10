@@ -165,6 +165,17 @@ async function main() {
   try { liveCfg = loadLiveConfig(); } catch (e) { log.error(String(e)); process.exit(1); return; }
   const armedMode = liveCfg.armed;
 
+  // ── WebSocket 계좌이벤트(AS0~AS4) 등록 토글 — 원인 격리용(req 3) ──
+  //   LS_US_WS_ACCOUNT_EVENTS=false → GSC/GSH 만 등록(AS 미등록)으로 close 원인 분리.
+  //   LS_US_WS_DEFER_ACCOUNT=false → AS 를 open 즉시 등록(기본은 첫 데이터 수신 후 지연 등록).
+  const usAccountEvents = process.env.LS_US_WS_ACCOUNT_EVENTS !== 'false';
+  const usDeferAccountEvents = process.env.LS_US_WS_DEFER_ACCOUNT !== 'false';
+  log.info(`[WS-CFG] accountEvents=${usAccountEvents} deferAccountEvents=${usDeferAccountEvents} (격리 테스트: LS_US_WS_ACCOUNT_EVENTS=false 로 AS 미등록)`);
+
+  // ── 거래 0건 사유별 카운터(req 9) — 매 틱 왜 주문이 안 나갔는지 분류 ──
+  const noTradeCounts = { NO_BUY_SIGNAL: 0, WS_NOT_READY: 0, MARKET_CLOSED: 0, CASH_GATE: 0, PENDING: 0, DAILY_LIMIT: 0, DUPLICATE_CANDLE: 0, WARMUP: 0 };
+  const bumpNoTrade = (k: keyof typeof noTradeCounts) => { noTradeCounts[k]++; };
+
   // ── 현금 주문가능액(해외 예수금) 조회 캐시 + refreshDeposit ── 계좌 단위 60초 캐시. rsp_cd/rsp_msg/전체필드 보존.
   // depCash = cash-only USD 주문가능 상한(USD현금 or 원화현금 선환전, 레버리지 제외, P0-15). depFull = 진단용 원본.
   let depAt = 0; let depCash = 0; let depOk = false; let depRspCd = ''; let depRspMsg = '';
@@ -320,7 +331,15 @@ async function main() {
       }
     },
     onStatus: (m) => log.info(`[WS] ${scrub(m)}`),
-  }, { accountEvents: true });   // AS0~AS4 계좌 이벤트 등록(tr_type=1) — 재연결 시 자동 재등록
+    // req 1: close code/reason/wasClean/lastRegister/connectedDurationMs 반드시 로그
+    onClose: (i) => log.error(`[WS-CLOSE] code=${i.code ?? '-'} reason=${scrub(i.reason) || '-'} wasClean=${i.wasClean ?? '-'} lastRegister=${i.lastRegister || '-'} connectedDurationMs=${i.connectedDurationMs} dataReceived=${i.dataReceived}`),
+    onError: (i) => log.error(`[WS-ERROR] ${scrub(i.message)}`),
+    // req 2: 소켓 open 만으로 LIVE 아님 — 첫 GSC/GSH 데이터 수신 시 LIVE_WS_READY=true
+    onDataReady: () => log.info(`[WS-READY] LIVE_WS_READY=true (첫 GSC/GSH 데이터 수신, 등록응답 정상)`),
+  }, {
+    accountEvents: usAccountEvents,          // AS0~AS4 계좌 이벤트 등록(env 로 격리 테스트 가능)
+    deferAccountEvents: usDeferAccountEvents, // 첫 데이터 수신 후 AS 등록(원인 격리, req 3)
+  });
   client.connect(us.ok.map(s => ({ exchcd: s.exchcd, symbol: s.symbol })));
 
   const traderDeps: TraderDeps = {
@@ -336,7 +355,8 @@ async function main() {
     log: (m) => log.info(scrub(m)),
   };
 
-  async function evaluateArmed(ctx: SymCtx, sig: { action: string; candleDatetime: string }, now: number): Promise<void> {
+  // 반환: 이 틱의 결과 사유(거래 0건 분류용, req 9).
+  async function evaluateArmed(ctx: SymCtx, sig: { action: string; candleDatetime: string }, now: number): Promise<keyof typeof noTradeCounts | 'ORDERED' | 'LIVE_OFF'> {
     const etDate = etDateStr(now);
     const gscAgeSec = ctx.lastGSCat == null ? null : Math.round((now - ctx.lastGSCat) / 1000);
     const gshAgeSec = ctx.lastGSHat == null ? null : Math.round((now - ctx.lastGSHat) / 1000);
@@ -372,16 +392,25 @@ async function main() {
     };
     const g = evaluateTradeGate(state);
     log.info(`[ARMED ${ctx.symbol}] armed=${g.armed} 통과=${g.passed.length}/10 ${cashLog}${g.blockedBy.length ? ` 차단=[${g.blockedBy.join(', ')}]` : ''}`);
-    if (!g.armed) return;
+    if (!g.armed) {
+      // 거래 0건 사유 분류(req 9): 우선순위 pending > dailyLimit > duplicate > cash > no-signal
+      if (pending) return 'PENDING';
+      if (!ctx.orders.canBuyToday(etDate, liveCfg.dailyMaxBuys)) return 'DAILY_LIMIT';
+      if (ctx.orders.hasOrderedCandle(sig.candleDatetime, 'buy')) return 'DUPLICATE_CANDLE';
+      if (sig.action !== 'BUY') return 'NO_BUY_SIGNAL';
+      if (!orderableQtyOk) return 'CASH_GATE';
+      return 'NO_BUY_SIGNAL';
+    }
 
     const live = canExecuteLive(g.armed, liveCfg.liveTrading, { manualCancel: liveCfg.manualCancel, cancelEnvConfirmed: liveCfg.cancelConfirmed });
-    if (!live.execute) { log.info(`[ARMED-READY ${ctx.symbol}] 전 10개 조건 충족 · 매수지정가=${buyPrice}(ask) · 주문 없음 — ${live.reason}`); return; }
-    // ↓ 현재 도달 불가(LIVE off 또는 취소 TR 미확인). 도달 시에도 trader 가 한도/중복/미체결 재검증.
+    if (!live.execute) { log.info(`[ARMED-READY ${ctx.symbol}] 전 10개 조건 충족 · 매수지정가=${buyPrice}(ask) · 주문 없음 — ${live.reason}`); return 'LIVE_OFF'; }
+    // 도달 시 trader 가 한도/중복/미체결 재검증.
     const outcome = await executeBuyOrder(traderDeps, {
       orders: ctx.orders, exchcd: ctx.exchcd, symbol: ctx.symbol, candleDatetime: sig.candleDatetime,
       qty: liveCfg.maxQty, price: buyPrice, etDate, dailyMaxBuys: liveCfg.dailyMaxBuys,
     });
     log.info(`[ORDER-RESULT ${ctx.symbol}] status=${outcome.status} ordNo=${outcome.ordNo ?? '-'} ${outcome.reason}`);
+    return outcome.status === 'placed-filled' || outcome.status === 'placed-pending' ? 'ORDERED' : 'CASH_GATE';
   }
 
   // ── 10초마다 readiness + OBSERVE + ARMED (상태 항목별 출력) ──
@@ -392,8 +421,10 @@ async function main() {
     try {
       for (const ctx of ctxs.values()) {
         const now = Date.now();
+        // req 2: socket open 만으로 연결성공 아님 — 첫 GSC/GSH 데이터(dataReady) 까지 websocketConnected=false 유지.
+        const wsReady = client.connected && client.dataReady;
         const r = evaluateReadiness({
-          websocketConnected: client.connected,
+          websocketConnected: wsReady,
           lastGSCatMs: ctx.lastGSCat,
           lastGSHatMs: ctx.lastGSHat,
           lastPrice: ctx.lastPrice,
@@ -405,7 +436,7 @@ async function main() {
         log.info(
           `[READY ${ctx.symbol}] READY=${r.ready} warmup=${r.warmup}${r.warmup ? ` remaining=${r.warmupRemaining}` : ''}`
           + ` confirmed=${ctx.builder.confirmedCount}/${MIN_RT_CANDLES} forming=${ctx.builder.hasForming}`
-          + ` gscAgeSec=${r.gscAgeSec ?? '-'} gshAgeSec=${r.gshAgeSec ?? '-'} wsConnected=${client.connected}`
+          + ` gscAgeSec=${r.gscAgeSec ?? '-'} gshAgeSec=${r.gshAgeSec ?? '-'} socketOpen=${client.connected} dataReady=${client.dataReady} LIVE_WS_READY=${wsReady} wsAttempt=${client.attemptCount}`
           + ` bid=${ctx.bestBid || '-'} ask=${ctx.bestAsk || '-'} lastPrice=${ctx.lastPrice || '-'}`
           + ` 신규매수허용=${r.allowNewBuy} 신호계산허용=${r.allowSignal} 보유매도허용=${r.allowSellExisting}`
           + (r.reasons.length ? ` | ${r.reasons.join(', ')}` : ''),
@@ -423,7 +454,16 @@ async function main() {
               log.warn(`[RECONCILE ${ctx.symbol}] 미체결 ${ctx.orders.pending.length}건 존재하나 실주문/취소 비활성 → 수동 확인 필요(신규주문 차단)`);
             }
           }
-          if (armedMode && sig && !r.warmup && r.allowSignal) await evaluateArmed(ctx, sig, Date.now());
+          // ── 거래 0건 사유 분류 + 카운터(req 9) ──
+          let reason: keyof typeof noTradeCounts | 'ORDERED' | 'LIVE_OFF';
+          if (!isUSRegularSession(now)) reason = 'MARKET_CLOSED';
+          else if (!client.connected || !client.dataReady || r.stale) reason = 'WS_NOT_READY';   // WS 미연결/데이터 미수신/stale
+          else if (r.warmup) reason = 'WARMUP';
+          else if (armedMode && sig && r.allowSignal) reason = await evaluateArmed(ctx, sig, Date.now());
+          else reason = 'NO_BUY_SIGNAL';
+          if (reason !== 'ORDERED' && reason !== 'LIVE_OFF') bumpNoTrade(reason);
+          const counts = Object.entries(noTradeCounts).filter(([, v]) => v > 0).map(([k, v]) => `${k}=${v}`).join(' ');
+          log.info(`[NO-TRADE-COUNTS ${ctx.symbol}] 이번틱=${reason} · 누적: ${counts || '없음'}`);
         }
       }
     } finally { ticking = false; }

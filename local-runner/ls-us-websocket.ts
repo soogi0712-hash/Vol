@@ -269,22 +269,36 @@ export interface WsLike {
 }
 export type WsFactory = (url: string) => WsLike;
 export interface SymbolSub { exchcd: string; symbol: string; }
+// [WS-CLOSE] 진단 정보(req 1) — 왜 close 되는지 반드시 남긴다.
+export interface WsCloseInfo {
+  code: number | null; reason: string; wasClean: boolean | null;
+  lastRegister: string;          // 이 연결에서 마지막으로 보낸 등록 요약
+  connectedDurationMs: number;   // open~close 유지 시간
+  dataReceived: boolean;         // 이 연결에서 실제 GSC/GSH 데이터를 받았는지
+}
 export interface ClientHooks {
   onGSC?: (t: GSCTick) => void;
   onGSH?: (q: GSHQuote) => void;
   onAccountEvent?: (trCd: string, body: any) => void;         // AS0~AS4 주문 이벤트 원문 body
   onRegisterAck?: (trCd: string, rspCd: string, rspMsg: string) => void;   // 등록 성공/실패 응답
   onStatus?: (msg: string) => void;
+  onClose?: (info: WsCloseInfo) => void;                      // [WS-CLOSE] code/reason/wasClean 등
+  onError?: (info: { message: string }) => void;             // [WS-ERROR] 실제 error 내용
+  onDataReady?: () => void;                                   // 첫 GSC/GSH 데이터 수신(LIVE_WS_READY)
 }
 export interface ClientOpts {
   url?: string;
   wsFactory?: WsFactory;
   staleTimeoutMs?: number;      // 무수신 시 재연결 (기본 45s)
-  backoffMs?: number[];         // 재연결 백오프 (기본 1s,2s,4s,8s,16s)
+  backoffMs?: number[];         // 재연결 백오프 (기본 1s,2s,4s,8s,16s,30s)
+  stableMs?: number;            // 데이터 수신하며 이만큼 유지되면 attempt 리셋 (기본 15s)
   accountEvents?: boolean;      // AS0~AS4 계좌이벤트 등록(tr_type=1). 기본 false.
+  deferAccountEvents?: boolean; // AS 등록을 첫 데이터 수신 후로 지연(원인 격리). 기본 true.
   sleep?: (ms: number) => Promise<void>;
   now?: () => number;
 }
+
+export const WS_BACKOFF_MS = [1000, 2000, 4000, 8000, 16000, 30000];   // 1s→2s→4s→8s→16s→30s(cap)
 
 function defaultWsFactory(url: string): WsLike {
   const G: any = (globalThis as any).WebSocket;
@@ -292,20 +306,37 @@ function defaultWsFactory(url: string): WsLike {
   return new G(url) as WsLike;
 }
 
+// close 이벤트에서 code/reason/wasClean 안전 추출(브라우저/ws/mock 형태 모두 대응).
+function readCloseEvent(ev: any): { code: number | null; reason: string; wasClean: boolean | null } {
+  const code = typeof ev?.code === 'number' ? ev.code : null;
+  const reason = ev?.reason != null ? String(ev.reason) : '';
+  const wasClean = typeof ev?.wasClean === 'boolean' ? ev.wasClean : null;
+  return { code, reason, wasClean };
+}
+
 export class LSUSRealtimeClient {
   private ws: WsLike | null = null;
   private subs: SymbolSub[] = [];
   private closedByUser = false;
-  private isConnected = false;   // onopen~onclose 사이 true (readiness 의 websocketConnected)
+  private isConnected = false;   // onopen~onclose 사이 true (socket open)
+  private dataReadyFlag = false; // 이 프로세스에서 실제 GSC/GSH 데이터 첫 수신 여부(LIVE_WS_READY)
+  private connDataReceived = false;   // 현재 연결에서 데이터 수신 여부(close 진단용)
+  private accountRegistered = false;  // 현재 연결에서 AS 등록 완료 여부(지연 등록 1회)
   private regQueue: string[] = [];   // 등록 전송 순서(등록응답 FIFO 귀속 — 실계정 tr_cd 빈 문자열 대응)
   private lastMsgAt = 0;
+  private connectedAt = 0;
+  private lastRegister = '';
   private staleTimer: ReturnType<typeof setInterval> | null = null;
+  private stableTimer: ReturnType<typeof setTimeout> | null = null;
+  private reconnecting = false;   // 재연결 루프 중복 방지(단일 커넥션 보장)
   private attempt = 0;
   private readonly url: string;
   private readonly factory: WsFactory;
   private readonly staleTimeoutMs: number;
   private readonly backoff: number[];
+  private readonly stableMs: number;
   private readonly accountEvents: boolean;
+  private readonly deferAccountEvents: boolean;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly now: () => number;
 
@@ -313,14 +344,20 @@ export class LSUSRealtimeClient {
     this.url = opts.url ?? LS_WS_URL;
     this.factory = opts.wsFactory ?? defaultWsFactory;
     this.staleTimeoutMs = opts.staleTimeoutMs ?? 45_000;
-    this.backoff = opts.backoffMs ?? [1000, 2000, 4000, 8000, 16000];
+    this.backoff = opts.backoffMs ?? WS_BACKOFF_MS;
+    this.stableMs = opts.stableMs ?? 15_000;
     this.accountEvents = opts.accountEvents ?? false;
+    this.deferAccountEvents = opts.deferAccountEvents ?? true;
     this.sleep = opts.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
     this.now = opts.now ?? (() => Date.now());
   }
 
-  /** 현재 WS 연결 상태(readiness.websocketConnected 입력용). */
+  /** 현재 WS 소켓 open 상태. */
   get connected(): boolean { return this.isConnected; }
+  /** 실제 GSC/GSH 데이터 수신까지 완료(LIVE_WS_READY). socket open 만으로 true 아님(req 2). */
+  get dataReady(): boolean { return this.dataReadyFlag; }
+  /** 현재 재연결 backoff 시도 횟수(진단용). */
+  get attemptCount(): number { return this.attempt; }
 
   connect(subs: SymbolSub[]): void {
     this.subs = subs;
@@ -328,46 +365,86 @@ export class LSUSRealtimeClient {
     this.open();
   }
 
+  // 이전 소켓의 리스너/타이머를 완전히 제거하고 close(단일 커넥션 보장, req 4).
+  private cleanupSocket(): void {
+    const old = this.ws;
+    if (old) {
+      old.onopen = null; old.onmessage = null; old.onclose = null; old.onerror = null;
+      try { old.close(); } catch { /* noop */ }
+    }
+    this.ws = null;
+    this.stopStaleWatch();
+    this.stopStableWatch();
+  }
+
   private open(): void {
-    this.hooks.onStatus?.(`WS 연결 시도 ${this.url}`);
+    this.cleanupSocket();   // 새 연결 전 기존 소켓/타이머 완전 정리(중복 연결 방지)
+    this.hooks.onStatus?.(`WS 연결 시도 ${this.url} (attempt ${this.attempt})`);
     const ws = this.factory(this.url);
     this.ws = ws;
+    this.isConnected = false;
+    this.connDataReceived = false;
+    this.accountRegistered = false;
     ws.onopen = () => {
-      this.attempt = 0;
+      // ⚠️ 여기서 attempt 를 리셋하지 않는다(req 5). 소켓 open 직후 서버가 끊는 storm 방지.
       this.isConnected = true;
+      this.connectedAt = this.now();
       this.lastMsgAt = this.now();
-      this.hooks.onStatus?.('WS 연결됨 → 종목 등록');
-      this.registerAll();
+      this.hooks.onStatus?.('WS 연결됨(소켓 open) → GSC/GSH 등록');
+      this.registerMarketData();
+      // AS 등록: 지연 모드면 첫 데이터 수신 후, 아니면 즉시(원인 격리, req 3)
+      if (this.accountEvents && !this.deferAccountEvents) this.registerAccountEvents();
       this.startStaleWatch();
+      this.startStableWatch();
     };
     ws.onmessage = (ev) => { this.lastMsgAt = this.now(); this.handleMessage(ev.data); };
-    ws.onerror = () => { this.hooks.onStatus?.('WS 오류'); };
-    ws.onclose = () => {
+    ws.onerror = (ev) => {
+      const message = ev?.message ? String(ev.message) : (ev?.error ? String(ev.error) : (ev?.type ? String(ev.type) : 'unknown'));
+      this.hooks.onError?.({ message });
+      this.hooks.onStatus?.(`WS 오류: ${message}`);
+    };
+    ws.onclose = (ev) => {
+      const { code, reason, wasClean } = readCloseEvent(ev);
+      const connectedDurationMs = this.connectedAt ? this.now() - this.connectedAt : 0;
       this.isConnected = false;
       this.stopStaleWatch();
+      this.stopStableWatch();
+      this.hooks.onClose?.({ code, reason, wasClean, lastRegister: this.lastRegister, connectedDurationMs, dataReceived: this.connDataReceived });
       if (this.closedByUser) { this.hooks.onStatus?.('WS 종료(사용자)'); return; }
       void this.reconnect();
     };
   }
 
-  private registerAll(): void {
+  private registerMarketData(): void {
     this.regQueue = [];   // 재연결 시 초기화 — 등록응답(ack) FIFO 귀속용
-    // 시세(GSC/GSH) 등록 — tr_type="3", 종목별 tr_key(18자리 패딩)
+    const keys: string[] = [];
     for (const s of this.subs) {
       const trKey = buildWsTrKey(s.exchcd, s.symbol);
       for (const tr of ['GSC', 'GSH'] as const) {
         this.ws?.send(JSON.stringify(buildRegisterMessage(this.token, tr, trKey, '3')));
         this.regQueue.push(tr);
       }
+      keys.push(`${s.exchcd}${s.symbol}`);
     }
-    // 계좌 주문이벤트(AS0~AS4) 등록 — tr_type="1", tr_key="" (재연결 시에도 자동 재등록)
-    if (this.accountEvents) {
-      for (const tr of LS_ACCOUNT_EVENT_TRS) {
-        this.ws?.send(JSON.stringify(buildRegisterMessage(this.token, tr, '', '1')));
-        this.regQueue.push(tr);
-      }
-      this.hooks.onStatus?.(`계좌이벤트 등록요청 전송(tr_type=1): ${LS_ACCOUNT_EVENT_TRS.join(', ')}`);
+    this.lastRegister = `GSC/GSH[${keys.join(',')}]`;
+  }
+
+  private registerAccountEvents(): void {
+    if (this.accountRegistered) return;
+    this.accountRegistered = true;
+    for (const tr of LS_ACCOUNT_EVENT_TRS) {
+      this.ws?.send(JSON.stringify(buildRegisterMessage(this.token, tr, '', '1')));
+      this.regQueue.push(tr);
     }
+    this.lastRegister += ` +AS[${LS_ACCOUNT_EVENT_TRS.join(',')}]`;
+    this.hooks.onStatus?.(`계좌이벤트 등록요청 전송(tr_type=1): ${LS_ACCOUNT_EVENT_TRS.join(', ')}${this.deferAccountEvents ? ' (첫 데이터 수신 후)' : ''}`);
+  }
+
+  // 실제 시세 데이터 수신 표시 — LIVE_WS_READY, 지연 AS 등록 트리거.
+  private markData(): void {
+    this.connDataReceived = true;
+    if (!this.dataReadyFlag) { this.dataReadyFlag = true; this.hooks.onDataReady?.(); }
+    if (this.accountEvents && this.deferAccountEvents && !this.accountRegistered) this.registerAccountEvents();
   }
 
   private handleMessage(data: any): void {
@@ -387,8 +464,8 @@ export class LSUSRealtimeClient {
       return;
     }
     if (!msg?.body) return;
-    if (trCd === 'GSC') this.hooks.onGSC?.(parseGSC(msg.body));
-    else if (trCd === 'GSH') this.hooks.onGSH?.(parseGSH(msg.body));
+    if (trCd === 'GSC') { this.markData(); this.hooks.onGSC?.(parseGSC(msg.body)); }
+    else if (trCd === 'GSH') { this.markData(); this.hooks.onGSH?.(parseGSH(msg.body)); }
     else if ((LS_ACCOUNT_EVENT_TRS as readonly string[]).includes(trCd)) this.hooks.onAccountEvent?.(trCd, msg.body);   // AS0~AS4
   }
 
@@ -403,18 +480,32 @@ export class LSUSRealtimeClient {
   }
   private stopStaleWatch(): void { if (this.staleTimer) { clearInterval(this.staleTimer); this.staleTimer = null; } }
 
+  // 데이터 수신하며 stableMs 이상 유지되면 attempt=0 리셋(req 5) — 잠깐 붙었다 끊기는 storm 은 리셋 안 함.
+  private startStableWatch(): void {
+    this.stopStableWatch();
+    this.stableTimer = setTimeout(() => {
+      if (this.isConnected && this.connDataReceived && this.attempt !== 0) {
+        this.hooks.onStatus?.(`WS 안정(데이터 수신 ${Math.round(this.stableMs / 1000)}s 유지) → 재연결 attempt 리셋`);
+        this.attempt = 0;
+      }
+    }, this.stableMs);
+  }
+  private stopStableWatch(): void { if (this.stableTimer) { clearTimeout(this.stableTimer); this.stableTimer = null; } }
+
   private async reconnect(): Promise<void> {
+    if (this.reconnecting || this.closedByUser) return;   // 중복 재연결 방지(단일 커넥션)
+    this.reconnecting = true;
     const wait = this.backoff[Math.min(this.attempt, this.backoff.length - 1)];
     this.attempt++;
-    this.hooks.onStatus?.(`WS 재연결 대기 ${wait}ms (attempt ${this.attempt})`);
+    this.hooks.onStatus?.(`WS 재연결 대기 ${wait}ms (attempt ${this.attempt}, 다음 backoff cap=${this.backoff[this.backoff.length - 1]}ms)`);
     await this.sleep(wait);
-    if (!this.closedByUser) this.open();   // 재연결 후 registerAll 로 자동 재등록
+    this.reconnecting = false;
+    if (!this.closedByUser) this.open();   // 재연결 후 registerMarketData 로 자동 재등록
   }
 
   close(): void {
     this.closedByUser = true;
     this.isConnected = false;
-    this.stopStaleWatch();
-    try { this.ws?.close(); } catch { /* noop */ }
+    this.cleanupSocket();
   }
 }

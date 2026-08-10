@@ -168,9 +168,9 @@ describe('LSUSRealtimeClient (fake socket)', () => {
       expect(r.body.tr_key.startsWith('82AAPL')).toBe(true);
     }
   });
-  it('accountEvents=true → GSC/GSH(tr_type=3) + AS0~AS4(tr_type=1, tr_key="") 등록', () => {
+  it('accountEvents=true, deferAccountEvents=false → GSC/GSH(tr_type=3) + AS0~AS4(tr_type=1, tr_key="") 즉시 등록', () => {
     const ws = fakeWs();
-    const client = new LSUSRealtimeClient('TOK', {}, { wsFactory: () => ws, accountEvents: true });
+    const client = new LSUSRealtimeClient('TOK', {}, { wsFactory: () => ws, accountEvents: true, deferAccountEvents: false });
     client.connect([{ exchcd: '82', symbol: 'AAPL' }]);
     ws.onopen?.();
     const regs = ws.sent.map((s) => JSON.parse(s));
@@ -183,7 +183,7 @@ describe('LSUSRealtimeClient (fake socket)', () => {
   it('AS 이벤트 라우팅 + 등록응답(ack) 콜백', () => {
     const ws = fakeWs();
     const events: any[] = []; const acks: any[] = [];
-    const client = new LSUSRealtimeClient('TOK', { onAccountEvent: (tr, b) => events.push({ tr, b }), onRegisterAck: (tr, c, m) => acks.push({ tr, c, m }) }, { wsFactory: () => ws, accountEvents: true });
+    const client = new LSUSRealtimeClient('TOK', { onAccountEvent: (tr, b) => events.push({ tr, b }), onRegisterAck: (tr, c, m) => acks.push({ tr, c, m }) }, { wsFactory: () => ws, accountEvents: true, deferAccountEvents: false });
     client.connect([{ exchcd: '82', symbol: 'AAPL' }]);
     ws.onopen?.();
     ws.onmessage?.({ data: JSON.stringify({ header: { tr_cd: 'AS0', rsp_cd: '0', rsp_msg: '정상등록' }, body: null }) });   // 등록 ack
@@ -195,7 +195,7 @@ describe('LSUSRealtimeClient (fake socket)', () => {
   it('등록응답 tr_cd 가 빈 문자열이어도 FIFO 로 AS0~AS4 귀속(P0-12)', () => {
     const ws = fakeWs();
     const acks: Array<{ tr: string }> = [];
-    const client = new LSUSRealtimeClient('TOK', { onRegisterAck: (tr) => acks.push({ tr }) }, { wsFactory: () => ws, accountEvents: true });
+    const client = new LSUSRealtimeClient('TOK', { onRegisterAck: (tr) => acks.push({ tr }) }, { wsFactory: () => ws, accountEvents: true, deferAccountEvents: false });
     client.connect([{ exchcd: '82', symbol: 'AAPL' }]);
     ws.onopen?.();   // 전송 순서: GSC, GSH, AS0, AS1, AS2, AS3, AS4
     // 등록응답 7건 모두 tr_cd 빈 문자열 → FIFO 로 순서대로 귀속
@@ -205,7 +205,7 @@ describe('LSUSRealtimeClient (fake socket)', () => {
   });
   it('재연결 시 GSC/GSH + AS0~AS4 모두 자동 재등록', async () => {
     const sockets: any[] = [];
-    const client = new LSUSRealtimeClient('TOK', {}, { wsFactory: () => { const w = fakeWs(); sockets.push(w); return w; }, accountEvents: true, backoffMs: [1], sleep: async () => {} });
+    const client = new LSUSRealtimeClient('TOK', {}, { wsFactory: () => { const w = fakeWs(); sockets.push(w); return w; }, accountEvents: true, deferAccountEvents: false, backoffMs: [1], sleep: async () => {} });
     client.connect([{ exchcd: '82', symbol: 'AAPL' }]);
     sockets[0].onopen?.();
     expect(sockets[0].sent).toHaveLength(7);   // GSC+GSH+AS0~4
@@ -242,6 +242,101 @@ describe('LSUSRealtimeClient (fake socket)', () => {
     expect(sockets.length).toBe(2);       // 새 소켓 생성
     sockets[1].onopen?.();
     expect(sockets[1].sent).toHaveLength(2);   // 재등록됨
+    client.close();
+  });
+
+  // ── P0-21 WebSocket 장애 진단/복구 ──
+  function fakeWs2() {
+    const ws: any = { sent: [] as string[], send(d: string) { ws.sent.push(d); }, close(ev?: any) { ws.onclose?.(ev); }, onopen: null, onmessage: null, onclose: null, onerror: null };
+    return ws as WsLike & { sent: string[] };
+  }
+  it('P0-21 #1: onclose 시 code/reason/wasClean/lastRegister/connectedDurationMs 캡처', () => {
+    let closeInfo: any = null; let now = 1000;
+    const ws = fakeWs2();
+    const client = new LSUSRealtimeClient('TOK', { onClose: (i) => { closeInfo = i; } },
+      { wsFactory: () => ws, backoffMs: [1], sleep: async () => {}, now: () => now });
+    client.connect([{ exchcd: '82', symbol: 'AAPL' }]);
+    ws.onopen?.();
+    now = 1500;   // 500ms 유지
+    ws.onclose?.({ code: 1006, reason: 'abnormal', wasClean: false });
+    expect(closeInfo).toMatchObject({ code: 1006, reason: 'abnormal', wasClean: false, connectedDurationMs: 500, dataReceived: false });
+    expect(closeInfo.lastRegister).toContain('GSC/GSH');
+    client.close();
+  });
+  it('P0-21 #1: onerror 시 실제 error 메시지 전달', () => {
+    let err: any = null;
+    const ws = fakeWs2();
+    const client = new LSUSRealtimeClient('TOK', { onError: (i) => { err = i; } }, { wsFactory: () => ws });
+    client.connect([{ exchcd: '82', symbol: 'AAPL' }]);
+    ws.onopen?.();
+    ws.onerror?.({ message: 'ECONNRESET' });
+    expect(err).toEqual({ message: 'ECONNRESET' });
+    client.close();
+  });
+  it('P0-21 #2: socket open 만으로 dataReady=false, 첫 GSC/GSH 수신 시 true + onDataReady', () => {
+    let dataReadyFired = 0;
+    const ws = fakeWs2();
+    const client = new LSUSRealtimeClient('TOK', { onDataReady: () => dataReadyFired++ }, { wsFactory: () => ws });
+    client.connect([{ exchcd: '82', symbol: 'AAPL' }]);
+    ws.onopen?.();
+    expect(client.connected).toBe(true);
+    expect(client.dataReady).toBe(false);   // open 만으로는 false
+    ws.onmessage?.({ data: JSON.stringify({ header: { tr_cd: 'GSH' }, body: { symbol: 'AAPL', offerho1: '284', bidho1: '283' } }) });
+    expect(client.dataReady).toBe(true);
+    expect(dataReadyFired).toBe(1);
+    client.close();
+  });
+  it('P0-21 #3: deferAccountEvents=true(기본) → open 시 GSC/GSH 만, 첫 데이터 후 AS 등록', () => {
+    const ws = fakeWs2();
+    const client = new LSUSRealtimeClient('TOK', {}, { wsFactory: () => ws, accountEvents: true });
+    client.connect([{ exchcd: '82', symbol: 'AAPL' }]);
+    ws.onopen?.();
+    expect(ws.sent).toHaveLength(2);   // GSC/GSH 만(AS 지연)
+    ws.onmessage?.({ data: JSON.stringify({ header: { tr_cd: 'GSC' }, body: { symbol: 'AAPL', price: '283', trdq: '1', totq: '1', ovsdate: '20260805', trdtm: '093015' } }) });
+    const trs = ws.sent.map(s => JSON.parse(s).body.tr_cd);
+    expect(trs).toEqual(['GSC', 'GSH', 'AS0', 'AS1', 'AS2', 'AS3', 'AS4']);   // 데이터 후 AS 등록
+    client.close();
+  });
+  it('P0-21 #5: open 직후 데이터없이 close 반복 → attempt 리셋 안 됨, exponential backoff', async () => {
+    const sockets: any[] = []; const waits: number[] = [];
+    const client = new LSUSRealtimeClient('TOK', {}, {
+      wsFactory: () => { const w = fakeWs2(); sockets.push(w); return w; },
+      backoffMs: [1000, 2000, 4000, 8000, 16000, 30000],
+      sleep: async (ms) => { waits.push(ms); },   // 실제 대기 없이 backoff 값만 수집
+    });
+    client.connect([{ exchcd: '82', symbol: 'AAPL' }]);
+    // open → 데이터 없이 close 를 4회: attempt 가 매번 리셋되지 않고 증가해야 함
+    for (let i = 0; i < 4; i++) { sockets[i].onopen?.(); sockets[i].onclose?.({ code: 1006 }); await Promise.resolve(); await Promise.resolve(); }
+    expect(waits.slice(0, 4)).toEqual([1000, 2000, 4000, 8000]);   // ★ 1초 고정 storm 아님
+    client.close();
+  });
+  it('P0-21 #4: 재연결 시 이전 소켓 리스너 제거(중복 연결 방지) — 죽은 소켓 onclose 는 재연결 유발 안 함', async () => {
+    const sockets: any[] = [];
+    const client = new LSUSRealtimeClient('TOK', {}, { wsFactory: () => { const w = fakeWs2(); sockets.push(w); return w; }, backoffMs: [1], sleep: async () => {} });
+    client.connect([{ exchcd: '82', symbol: 'AAPL' }]);
+    sockets[0].onopen?.();
+    sockets[0].onclose?.({ code: 1006 });         // 재연결 트리거
+    await new Promise(r => setTimeout(r, 5));
+    expect(sockets.length).toBe(2);               // 소켓 1개만 새로 생성
+    // 이전(죽은) 소켓의 onclose 는 cleanup 으로 detach 되어 추가 재연결 없음
+    expect(sockets[0].onclose).toBeNull();
+    client.close();
+  });
+  it('P0-21 #5: 데이터 수신하며 stableMs 유지되면 attempt 리셋', async () => {
+    let now = 0; const statuses: string[] = [];
+    const ws = fakeWs2();
+    const client = new LSUSRealtimeClient('TOK', { onStatus: (m) => statuses.push(m) },
+      { wsFactory: () => ws, backoffMs: [1], sleep: async () => {}, stableMs: 50, now: () => now });
+    client.connect([{ exchcd: '82', symbol: 'AAPL' }]);
+    // 먼저 한 번 끊겨 attempt 증가
+    ws.onopen?.(); ws.onclose?.({ code: 1006 }); await new Promise(r => setTimeout(r, 5));
+    expect(client.attemptCount).toBeGreaterThan(0);
+    // 재연결 후 데이터 수신 + stableMs 경과
+    ws.onopen?.();
+    ws.onmessage?.({ data: JSON.stringify({ header: { tr_cd: 'GSH' }, body: { symbol: 'AAPL', offerho1: '1', bidho1: '1' } }) });
+    now = 100;
+    await new Promise(r => setTimeout(r, 70));   // stableTimer(50ms) 발화
+    expect(client.attemptCount).toBe(0);          // ★ 안정 후 리셋
     client.close();
   });
 });

@@ -300,6 +300,31 @@ HTS_QTY / PROGRAM_QTY(최신 bestAsk 재계산) / cashOnly / paymentMode=CROSS_W
 && (WonCashMin programQty≥1 && cashOnly)**. 시작 로그의 "실주문 가능" 문구도 동일 최종 게이트와 일치하도록
 `US_LIVE_READY && CROSS_WON_VERIFIED && LS_LIVE_TRADING && 시작현금조회` 를 모두 만족할 때만 출력한다(P0-20 #12).
 
+### P0-21 — WebSocket 무한 재연결(1초 storm) 장애 수정
+
+증상: 소켓 open → 등록 → 서버가 곧바로 close → `재연결 대기 1000ms` 를 1초마다 무한 반복. GSC/GSH stale.
+**근본 원인**: `onopen` 에서 `attempt=0` 을 매번 리셋해, 데이터 수신 전에 끊겨도 backoff 가 항상 1초(`backoff[0]`)
+로 고정 → storm. 또 `onclose`/`onerror` 가 이벤트를 버려 close code/reason 이 로그에 없었다.
+
+수정:
+- **close 진단 로그 `[WS-CLOSE]`** — `code / reason / wasClean / lastRegister / connectedDurationMs / dataReceived`.
+  `[WS-ERROR]` 에 실제 error 메시지. (추측 대신 실제 close code 를 잡는다)
+- **attempt 리셋 규칙**: `onopen` 에서 리셋하지 않는다. **데이터를 받으며 `stableMs`(15s) 이상 유지**된 뒤에만
+  `attempt=0`. exponential backoff **1s→2s→4s→8s→16s→30s(cap)**. → 1초 storm 제거.
+- **LIVE_WS_READY(req 2)**: 소켓 open 만으로 연결성공 아님. 첫 GSC/GSH 데이터 수신(`dataReady`) 후에만 true.
+  READY 게이트의 `websocketConnected = socketOpen && dataReady`. `[WS-READY]`·`[READY … socketOpen/dataReady/
+  LIVE_WS_READY/wsAttempt]` 로그.
+- **단일 커넥션(req 4)**: 재연결 전 이전 소켓 리스너 detach + close(`cleanupSocket`), 재연결 루프 중복 방지(`reconnecting`).
+- **AS 원인 격리(req 3)**: 기본은 AS0~AS4 를 **첫 데이터 수신 후 지연 등록**(`deferAccountEvents`). AS 때문에 서버가
+  끊는지 분리 가능. `LS_US_WS_ACCOUNT_EVENTS=false` 로 AS 완전 미등록 테스트. 
+- **거래 0건 사유 카운터(req 9)** `[NO-TRADE-COUNTS]`: `NO_BUY_SIGNAL / WS_NOT_READY / MARKET_CLOSED /
+  CASH_GATE / PENDING / DAILY_LIMIT / DUPLICATE_CANDLE / WARMUP` 별 누적.
+- stale 데이터(GSC>300s / GSH>30s)면 `READY=false` → BUY POST=false 유지(req 7). 비거래시간엔 backoff 로
+  storm 없이 느리게 재연결(req 6).
+
+**오늘 밤 실전 준비 완료 조건(req 8)**: `wsConnected=true` 지속 + GSC/GSH age≤30s + 실시간 bid/ask/last 갱신 +
+`READY=true` + `[US-LIVE-GATE] POST_ALLOWED` 가능 상태가 **최소 5분 끊김 없이** 유지.
+
 ### COSAT00311(미체결 취소) 공식 필드 확인 결과 — 근거
 
 Phase 3A 완성을 위해 취소 TR 을 구현하려 했으나, **공식 필드를 확인하지 못했습니다.** 확인 경로와 결과:
