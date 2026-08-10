@@ -16,7 +16,7 @@ import {
 import { loadUSUniverse, selectUSLiveCandidate, probeUSMasterExgubun, exgubunWithNyseAmex } from './us-universe';
 import { computeScanCapacity, RateLimiter } from './kr-rate-limiter';
 import { rankBuyCandidates, bbBreakStrength, rsiReboundStrength, RoundRobinScanner } from './kr-scanner';
-import { pickBackfillTarget, computeBackfillCapacity, BackfillStats, BACKFILL_MIN_CONFIRMED, BACKFILL_TARGET, type BackfillCand } from './us-backfill';
+import { pickBackfillTarget, computeBackfillCapacity, computeBackfillDelta, BackfillStats, BACKFILL_MIN_CONFIRMED, BACKFILL_TARGET, type BackfillCand } from './us-backfill';
 import {
   LSUSRealtimeClient, RealtimeCandleBuilder, buildWsTrKey, evaluateReadiness, MIN_RT_CANDLES,
   aggregateTicksTo15Min, type RTCandle,
@@ -258,7 +258,7 @@ async function main() {
   log.info(`[WS-CFG] accountEvents=${usAccountEvents} deferAccountEvents=${usDeferAccountEvents} (격리 테스트: LS_US_WS_ACCOUNT_EVENTS=false 로 AS 미등록)`);
 
   // ── 거래 0건 사유별 카운터(req 9) — 매 틱 왜 주문이 안 나갔는지 분류 ──
-  const noTradeCounts = { NO_BUY_SIGNAL: 0, WS_NOT_READY: 0, MARKET_CLOSED: 0, CASH_GATE: 0, PENDING: 0, DAILY_LIMIT: 0, DUPLICATE_CANDLE: 0, WARMUP: 0 };
+  const noTradeCounts = { NO_BUY_SIGNAL: 0, WS_NOT_READY: 0, MARKET_CLOSED: 0, CASH_GATE: 0, RECONCILIATION_FAILED: 0, PENDING: 0, DAILY_LIMIT: 0, DUPLICATE_CANDLE: 0, WARMUP: 0 };
   const bumpNoTrade = (k: keyof typeof noTradeCounts) => { noTradeCounts[k]++; };
 
   // ── 현금 주문가능액(해외 예수금) 조회 캐시 + refreshDeposit ── 계좌 단위 60초 캐시. rsp_cd/rsp_msg/전체필드 보존.
@@ -504,31 +504,59 @@ async function main() {
 
     const cx = ctxs.get(target.symbol);
     const store = cx ? cx.store : (() => { const st = new CandleStore(target.symbol); st.load(); return st; })();
-    const before = cx ? cx.builder.confirmedCount : poolConfirmed(target.symbol);
+    if (store.corrupt) { bfStats.error++; bfFailed.set(target.symbol, Date.now() + BF_FAIL_BACKOFF_MS); return true; }
+    // 기존 보유 timestamp(store 가 진실원). 신규 unique 판정 기준(issue2 req1·2).
+    const existingTs = store.confirmedSorted().map(c => c.datetime);
+    const before = existingTs.length;
+    // 과거 봉까지 도달하려면 현재 보유보다 더 뒤(과거)로 continuation 되도록 target 을 동적으로 키운다(issue2 req4).
+    const gap = Math.max(0, BACKFILL_MIN_CONFIRMED - before);
+    const dynTarget = Math.max(BACKFILL_TARGET, before + gap + 4);
+    const dynMaxCalls = Math.min(12, Math.max(6, Math.ceil(dynTarget / 5) + 2));
     bfStats.requests++;
     try {
-      const r = await getLSUS15MinPaged(cfg, token, target.symbol, target.exchcd, quote.delaygb, { target: BACKFILL_TARGET, maxCalls: 6, ncnt: 15, sdate });
-      if (store.corrupt) { bfStats.error++; return true; }
+      const r = await getLSUS15MinPaged(cfg, token, target.symbol, target.exchcd, quote.delaygb, { target: dynTarget, maxCalls: dynMaxCalls, ncnt: 15, sdate });
       const fetched = r.candles.map(c => ({ datetime: c.datetime, open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume }));
+      const rawRows = r.pages.reduce((a, p) => a + p.rawCount, 0);
+      const contPages = r.pages.length;
+      const delta = computeBackfillDelta(existingTs, fetched.map(c => c.datetime));   // ← rawRows 아닌 newUnique
+      // issue2 req3: continuation 진행 검증 — 각 페이지 tr_cont/tr_cont_key + 반환 봉 timestamp 범위 로그.
+      const tsSorted = fetched.map(c => c.datetime).sort();
+      const contDiag = r.pages.map((p, i) => `p${i + 1}(rows=${p.rawCount},tr_cont=${p.resTrCont || '-'},key='${p.resTrContKey || ''}')`).join(' ');
+      log.info(`[US-BACKFILL-CONT ${target.symbol}] pages=${contPages} ${contDiag} tsRange=[${tsSorted[0] ?? '-'}..${tsSorted[tsSorted.length - 1] ?? '-'}] storeOldest=${existingTs[0] ?? '-'}`);
+
       if (fetched.length === 0) {
         bfStats.empty++;
         bfFailed.set(target.symbol, Date.now() + BF_FAIL_BACKOFF_MS);   // 빈 응답 → 큐 뒤로(요구 7)
-        log.warn(`[US-BACKFILL] ${target.symbol} before=${before} fetched=0 after=${before} remaining=${Math.max(0, BACKFILL_MIN_CONFIRMED - before)} → 빈 응답, 백오프`);
+        log.warn(`[US-BACKFILL] symbol=${target.symbol} before=${before} rawRows=0 newUnique=0 after=${before} remaining=${gap} continuationPages=${contPages} stopReason=EMPTY_RESPONSE`);
         return true;
       }
+      // 신규 unique 0 = 진전 없음(동일 최근봉만 반환). 성공으로 세지 말고 backoff 후 다음 종목(issue2 req2·5 — 무한루프 금지).
+      if (delta.newUnique === 0) {
+        bfStats.noNewUnique++;
+        bfFailed.set(target.symbol, Date.now() + BF_FAIL_BACKOFF_MS);
+        const lastPg = r.pages[r.pages.length - 1];
+        const stopReason = lastPg && lastPg.resTrCont !== 'Y' ? 'NO_NEW_UNIQUE(연속조회 종료 tr_cont=N)' : 'NO_NEW_UNIQUE(동일봉 반복)';
+        log.warn(`[US-BACKFILL] symbol=${target.symbol} before=${before} rawRows=${rawRows} newUnique=0 after=${before} remaining=${gap} continuationPages=${contPages} stopReason=${stopReason} → 백오프(다음 종목)`);
+        return true;
+      }
+      // 신규 unique 확정봉만 저장/반영(중복 재수집 금지, 요구 1·5). 즉시 영구 저장(요구 4).
       let dirty = false;
-      for (const c of fetched) if (store.upsertConfirmed(c)) dirty = true;   // 저장 봉 중복 재수집 금지(요구 1·5)
-      if (dirty) store.flush();                                              // 즉시 영구 저장(요구 4)
-      if (cx) cx.builder.seed(fetched);                                      // 현 배치면 실시간 ctx 에도 병합 → 즉시 READY 판정
+      for (const c of fetched) if (store.upsertConfirmed(c)) dirty = true;
+      if (dirty) store.flush();
+      if (cx) cx.builder.seed(fetched);   // 현 배치 → 실시간 ctx 에 즉시 병합(16→20+ 시 즉시 READY, issue2 req7)
       const after = cx ? cx.builder.confirmedCount : store.confirmedCount;
       bfConfirmedCache.set(target.symbol, after);
-      bfStats.success++; bfFailed.delete(target.symbol);
+      bfStats.success++;
       const remaining = Math.max(0, BACKFILL_MIN_CONFIRMED - after);
-      log.info(`[US-BACKFILL] ${target.symbol} before=${before} fetched=${fetched.length} after=${after} remaining=${remaining}${after >= BACKFILL_MIN_CONFIRMED ? ' → READY(확정봉 20+)' : ''}`);
+      const ready = after >= BACKFILL_MIN_CONFIRMED;
+      if (ready) bfFailed.delete(target.symbol);   // READY 도달 → 백오프 해제(재백필 불필요)
+      else bfFailed.set(target.symbol, Date.now() + Math.min(BF_FAIL_BACKOFF_MS, 60_000));   // 아직 부족 → 짧은 간격 후 재시도(다른 종목 우선)
+      const stopReason = ready ? 'READY(20+)' : 'PARTIAL(추가 필요)';
+      log.info(`[US-BACKFILL] symbol=${target.symbol} before=${before} rawRows=${rawRows} newUnique=${delta.newUnique} after=${after} remaining=${remaining} continuationPages=${contPages} stopReason=${stopReason}`);
     } catch (e) {
       bfStats.error++;
       bfFailed.set(target.symbol, Date.now() + BF_FAIL_BACKOFF_MS);
-      log.warn(`[US-BACKFILL] ${target.symbol} 실패(무시, 백오프): ${scrub(String(e))}`);
+      log.warn(`[US-BACKFILL] symbol=${target.symbol} before=${before} stopReason=ERROR 실패(무시, 백오프): ${scrub(String(e))}`);
     }
     return true;
   }
@@ -587,8 +615,16 @@ async function main() {
       orders: ctx.orders, exchcd: ctx.exchcd, symbol: ctx.symbol, candleDatetime: sig.candleDatetime,
       qty: liveCfg.maxQty, price: buyPrice, etDate, dailyMaxBuys: liveCfg.dailyMaxBuys,
     });
-    log.info(`[ORDER-RESULT ${ctx.symbol}] status=${outcome.status} ordNo=${outcome.ordNo ?? '-'} ${outcome.reason}`);
-    return outcome.status === 'placed-filled' || outcome.status === 'placed-pending' ? 'ORDERED' : 'CASH_GATE';
+    log.info(`[ORDER-RESULT ${ctx.symbol}] status=${outcome.status} ordNo=${outcome.ordNo ?? '-'}${outcome.abortCode ? ` abortCode=${outcome.abortCode}` : ''} ${outcome.reason}`);
+    if (outcome.status === 'placed-filled' || outcome.status === 'placed-pending') return 'ORDERED';
+    // 실제 사유별 분류(P0-27 req8): reconciliation 실패를 CASH_GATE 로 오분류하지 않는다.
+    switch (outcome.abortCode) {
+      case 'RECONCILIATION_FAILED': case 'UNRECORDED_ORDER': return 'RECONCILIATION_FAILED';
+      case 'PENDING': return 'PENDING';
+      case 'DAILY_LIMIT': return 'DAILY_LIMIT';
+      case 'DUPLICATE_CANDLE': return 'DUPLICATE_CANDLE';
+      default: return 'CASH_GATE';
+    }
   }
 
   // ── 10초마다 전 구독종목 스캔 → BUY 후보 랭킹 → 랭킹 1위부터 LIVE 게이트 (P0-23, AAPL 하드코딩 제거) ──

@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import {
-  pickBackfillTarget, computeBackfillCapacity, BackfillStats,
+  pickBackfillTarget, computeBackfillCapacity, computeBackfillDelta, BackfillStats,
   BACKFILL_MIN_CONFIRMED, BACKFILL_TARGET, type BackfillCand,
 } from '../local-runner/us-backfill';
 
@@ -80,12 +80,46 @@ describe('P0-26 백필 용량 계산(요구 12·보고)', () => {
 });
 
 describe('P0-26 백필 통계(요구 8)', () => {
-  it('line — reqPerSec/requests/success/empty/error 포맷', () => {
+  it('line — reqPerSec/requests/success/noNewUnique/empty/error 포맷', () => {
     const s = new BackfillStats();
-    s.requests = 3; s.success = 2; s.empty = 1; s.error = 0;
-    expect(s.line(1)).toBe('reqPerSec=1 requests=3 success=2 empty=1 error=0');
+    s.requests = 4; s.success = 2; s.noNewUnique = 1; s.empty = 1; s.error = 0;
+    expect(s.line(1)).toBe('reqPerSec=1 requests=4 success=2 noNewUnique=1 empty=1 error=0');
   });
   it('초기값 0', () => {
-    expect(new BackfillStats().line(1)).toBe('reqPerSec=1 requests=0 success=0 empty=0 error=0');
+    expect(new BackfillStats().line(1)).toBe('reqPerSec=1 requests=0 success=0 noNewUnique=0 empty=0 error=0');
+  });
+});
+
+describe('P0-27 issue2 newUnique 계산(무한루프 방지 req1·2·5)', () => {
+  it('반환 4행이 기존 timestamp 와 전부 중복 → newUnique=0, after=before (성공 아님)', () => {
+    const existing = ['t1', 't2', 't3', 't4', 't5'];   // before=5
+    const d = computeBackfillDelta(existing, ['t2', 't3', 't4', 't5']);   // 전부 중복
+    expect(d.rawRows).toBe(4);
+    expect(d.newUnique).toBe(0);
+    expect(d.before).toBe(5);
+    expect(d.after).toBe(5);   // 진전 없음 → 16→16 반복의 원인 (성공 카운트 금지)
+  });
+  it('continuation 으로 과거 unique 4개 추가 → 16→20 (READY 전환)', () => {
+    const existing = Array.from({ length: 16 }, (_, i) => `n${String(i + 5).padStart(2, '0')}`);   // 최신 16개(n05..n20)
+    const fetched = ['n01', 'n02', 'n03', 'n04', 'n05', 'n06'];   // 과거 4개(n01..n04) + 중복 2개(n05,n06)
+    const d = computeBackfillDelta(existing, fetched);
+    expect(d.before).toBe(16);
+    expect(d.newUnique).toBe(4);   // n01..n04 만 신규
+    expect(d.after).toBe(20);      // 16→20 → READY
+  });
+  it('fetched 내부 중복은 1회만 카운트', () => {
+    const d = computeBackfillDelta(['a'], ['b', 'b', 'c', 'c', 'c']);
+    expect(d.newUnique).toBe(2);   // b,c
+  });
+  it('빈 timestamp 문자열은 무시', () => {
+    const d = computeBackfillDelta(['a'], ['', 'b', '']);
+    expect(d.newUnique).toBe(1);
+  });
+  it('동일 페이지 반복 호출 → 매번 newUnique=0 (무한 진전 없음 감지)', () => {
+    const existing = ['x1', 'x2', 'x3', 'x4'];
+    for (let i = 0; i < 5; i++) {
+      const d = computeBackfillDelta(existing, ['x1', 'x2', 'x3', 'x4']);
+      expect(d.newUnique).toBe(0);   // 매 호출 진전 0 → 러너는 backoff 후 다음 종목으로 이동해야 함
+    }
   });
 });

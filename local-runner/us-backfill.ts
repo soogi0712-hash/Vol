@@ -36,10 +36,25 @@ export function computeBackfillCapacity(o: { eligible: number; alreadyReady: num
   return { eligible: o.eligible, alreadyReady: o.alreadyReady, toBackfill, candlesPerRequest, callsPerSymbol, reqPerSec, symbolsPerHour, hoursForAll };
 }
 
-// 백필 진행 통계(요구 8).
+// 신규 unique 확정봉 수 계산(P0-27 issue2 req1·2): API 반환 row 수가 아니라, 기존 store 에 없던 timestamp 만 센다.
+//   rawRows=API 반환 행수, newUnique=기존에 없던 신규 timestamp 수, after=before+newUnique. newUnique=0 이면 진전 없음(성공 금지).
+export interface BackfillDelta { rawRows: number; newUnique: number; before: number; after: number; }
+export function computeBackfillDelta(existingTimestamps: Iterable<string>, fetchedTimestamps: string[]): BackfillDelta {
+  const existing = new Set(existingTimestamps);
+  const before = existing.size;
+  const counted = new Set<string>();
+  let newUnique = 0;
+  for (const ts of fetchedTimestamps) {
+    if (!ts || existing.has(ts) || counted.has(ts)) continue;   // 기존 보유/이번 중복 제외
+    counted.add(ts); newUnique++;
+  }
+  return { rawRows: fetchedTimestamps.length, newUnique, before, after: before + newUnique };
+}
+
+// 백필 진행 통계(요구 8). noNewUnique = 반환은 됐으나 신규 timestamp 0(진전 없음) — success 와 분리.
 export class BackfillStats {
-  requests = 0; success = 0; empty = 0; error = 0;
+  requests = 0; success = 0; noNewUnique = 0; empty = 0; error = 0;
   line(reqPerSec: number): string {
-    return `reqPerSec=${reqPerSec} requests=${this.requests} success=${this.success} empty=${this.empty} error=${this.error}`;
+    return `reqPerSec=${reqPerSec} requests=${this.requests} success=${this.success} noNewUnique=${this.noNewUnique} empty=${this.empty} error=${this.error}`;
   }
 }

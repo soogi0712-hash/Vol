@@ -12,7 +12,7 @@ afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
 
 type ExecRow = { ordNo: string; orgOrdNo: string; symbol: string; ordQty: number; execQty: number; unfilledQty: number; ordPrc: number; ordPtnCode: string; trxNm: string };
 const row = (o: Partial<ExecRow>): ExecRow => ({ ordNo: '141', orgOrdNo: '0', symbol: 'AAPL', ordQty: 1, execQty: 0, unfilledQty: 1, ordPrc: 100, ordPtnCode: '02', trxNm: '접수', ...o });
-const execRes = (rows: ExecRow[] = [], rspCd = '00000') => ({ rspCd, rspMsg: '', rows, diag: {} as any });
+const execRes = (rows: ExecRow[] = [], rspCd = '00000', queryOk = true) => ({ queryOk, rspCd, rspMsg: '', rows, diag: {} as any });
 
 let clock = 1_000_000;
 function deps(over: Partial<TraderDeps> = {}): TraderDeps {
@@ -128,6 +128,76 @@ describe('US 주문 idempotency (KR 사고 패턴 이식)', () => {
   });
 });
 
+// ─── P0-27 issue1: reconciliation "조회 성공+0건" vs "조회 API 실패" 구분(req3·4·7·8) ───
+describe('P0-27 reconciliation 구분 — 0건 정상 vs API 실패', () => {
+  beforeEach(() => { clock = 1_000_000; });
+
+  it('조회 API 성공 + 주문 0건 → POST 허용(오늘 주문 없던 계좌, 정상)', async () => {
+    const orders = new OrderStore('AAPL', dir);
+    // 대사(전송 전) queryOk=true rows=[] → 정상. 전송 후 체결조회는 filled.
+    let placed = false;
+    const d = deps({
+      place: async () => { placed = true; return { rspCd: '00000', rspMsg: 'ok', ordNo: '141', raw: {}, diag: {} as any }; },
+      query: async () => placed ? execRes([row({ execQty: 1, unfilledQty: 0 })]) : execRes([]),   // queryOk:true 기본
+    });
+    const r = await executeBuyOrder(d, buyParams(orders));
+    expect(r.status).toBe('placed-filled');   // ★ 0건이라고 차단되지 않음
+    expect(placed).toBe(true);
+  });
+
+  it('조회 API 실패(queryOk=false, 예외 아님) → POST 차단 + abortCode=RECONCILIATION_FAILED', async () => {
+    const orders = new OrderStore('AAPL', dir);
+    let placed = false;
+    const d = deps({
+      place: async () => { placed = true; return { rspCd: '00000', rspMsg: 'ok', ordNo: '141', raw: {}, diag: {} as any }; },
+      query: async () => ({ queryOk: false, rspCd: 'ERR(NETWORK)', rspMsg: 'timeout', rows: [], diag: {} as any, kind: 'NETWORK' as const }),
+    });
+    const r = await executeBuyOrder(d, buyParams(orders));
+    expect(r.status).toBe('aborted');
+    expect(r.abortCode).toBe('RECONCILIATION_FAILED');
+    expect(placed).toBe(false);   // ★ 안전차단(전송 금지)
+  });
+
+  it('조회 예외(throw) → POST 차단 + abortCode=RECONCILIATION_FAILED', async () => {
+    const orders = new OrderStore('AAPL', dir);
+    let placed = false;
+    const d = deps({ place: async () => { placed = true; return { rspCd: '00000', rspMsg: '', ordNo: '1', raw: {}, diag: {} as any }; }, query: async () => { throw new Error('ETIMEDOUT'); } });
+    const r = await executeBuyOrder(d, buyParams(orders));
+    expect(r.status).toBe('aborted');
+    expect(r.abortCode).toBe('RECONCILIATION_FAILED');
+    expect(placed).toBe(false);
+  });
+
+  it('pending 주문 존재 → POST 차단 + abortCode=PENDING', async () => {
+    const orders = new OrderStore('AAPL', dir);
+    orders.recordPlaced('buy', '20260705093000', '20260705', { ordNo: '9', symbol: 'AAPL', qty: 1, price: 100, placedAtMs: 1 });
+    const r = await executeBuyOrder(usHarness({}), buyParams(orders));
+    expect(r.status).toBe('aborted');
+    expect(r.abortCode).toBe('PENDING');
+  });
+
+  it('오늘 BUY 한도 사용 → POST 차단 + abortCode=DAILY_LIMIT', async () => {
+    const orders = new OrderStore('AAPL', dir);
+    orders.recordPlaced('buy', '20260706091500', '20260706', { ordNo: '1', symbol: 'AAPL', qty: 1, price: 100, placedAtMs: 1 });
+    const h = usHarness({});
+    const r = await executeBuyOrder(h, buyParams(orders));
+    expect(r.status).toBe('aborted');
+    expect(r.abortCode).toBe('DAILY_LIMIT');
+    expect(h.placeCalls).toBe(0);
+  });
+
+  it('[US-RECON] 진단 로그가 queryOk/rsp_cd/order count/decision 을 출력', async () => {
+    const orders = new OrderStore('AAPL', dir);
+    const msgs: string[] = [];
+    const d = deps({ query: async () => execRes([]), log: (m) => msgs.push(m) });
+    await executeBuyOrder(d, buyParams(orders));
+    const recon = msgs.find(m => m.includes('[US-RECON'));
+    expect(recon).toBeTruthy();
+    expect(recon).toMatch(/queryOk=true/);
+    expect(recon).toMatch(/decision=POST_ALLOWED/);
+  });
+});
+
 describe('US 현금(USD) 주문가능 가드 (cash-only, req5·6·7)', () => {
   beforeEach(() => { clock = 1_000_000; });
   it('price*qty > 현금가능 → COSAT00301 미호출', async () => {
@@ -209,7 +279,7 @@ describe('reconcilePending — 타임아웃 취소(BUY→PENDING→CANCELLED 모
     clock = 1_000_000 + 30_000;
     let cancelled = false;
     const early = await reconcilePending(
-      deps({ query: async () => ({ rspCd: '00000', rspMsg: '', rows: [row({ execQty: 0, unfilledQty: 1 })], diag: {} as any }), cancel: async () => { cancelled = true; return { rspCd: '00000', rspMsg: '' }; } }),
+      deps({ query: async () => ({ queryOk: true, rspCd: '00000', rspMsg: '', rows: [row({ execQty: 0, unfilledQty: 1 })], diag: {} as any }), cancel: async () => { cancelled = true; return { rspCd: '00000', rspMsg: '' }; } }),
       { orders, exchcd: '82', ordDate: '20260706', timeoutMs: 60_000, autoCancel: true },
     );
     expect(early[0].status).toBe('waiting');
@@ -219,7 +289,7 @@ describe('reconcilePending — 타임아웃 취소(BUY→PENDING→CANCELLED 모
     // ③ 타임아웃 경과 → 취소 완료
     clock = 1_000_000 + 61_000;
     const late = await reconcilePending(
-      deps({ query: async () => ({ rspCd: '00000', rspMsg: '', rows: [row({ execQty: 0, unfilledQty: 1 })], diag: {} as any }), cancel: async () => ({ rspCd: '00000', rspMsg: '취소완료' }) }),
+      deps({ query: async () => ({ queryOk: true, rspCd: '00000', rspMsg: '', rows: [row({ execQty: 0, unfilledQty: 1 })], diag: {} as any }), cancel: async () => ({ rspCd: '00000', rspMsg: '취소완료' }) }),
       { orders, exchcd: '82', ordDate: '20260706', timeoutMs: 60_000, autoCancel: true },
     );
     expect(late[0].status).toBe('cancelled');
@@ -234,7 +304,7 @@ describe('reconcilePending — 타임아웃 취소(BUY→PENDING→CANCELLED 모
     clock = 1_000_000 + 61_000;
     let cancelled = false;
     const r = await reconcilePending(
-      deps({ query: async () => ({ rspCd: '00000', rspMsg: '', rows: [row({ execQty: 1, unfilledQty: 0 })], diag: {} as any }), cancel: async () => { cancelled = true; return { rspCd: '00000', rspMsg: '' }; } }),
+      deps({ query: async () => ({ queryOk: true, rspCd: '00000', rspMsg: '', rows: [row({ execQty: 1, unfilledQty: 0 })], diag: {} as any }), cancel: async () => { cancelled = true; return { rspCd: '00000', rspMsg: '' }; } }),
       { orders, exchcd: '82', ordDate: '20260706', timeoutMs: 60_000, autoCancel: true },
     );
     expect(r[0].status).toBe('filled');
@@ -248,7 +318,7 @@ describe('reconcilePending — 타임아웃 취소(BUY→PENDING→CANCELLED 모
     orders.flush();
     clock = 1_000_000 + 61_000;
     const r = await reconcilePending(
-      deps({ query: async () => ({ rspCd: '00000', rspMsg: '', rows: [row({ execQty: 0, unfilledQty: 1 })], diag: {} as any }), cancel: async () => { throw new Error('COSAT00311 공식 필드 미확인'); } }),
+      deps({ query: async () => ({ queryOk: true, rspCd: '00000', rspMsg: '', rows: [row({ execQty: 0, unfilledQty: 1 })], diag: {} as any }), cancel: async () => { throw new Error('COSAT00311 공식 필드 미확인'); } }),
       { orders, exchcd: '82', ordDate: '20260706', timeoutMs: 60_000, autoCancel: true },
     );
     expect(r[0].status).toBe('cancel-failed');
@@ -263,7 +333,7 @@ describe('reconcilePending — 타임아웃 취소(BUY→PENDING→CANCELLED 모
     let cancelled = false;
     const msgs: string[] = [];
     const r = await reconcilePending(
-      deps({ query: async () => ({ rspCd: '00000', rspMsg: '', rows: [row({ execQty: 0, unfilledQty: 1 })], diag: {} as any }), cancel: async () => { cancelled = true; return { rspCd: '00000', rspMsg: '' }; }, log: (m) => msgs.push(m) }),
+      deps({ query: async () => ({ queryOk: true, rspCd: '00000', rspMsg: '', rows: [row({ execQty: 0, unfilledQty: 1 })], diag: {} as any }), cancel: async () => { cancelled = true; return { rspCd: '00000', rspMsg: '' }; }, log: (m) => msgs.push(m) }),
       { orders, exchcd: '82', ordDate: '20260706', timeoutMs: 60_000, autoCancel: false },
     );
     expect(r[0].status).toBe('manual-cancel-required');
@@ -275,7 +345,7 @@ describe('reconcilePending — 타임아웃 취소(BUY→PENDING→CANCELLED 모
     const orders = new OrderStore('AAPL', dir);
     orders.recordPlaced('buy', '20260706093000', '20260706', { ordNo: '141', symbol: 'AAPL', qty: 1, price: 100, placedAtMs: 1_000_000 });
     const r = await reconcilePending(
-      deps({ query: async () => ({ rspCd: '00000', rspMsg: '', rows: [row({ execQty: 1, unfilledQty: 0 })], diag: {} as any }) }),
+      deps({ query: async () => ({ queryOk: true, rspCd: '00000', rspMsg: '', rows: [row({ execQty: 1, unfilledQty: 0 })], diag: {} as any }) }),
       { orders, exchcd: '82', ordDate: '20260706', timeoutMs: 60_000, autoCancel: false },
     );
     expect(r[0].status).toBe('filled');

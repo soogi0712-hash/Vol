@@ -182,7 +182,10 @@ async function runLimited<T>(op: () => Promise<T>): Promise<T> {
 // LS REST 공통 POST. rsp_cd 를 즉시 throw 하지 않고 블록을 파싱한다.
 // TR별 허용목록(LS_SUCCESS_CODES)에 없는 rsp_cd 만 실패. 네트워크/호출제한을 분류.
 // 전체 동작을 runLimited 로 감싸 직렬화 + IGW00201 재시도를 적용한다.
-async function lsPost(token: string, path: string, trCd: string, inBlock: Record<string, unknown>, cont: { trCont?: string; trContKey?: string; timeoutMs?: number } = {}): Promise<LSResult> {
+// soft=true (읽기전용 조회 TR 전용): HTTP 200 + 정상 JSON 이면 성공코드 목록에 없는 업무 rsp_cd(예: "조회할 자료가
+//   없습니다")여도 throw 하지 않고 그대로 반환한다(호출측이 queryOk/rows 로 "0건 정상" vs "API 실패"를 구분).
+//   ⚠️ 전송(주문) TR 에는 절대 쓰지 않는다. 네트워크/timeout/빈응답/JSON오류/HTTP>=400/429 는 soft 여도 그대로 throw.
+async function lsPost(token: string, path: string, trCd: string, inBlock: Record<string, unknown>, cont: { trCont?: string; trContKey?: string; timeoutMs?: number; soft?: boolean } = {}): Promise<LSResult> {
   const trCont = cont.trCont ?? 'N';
   const trContKey = cont.trContKey ?? '';
   const timeoutMs = cont.timeoutMs ?? 15000;   // ⚠️ fetch 무한대기 방지 — 모든 LS REST 호출에 기본 15s 타임아웃
@@ -230,8 +233,11 @@ async function lsPost(token: string, path: string, trCd: string, inBlock: Record
     const rspCd = String(data.rsp_cd ?? '');
     const rspMsg = String(data.rsp_msg ?? '');
     const ok = LS_SUCCESS_CODES[trCd] ?? ['00000'];
-    if (res.status >= 400 || (rspCd && !ok.includes(rspCd))) {
+    const rspOk = !rspCd || ok.includes(rspCd);
+    if (res.status >= 400 || !rspOk) {
       const rl = LS_RATE_LIMIT_CODES.has(rspCd) || /제한|초과|traffic|quota/i.test(rspMsg);
+      // soft(읽기 조회 TR): HTTP 200 + 정상 JSON + rate-limit 아님 → 업무 rsp_cd(0건 등)여도 throw 안 함(호출측이 판정).
+      if (cont.soft && res.status < 400 && !rl) return { data, rspCd, rspMsg, empty: true, diag };
       throw new LSApiError(rl ? 'RATE_LIMIT' : 'API', `LS ${trCd} rsp_cd=${rspCd || res.status} msg=${rspMsg}`, rspCd, diag);
     }
     const empty = (LS_EMPTY_CODES[trCd] ?? []).includes(rspCd);
@@ -678,7 +684,9 @@ export async function placeLSUSBuyOrder(
 //                 ExecYn/CrcyCode/ThdayBnsAppYn/LoanBalHldYn
 // OutBlock3(리스트): OrdNo/OrgOrdNo/ShtnIsuNo/OrdQty/ExecQty/UnercQty/OvrsOrdPrc/OrdPtnCode/OrdprcPtnCode ...
 export interface LSOrderExec { ordNo: string; orgOrdNo: string; symbol: string; ordQty: number; execQty: number; unfilledQty: number; ordPrc: number; ordPtnCode: string; trxNm: string; }
-export interface LSOrderExecResult { rspCd: string; rspMsg: string; rows: LSOrderExec[]; diag: LSHttpDiag; }
+// queryOk: 서버 왕복 성공(=주문내역을 열거 가능, rows 가 0건이어도 정상). false 는 실제 조회 실패(네트워크/timeout/
+//   빈응답/JSON오류/HTTP>=400/호출제한)뿐이다. ⚠️ "조회 성공 + 0건" 과 "조회 API 실패" 를 절대 같은 실패로 취급하지 않는다(P0-27 req3).
+export interface LSOrderExecResult { queryOk: boolean; rspCd: string; rspMsg: string; rows: LSOrderExec[]; diag: LSHttpDiag; kind?: LSErrorKind; httpStatus?: number; }
 export async function queryLSUSOrderExec(
   cfg: LSConfig, token: string, p: { exchcd: string; symbol?: string; ordDate: string; execYn?: '0' | '1' | '2' },
 ): Promise<LSOrderExecResult> {
@@ -690,14 +698,23 @@ export async function queryLSUSOrderExec(
       CrcyCode: '000', ThdayBnsAppYn: '0', LoanBalHldYn: '0',
     },
   };
-  const { data, rspCd, rspMsg, diag } = await lsPost(token, '/overseas-stock/accno', 'COSAQ00102', inb);
-  const rows: LSOrderExec[] = (data.COSAQ00102OutBlock3 || []).map((r: any) => ({
-    ordNo: String(r.OrdNo ?? ''), orgOrdNo: String(r.OrgOrdNo ?? ''),
-    symbol: String(r.ShtnIsuNo ?? r.IsuNo ?? ''),
-    ordQty: toNum(r.OrdQty), execQty: toNum(r.ExecQty), unfilledQty: toNum(r.UnercQty),
-    ordPrc: toNum(r.OvrsOrdPrc), ordPtnCode: String(r.OrdPtnCode ?? ''), trxNm: String(r.OrdTrxPtnNm ?? ''),
-  }));
-  return { rspCd, rspMsg, rows, diag };
+  try {
+    // soft=true: HTTP 200 이면 "조회할 자료 없음" 업무코드여도 throw 없이 반환 → 0건 정상으로 처리(P0-27 req3·4·5).
+    const { data, rspCd, rspMsg, diag } = await lsPost(token, '/overseas-stock/accno', 'COSAQ00102', inb, { soft: true });
+    const rows: LSOrderExec[] = (data.COSAQ00102OutBlock3 || []).map((r: any) => ({
+      ordNo: String(r.OrdNo ?? ''), orgOrdNo: String(r.OrgOrdNo ?? ''),
+      symbol: String(r.ShtnIsuNo ?? r.IsuNo ?? ''),
+      ordQty: toNum(r.OrdQty), execQty: toNum(r.ExecQty), unfilledQty: toNum(r.UnercQty),
+      ordPrc: toNum(r.OvrsOrdPrc), ordPtnCode: String(r.OrdPtnCode ?? ''), trxNm: String(r.OrdTrxPtnNm ?? ''),
+    }));
+    return { queryOk: true, rspCd, rspMsg, rows, diag, httpStatus: diag.status };   // 서버 왕복 성공(rows 0건이어도 정상)
+  } catch (e) {
+    // 여기 도달 = 실제 조회 실패(네트워크/timeout/빈응답/JSON오류/HTTP>=400/호출제한). 안전차단 신호.
+    const kind: LSErrorKind = e instanceof LSApiError ? e.kind : 'INVALID_RESPONSE';
+    const rspCd = e instanceof LSApiError ? (e.rspCd ?? `ERR(${e.kind})`) : 'EXCEPTION';
+    const diag = (e instanceof LSApiError ? e.diag : undefined) ?? ({} as LSHttpDiag);
+    return { queryOk: false, rspCd, rspMsg: e instanceof Error ? e.message : String(e), rows: [], diag, kind, httpStatus: diag.status };
+  }
 }
 
 // ── 해외 예수금/주문가능 조회 (COSOQ02701, /overseas-stock/accno) — 현금(cash-only) 주문가능 판정용 ──
