@@ -11,7 +11,7 @@ import {
   getLSUS15MinPaged, getLSUS15MinOlderThan, getLSUSTicksPaged, getLSUSDeposit, getLSUSStockMasterPage,
   placeLSUSBuyOrder, queryLSUSOrderExec, cancelLSUSOrder, LSApiError, LS_US_ORDEREXEC_EMPTY_CODES,
   decideUSCashPayment, usCashOnlyUsdCap, usOrderableQty, formatCashOrderableLine,
-  computeUSOrderQty, formatUSOrderQty,
+  computeUSOrderQty, formatUSSize,
   evaluateCrossWon, formatCrossWonCheck, formatCrossWonLiveCand, formatUSLiveGate, LS_US_CROSS_WON_TR_CONFIRMED, type LSUSDeposit,
 } from '../src/lib/ls-api';
 import { loadUSUniverse, selectUSLiveCandidate, probeUSMasterExgubun, exgubunWithNyseAmex } from './us-universe';
@@ -625,12 +625,15 @@ async function main() {
       await refreshDeposit(true);          // BUY 직전 강제 재조회(P0-17 #4,#6 / P0-18 #9 재검증)
       // 통합증거금(타통화+원화, 채택=WonCashMin) 경로: BUY 직전 재조회로 cash-only·가능수량 재확인(P0-20).
       const crossWon = depFull ? evaluateCrossWon(depFull, buyPrice, liveCfg.htsOrderableQty) : null;
+      const usdGate = usOrderAllowed(buyPrice);
       // 확정경로(USD현금) 또는 통합증거금 경로(qty>=1 && cashOnly) 중 하나라도 최소1주 결제 허용이면 통과.
-      const cashPathOk = usOrderAllowed(buyPrice).allowed || !!(crossWon && crossWon.orderAllowed);
-      // P0-29A: 실제 주문수량 산정 — 1회 거래예산 기반. 예산 미설정이면 fail-closed(allowed=false).
-      //   orderableQty = floor(cashOnlyUsdCap / bestAsk), finalQty = min(orderableQty, floor(예산/bestAsk)).
-      const qtyDec = computeUSOrderQty({ perTradeBudgetUsd: liveCfg.perTradeBudgetUsd, cashOnlyUsdCap: depCash, bestAsk: buyPrice, maxQty: liveCfg.maxQty });
-      log.info(formatUSOrderQty(ctx.symbol, qtyDec, { perTradeBudgetUsd: liveCfg.perTradeBudgetUsd, cashOnlyUsdCap: depCash, bestAsk: buyPrice }));
+      const cashPathOk = usdGate.allowed || !!(crossWon && crossWon.orderAllowed);
+      // P0-29B: 실제 주문수량 산정 — 통합증거금(crossWon) orderableQty + 1회 거래예산 결합.
+      //   orderableQty = crossWon.programQty(WonCashMin/bestAsk·환율, USD현금 0 이어도 유효), USD현금경로 수량과 max.
+      //   finalQty = min(orderableQty, floor(예산/bestAsk)). 예산 미설정이면 fail-closed.
+      const orderableQty = Math.max(crossWon ? crossWon.programQty : 0, usdGate.dec?.qtyCountry ?? 0);
+      const qtyDec = computeUSOrderQty({ perTradeBudgetUsd: liveCfg.perTradeBudgetUsd, orderableQty, bestAsk: buyPrice, maxQty: liveCfg.maxQty });
+      log.info(formatUSSize(ctx.symbol, qtyDec, { perTradeBudgetUsd: liveCfg.perTradeBudgetUsd, bestAsk: buyPrice }));
       orderQty = qtyDec.finalQty;
       // 최종 게이트: 현금경로 허용 AND 예산기반 수량 산정 성공(전량매수 금지·예산 미설정 fail-closed).
       orderableQtyOk = cashPathOk && qtyDec.allowed;
@@ -679,6 +682,18 @@ async function main() {
       case 'DUPLICATE_CANDLE': return 'DUPLICATE_CANDLE';
       default: return 'CASH_GATE';
     }
+  }
+
+  // ── P0-29B: 종목별 '실주문 후보 유효성' — 예산으로 ≥1주 살 수 있고 현금경로(통합증거금)도 허용인가 ──
+  //   orderableQty = max(통합증거금 crossWon.programQty, USD현금 qtyCountry). USD현금 0 이어도 crossWon 기준 산정.
+  //   예산으로 최소 1주도 못 사는 종목(budgetQty=0)은 eligible=false → 러너가 다음 BUY 후보로 넘어간다.
+  function budgetEligibleFor(ctx: SymCtx): { eligible: boolean; qtyDec: ReturnType<typeof computeUSOrderQty> } {
+    const ask = ctx.bestAsk;
+    const crossWon = depFull ? evaluateCrossWon(depFull, ask, liveCfg.htsOrderableQty) : null;
+    const orderableQty = Math.max(crossWon ? crossWon.programQty : 0, usOrderAllowed(ask).dec?.qtyCountry ?? 0);
+    const qtyDec = computeUSOrderQty({ perTradeBudgetUsd: liveCfg.perTradeBudgetUsd, orderableQty, bestAsk: ask, maxQty: liveCfg.maxQty });
+    const cashPathOk = usOrderAllowed(ask).allowed || !!(crossWon && crossWon.orderAllowed);
+    return { eligible: cashPathOk && qtyDec.eligibleForLiveSelection, qtyDec };
   }
 
   // ── 10초마다 전 구독종목 스캔 → BUY 후보 랭킹 → 랭킹 1위부터 LIVE 게이트 (P0-23, AAPL 하드코딩 제거) ──
@@ -749,15 +764,25 @@ async function main() {
         log.info(`[US-SIGNAL] BUY candidates=${ranked.length}`);
         log.info(`[US-RANK] ` + ranked.slice(0, 5).map(c => `${c.rank} symbol=${c.shcode} exchange=${ctxs.get(c.shcode)?.exchange ?? '-'} score=${Math.round(c.score)}`).join(' '));
         const rankedUS = ranked.map(c => ({ symbol: c.shcode, exchcd: ctxs.get(c.shcode)?.exchcd ?? '', rank: c.rank, score: c.score }));
+        // P0-29B: 종목별 예산 유효성 사전평가(로그·선정 공용). 예산으로 ≥1주 못 사는 종목은 후보에서 제외.
+        for (const c of rankedUS) {
+          const cx = ctxs.get(c.symbol); if (!cx) continue;
+          const be = budgetEligibleFor(cx);
+          log.info(formatUSSize(c.symbol, be.qtyDec, { perTradeBudgetUsd: liveCfg.perTradeBudgetUsd, bestAsk: cx.bestAsk }));
+        }
+        const budgetEligibleCount = rankedUS.filter(c => {
+          const cx = ctxs.get(c.symbol);
+          return !!cx && cx.builder.confirmedCount >= MIN_RT_CANDLES && !cx.orders.hasPending() && budgetEligibleFor(cx).eligible;
+        }).length;
         const sel = selectUSLiveCandidate(rankedUS, (sym) => {
           const cx = ctxs.get(sym);
-          return { warmedUp: !!cx && cx.builder.confirmedCount >= MIN_RT_CANDLES, hasPending: !!cx && cx.orders.hasPending(), dailyExhausted: accountBoughtDate === etDate };
+          return { warmedUp: !!cx && cx.builder.confirmedCount >= MIN_RT_CANDLES, hasPending: !!cx && cx.orders.hasPending(), dailyExhausted: accountBoughtDate === etDate, budgetEligible: !!cx && budgetEligibleFor(cx).eligible };
         });
+        log.info(`[US-LIVE-SELECT] BUY후보=${rankedUS.length} budgetEligible=${budgetEligibleCount} 선택=${sel ? `${sel.symbol}(exchcd=${sel.exchcd},rank=${sel.rank})` : '없음(예산으로 최소1주 가능한 후보 없음/한도소진)'} — AAPL 하드코딩 아님`);
         if (accountBoughtDate === etDate) tickReason = 'DAILY_LIMIT';
         else if (!sel) tickReason = 'NO_ELIGIBLE_CANDIDATE';
         else if (armedMode) {
           const selCtx = ctxs.get(sel.symbol)!; const selCand = buyCands.find(c => c.symbol === sel.symbol)!;
-          log.info(`[US-LIVE-SELECT] 랭킹1위 실거래 대상 symbol=${sel.symbol}(exchcd=${sel.exchcd}) — AAPL 하드코딩 아님`);
           // 요구 9: BUY 게이트 REST(예수금 재조회/주문/미체결) 동안 백필 REST 예산 양보(주문 판단 비차단).
           pauseBackfill = true;
           try { tickReason = await evaluateArmed(selCtx, { action: 'BUY', candleDatetime: selCand.candleDatetime }, Date.now()); }

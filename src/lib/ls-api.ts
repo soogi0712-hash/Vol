@@ -902,9 +902,11 @@ export async function getLSUSDeposit(cfg: LSConfig, token: string): Promise<LSUS
 //     근거가 되지 못한다(별개 사실). 따라서 코드상수로 봉인한다.
 // ── P0-20: 실계정 실측 검증 완료 → 통합증거금(타통화+원화) 경로 확정 ──
 // HTS "타통화+원화 가능수량"=2 와 프로그램 WonDpsBalAmt/MnyoutAbleAmt/WonCashMin qty=2 정확 일치 확인.
-// cashOnly=true(OvrsMgn=0/LoanAmt=0/FcurrPldgAmt=0). 안전 우선으로 WonCashMin=min(WonDpsBalAmt,MnyoutAbleAmt) 채택.
+// cashOnly=true(OvrsMgn=0/LoanAmt=0). 안전 우선으로 WonCashMin=min(WonDpsBalAmt,MnyoutAbleAmt) 채택.
 //   → LS_US_CROSS_WON_TR_CONFIRMED=true 전환. CROSS_WON_ADOPTED_FIELD='WonCashMin'(아래).
-// 통합증거금이라도 신용/미수/대출 금지·현금 범위만: OvrsMgn/LoanAmt/FcurrPldgAmt 중 하나라도 >0 이면 차단.
+// 통합증거금이라도 신용/미수/대출 금지·현금 범위만: OvrsMgn/LoanAmt 중 하나라도 >0 이면 차단.
+// ⚠️ P0-29B: 외화담보(FcurrPldgAmt)는 차단 기준에서 제외(진단만). 담보는 대응 차입이 있어야 레버리지인데
+//    OvrsMgn/LoanAmt=0 이면 차입이 없어 레버리지가 아니다(체결 후 정상 결제/보유 금액). isCashOnly() 참조.
 export const LS_US_CROSS_WON_TR_CONFIRMED = true;   // 실측 검증 완료(P0-20)
 export type USPaymentMode = 'USD' | 'KRW' | 'NONE';
 export interface USCashDecision {
@@ -951,46 +953,47 @@ export function decideUSCashPayment(dep: LSUSDeposit, priceUsd: number, qty: num
   return { ...base, paymentMode: 'NONE', orderAllowed: false, reason: 'ORDERABLE_QTY_INSUFFICIENT' };
 }
 
-// ── P0-29A: 미국 실거래 주문수량 산정 (테스트 maxQty=1 하드제한 해제 → 1회 거래예산 기반 정수주 계산) ──
+// ── P0-29A/B: 미국 실거래 주문수량 산정 (maxQty=1 하드제한 없음 → 통합증거금 orderableQty + 1회 거래예산 결합) ──
 // 원칙(안전 최우선):
 //   · 전량매수 금지: qty=orderableQty(가용 전량) 로 사지 않는다. 1회 거래예산(perTradeBudgetUsd)으로 상한을 둔다.
 //   · fail-closed: 예산(LS_US_PER_TRADE_BUDGET_USD) 미설정/비정상(<=0) 이면 주문 금지(finalQty=0, allowed=false).
-//   · cash-only 유지: orderableQty = floor(cashOnlyUsdCap / bestAsk). cashOnlyUsdCap 은 신용/미수/증거금을 제외한
-//     현금상한(usCashOnlyUsdCap) 이므로 이 수량을 초과 주문하지 않는다(레버리지 절대 미사용).
+//   · P0-29B 근본수정: orderableQty 는 호출측이 산정한 '통합증거금(crossWon) 기준 매수가능 주수'를 그대로 받는다.
+//     USD현금(FcurrOrdAbleAmt)=0 이라는 이유로 orderableQty 를 0 으로 만들지 않는다(체결 후 차단 버그 제거).
 //   · finalQty = min(orderableQty, floor(perTradeBudgetUsd / bestAsk)) [설정 시 maxQty 상한 추가 적용].
+//   · eligibleForLiveSelection: 이 종목이 '실주문 후보'로 유효한가 = 예산으로 최소 1주 이상 살 수 있고 현금여력도 ≥1주.
+//     예산보다 1주가 비싼 종목(budgetQty=0)은 false → 러너가 다음 BUY 후보로 넘어간다(SIZE_GATE 무한반복 방지).
 export interface USQtyDecision {
   allowed: boolean;
   finalQty: number;
-  orderableQty: number;   // 현금상한 기준 매수가능 주수 = floor(cashOnlyUsdCap / bestAsk)
+  orderableQty: number;   // 통합증거금(crossWon) 기준 매수가능 주수(호출측 산정)
   budgetQty: number;      // 1회 거래예산 기준 주수 = floor(perTradeBudgetUsd / bestAsk)
+  eligibleForLiveSelection: boolean;   // 예산으로 ≥1주 && 현금여력 ≥1주 && 가격>0 && 예산설정
   reason: string;         // 'OK' | 'PRICE_UNAVAILABLE' | 'BUDGET_UNSET' | 'CASH_INSUFFICIENT' | 'BUDGET_TOO_SMALL'
 }
 export function computeUSOrderQty(p: {
   perTradeBudgetUsd: number | null;   // LS_US_PER_TRADE_BUDGET_USD. null/<=0 = 미설정 → fail-closed
-  cashOnlyUsdCap: number;             // usCashOnlyUsdCap(dep) — cash-only USD 상한
+  orderableQty: number;               // 통합증거금(crossWon) 기준 매수가능 주수 — 호출측이 evaluateCrossWon.programQty 등으로 산정
   bestAsk: number;                    // 매수 지정가(=GSH ask) USD
   maxQty?: number | null;             // 선택적 안전 상한(설정 시). 미설정=null → 예산이 상한을 결정
 }): USQtyDecision {
-  const zero = { finalQty: 0, orderableQty: 0, budgetQty: 0 };
+  const orderableQty = Math.max(0, Math.floor(p.orderableQty));
+  const zero = { finalQty: 0, orderableQty, budgetQty: 0, eligibleForLiveSelection: false };
   if (!(p.bestAsk > 0)) return { ...zero, allowed: false, reason: 'PRICE_UNAVAILABLE' };
-  const cap = p.cashOnlyUsdCap > 0 ? p.cashOnlyUsdCap : 0;
-  const orderableQty = Math.max(0, Math.floor(cap / p.bestAsk));
   // fail-closed: 예산 미설정/비정상 → 절대 주문하지 않는다(전량매수 방지의 핵심 장치).
-  if (p.perTradeBudgetUsd == null || !(p.perTradeBudgetUsd > 0)) {
-    return { ...zero, orderableQty, allowed: false, reason: 'BUDGET_UNSET' };
-  }
+  if (p.perTradeBudgetUsd == null || !(p.perTradeBudgetUsd > 0)) return { ...zero, allowed: false, reason: 'BUDGET_UNSET' };
   const budgetQty = Math.max(0, Math.floor(p.perTradeBudgetUsd / p.bestAsk));
-  if (orderableQty < 1) return { finalQty: 0, orderableQty, budgetQty, allowed: false, reason: 'CASH_INSUFFICIENT' };
-  if (budgetQty < 1) return { finalQty: 0, orderableQty, budgetQty, allowed: false, reason: 'BUDGET_TOO_SMALL' };
+  if (orderableQty < 1) return { finalQty: 0, orderableQty, budgetQty, eligibleForLiveSelection: false, allowed: false, reason: 'CASH_INSUFFICIENT' };
+  if (budgetQty < 1) return { finalQty: 0, orderableQty, budgetQty, eligibleForLiveSelection: false, allowed: false, reason: 'BUDGET_TOO_SMALL' };
   let finalQty = Math.min(orderableQty, budgetQty);
   if (p.maxQty != null && p.maxQty > 0) finalQty = Math.min(finalQty, Math.floor(p.maxQty));
-  return { finalQty, orderableQty, budgetQty, allowed: finalQty >= 1, reason: finalQty >= 1 ? 'OK' : 'QTY_ZERO' };
+  const ok = finalQty >= 1;
+  return { finalQty, orderableQty, budgetQty, eligibleForLiveSelection: ok, allowed: ok, reason: ok ? 'OK' : 'QTY_ZERO' };
 }
-// [US-ORDER-QTY] 산정 진단 로그 한 줄.
-export function formatUSOrderQty(symbol: string, d: USQtyDecision, p: { perTradeBudgetUsd: number | null; cashOnlyUsdCap: number; bestAsk: number }): string {
-  return `[US-ORDER-QTY ${symbol}] bestAsk=${p.bestAsk.toFixed(2)} 예산=${p.perTradeBudgetUsd == null ? '미설정' : p.perTradeBudgetUsd.toFixed(2)}USD`
-    + ` cashOnlyCap=${p.cashOnlyUsdCap.toFixed(2)}USD → orderableQty=${d.orderableQty} budgetQty=${d.budgetQty}`
-    + ` finalQty=${d.finalQty} allowed=${d.allowed}${d.allowed ? '' : ` (${d.reason})`}`;
+// [US-SIZE] 수량산정 진단 로그 한 줄(요구 형식).
+export function formatUSSize(symbol: string, d: USQtyDecision, p: { perTradeBudgetUsd: number | null; bestAsk: number }): string {
+  return `[US-SIZE ${symbol}] bestAsk=${p.bestAsk.toFixed(2)} perTradeBudgetUSD=${p.perTradeBudgetUsd == null ? '미설정' : p.perTradeBudgetUsd.toFixed(2)}`
+    + ` crossWonOrderableQty=${d.orderableQty} budgetQty=${d.budgetQty} finalQty=${d.finalQty}`
+    + ` eligibleForLiveSelection=${d.eligibleForLiveSelection} reason=${d.reason}`;
 }
 
 // ── ARMED cashOrderable 한 줄 로그 (P0-17) — 항상 캐시 기준. "미조회" 는 절대 출력하지 않는다 ──
@@ -1020,14 +1023,24 @@ export interface CrossWonEval {
   programQty: number;              // 채택 필드 기준(미채택이면 0)
   matchedKeys: CrossWonFieldKey[]; // htsQty 와 정확히 일치한 후보들(실측 대조 결과)
   match: boolean | null;           // htsQty!=null && 채택필드 있음 && programQty===htsQty
-  cashOnly: boolean;               // 미수/대출/담보 잔액 전부 0
-  cashOnlyBlockers: string[];      // cashOnly=false 사유(필드=값)
+  cashOnly: boolean;               // P0-29B: 미수(OvrsMgn)/대출(LoanAmt) 전부 0(=차입 없음)
+  cashOnlyBlockers: string[];      // cashOnly=false 사유(필드=값) — 미수/대출만
+  pledgeNote: string;              // P0-29B: 외화담보(FcurrPldgAmt) 진단 메모(차단 아님). 없으면 ''
   crossWonConfirmed: boolean;      // 코드상수(공식 필드 확정) — false 면 절대 허용 금지
   orderAllowed: boolean;
   reason: string;
 }
 // P0-20: 실측 검증 완료 → 안전 우선 WonCashMin(=min(WonDpsBalAmt,MnyoutAbleAmt)) 채택.
 export const CROSS_WON_ADOPTED_FIELD: CrossWonFieldKey | null = 'WonCashMin';
+
+// ── P0-29B: cash-only(레버리지 없음) 판정 — 미수/대출만 권위 기준 ──
+// 권위 필드: OvrsMgn(해외증거금/미수) 와 LoanAmt(대출). 둘 중 하나라도 >0 이면 차입/레버리지 사용 → cash-only 아님.
+// 외화담보(FcurrPldgAmt)는 '대응 차입을 뒷받침하는 담보' 성격이라 차입(OvrsMgn/LoanAmt)이 0 이면 레버리지가 될 수 없다.
+//   실계정에서 소액 체결 후 FcurrPldgAmt>0 이 나타나도(OvrsMgn=0/LoanAmt=0) 정상 결제/보유 관련 금액이므로
+//   단독으로 cash-only 를 깨지 않는다(추측 아님 — 담보는 차입 잔액이 있어야 레버리지라는 결정적 관계). 진단으로만 노출.
+export function isCashOnly(dep: LSUSDeposit): boolean {
+  return dep.overseasMargin <= 0 && dep.loanAmt <= 0;
+}
 
 // 채택 필드의 금액(원자료)과 통화기준. usCashOnlyUsdCap 이 trader USD 명목게이트용으로 USD 환산에 사용.
 export function crossWonAdoptedAmount(dep: LSUSDeposit): { amount: number; basis: 'USD' | 'KRW' } | null {
@@ -1045,8 +1058,11 @@ export function crossWonAdoptedAmount(dep: LSUSDeposit): { amount: number; basis
   }
 }
 // 채택 통합증거금 경로의 cash-only USD 환산 상한. 확정(코드상수)·cashOnly 아니면 0.
+// P0-29B: cash-only 판정은 미수(OvrsMgn)/대출(LoanAmt) 만 기준. 외화담보(FcurrPldgAmt)는 대응 차입이 있어야
+//   레버리지이므로 단독으로 상한을 0 으로 만들지 않는다(isCashOnly 참조). 이 필드 때문에 crossWon 상한이 사라져
+//   실주문 여력이 있는데도 차단되던 버그(체결 후 FcurrPldgAmt>0)를 수정.
 export function crossWonAdoptedUsdCap(dep: LSUSDeposit): number {
-  if (!dep.ok || dep.overseasMargin > 0 || dep.loanAmt > 0 || dep.fcurrPldgAmt > 0) return 0;   // cash-only 아니면 0
+  if (!dep.ok || !isCashOnly(dep)) return 0;   // cash-only(미수/대출 0) 아니면 0
   if (!LS_US_CROSS_WON_TR_CONFIRMED || CROSS_WON_ADOPTED_FIELD == null) return 0;
   const a = crossWonAdoptedAmount(dep);
   if (!a) return 0;
@@ -1075,12 +1091,13 @@ export function evaluateCrossWon(dep: LSUSDeposit, bestAsk: number, htsQty: numb
     mk('WonCashMin', '원화현금 한도 min(WonDpsBalAmt,MnyoutAbleAmt)', 'KRW', Math.min(dep.krwCash, dep.krwWithdrawable)),
   ];
   const matchedKeys = htsQty == null ? [] : candidates.filter(c => c.qty === htsQty).map(c => c.key);
-  // cash-only: 미수(OvrsMgn)/대출(LoanAmt)/담보(FcurrPldgAmt) 잔액 전부 0 이어야 함
+  // P0-29B cash-only: 미수(OvrsMgn)/대출(LoanAmt) 잔액만 권위 차단 기준(둘 다 0 이어야 cash-only).
+  //   외화담보(FcurrPldgAmt)는 차입이 있어야 레버리지 → OvrsMgn/LoanAmt=0 이면 단독으로 차단하지 않고 진단만 노출.
   const cashOnlyBlockers: string[] = [];
   if (dep.overseasMargin > 0) cashOnlyBlockers.push(`OvrsMgn=${dep.overseasMargin}`);
   if (dep.loanAmt > 0) cashOnlyBlockers.push(`LoanAmt=${dep.loanAmt}`);
-  if (dep.fcurrPldgAmt > 0) cashOnlyBlockers.push(`FcurrPldgAmt=${dep.fcurrPldgAmt}`);
-  const cashOnly = cashOnlyBlockers.length === 0;
+  const cashOnly = isCashOnly(dep);   // = cashOnlyBlockers.length === 0 (미수/대출 기준). FcurrPldgAmt 는 진단전용.
+  const pledgeNote = dep.fcurrPldgAmt > 0 ? `FcurrPldgAmt=${dep.fcurrPldgAmt}(외화담보·차입0이면 정상보유)` : '';
 
   const adoptedField = CROSS_WON_ADOPTED_FIELD;
   const adopted = adoptedField ? candidates.find(c => c.key === adoptedField) ?? null : null;
@@ -1101,7 +1118,7 @@ export function evaluateCrossWon(dep: LSUSDeposit, bestAsk: number, htsQty: numb
 
   return {
     bestAsk, baseXchRate: rate, htsQty, candidates, adoptedField, programQty,
-    matchedKeys, match, cashOnly, cashOnlyBlockers, crossWonConfirmed, orderAllowed, reason,
+    matchedKeys, match, cashOnly, cashOnlyBlockers, pledgeNote, crossWonConfirmed, orderAllowed, reason,
   };
 }
 // [CROSS-WON-CHECK] 최종 로그 라인(요구 형식).

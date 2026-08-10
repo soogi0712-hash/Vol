@@ -176,22 +176,33 @@ describe('P0-23 LIVE 후보 선정(요구 11) — AAPL 하드코딩 제거', () 
     { symbol: 'NVDA', exchcd: '82', rank: 2, score: 500 },
     { symbol: 'BA', exchcd: '81', rank: 3, score: 100 },
   ];
-  it('랭킹 1위가 준비완료+미보유+한도내 → 선택', () => {
-    const sel = selectUSLiveCandidate(ranked, () => ({ warmedUp: true, hasPending: false, dailyExhausted: false }));
+  it('랭킹 1위가 준비완료+미보유+한도내+예산가능 → 선택', () => {
+    const sel = selectUSLiveCandidate(ranked, () => ({ warmedUp: true, hasPending: false, dailyExhausted: false, budgetEligible: true }));
     expect(sel).toEqual({ symbol: 'TSLA', exchcd: '82', rank: 1 });
   });
   it('1위가 warm-up 미완/pending/한도소진이면 다음 순위로', () => {
     const sel = selectUSLiveCandidate(ranked, (s) => s === 'TSLA'
-      ? { warmedUp: false, hasPending: false, dailyExhausted: false }   // 1위 warm-up 미완
-      : { warmedUp: true, hasPending: false, dailyExhausted: false });
+      ? { warmedUp: false, hasPending: false, dailyExhausted: false, budgetEligible: true }   // 1위 warm-up 미완
+      : { warmedUp: true, hasPending: false, dailyExhausted: false, budgetEligible: true });
     expect(sel?.symbol).toBe('NVDA');
   });
   it('모두 부적격 → null(AAPL 로 폴백하지 않음)', () => {
-    const sel = selectUSLiveCandidate(ranked, () => ({ warmedUp: false, hasPending: false, dailyExhausted: false }));
+    const sel = selectUSLiveCandidate(ranked, () => ({ warmedUp: false, hasPending: false, dailyExhausted: false, budgetEligible: true }));
     expect(sel).toBeNull();
   });
   it('pending 있으면 그 종목은 건너뜀(동일 주문 방지)', () => {
-    const sel = selectUSLiveCandidate(ranked, (s) => ({ warmedUp: true, hasPending: s === 'TSLA', dailyExhausted: false }));
+    const sel = selectUSLiveCandidate(ranked, (s) => ({ warmedUp: true, hasPending: s === 'TSLA', dailyExhausted: false, budgetEligible: true }));
     expect(sel?.symbol).toBe('NVDA');
+  });
+  // ── P0-29B: 예산으로 최소 1주 못 사는 종목(budgetEligible=false) 제외 ──
+  it('P0-29B: 1위가 예산부적격(budgetQty=0, 예: AAPL $305/예산$60)이면 다음 BUY 후보 선택', () => {
+    const sel = selectUSLiveCandidate(ranked, (s) => s === 'TSLA'
+      ? { warmedUp: true, hasPending: false, dailyExhausted: false, budgetEligible: false }   // 1위 예산부적격
+      : { warmedUp: true, hasPending: false, dailyExhausted: false, budgetEligible: true });   // 2위 예산가능
+    expect(sel?.symbol).toBe('NVDA');
+  });
+  it('P0-29B: 모든 후보가 예산부적격 → null(강제 주문 안 함)', () => {
+    const sel = selectUSLiveCandidate(ranked, () => ({ warmedUp: true, hasPending: false, dailyExhausted: false, budgetEligible: false }));
+    expect(sel).toBeNull();
   });
 });

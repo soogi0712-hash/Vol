@@ -139,7 +139,9 @@ export function exgubunWithNyseAmex(probes: ExgubunProbe[]): string[] {
 }
 
 // ── LIVE 후보 선정(요구 11) — AAPL 하드코딩 제거. 랭킹 1위부터 준비완료+eligible 후보를 선택 ──
-export interface USCandidateReadiness { warmedUp: boolean; hasPending: boolean; dailyExhausted: boolean; }
+// P0-29B: budgetEligible 추가 — 1회 거래예산으로 최소 1주도 못 사는 종목(budgetQty=0)은 후보에서 제외하고
+//   다음 BUY 후보로 넘어간다(예: AAPL $305 / 예산 $60 → 제외, AAL $15 → 선택). SIZE_GATE 무한반복 방지.
+export interface USCandidateReadiness { warmedUp: boolean; hasPending: boolean; dailyExhausted: boolean; budgetEligible: boolean; }
 export interface RankedUSCandidate { symbol: string; exchcd: string; rank: number; score: number; }
 // ranked(순위) + 종목별 준비상태 → 실제 LIVE 게이트를 적용할 단일 후보. 없으면 null.
 export function selectUSLiveCandidate(
@@ -148,7 +150,7 @@ export function selectUSLiveCandidate(
 ): { symbol: string; exchcd: string; rank: number } | null {
   for (const c of ranked) {
     const r = readiness(c.symbol);
-    if (r.warmedUp && !r.hasPending && !r.dailyExhausted) return { symbol: c.symbol, exchcd: c.exchcd, rank: c.rank };
+    if (r.warmedUp && !r.hasPending && !r.dailyExhausted && r.budgetEligible) return { symbol: c.symbol, exchcd: c.exchcd, rank: c.rank };
   }
   return null;
 }

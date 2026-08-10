@@ -5,7 +5,7 @@ import {
   getLSUSTicks, getLSUSTicksPaged, lsOverseasChartRaw,
   placeLSUSBuyOrder, queryLSUSOrderExec, classifyOrderExec, LS_US_ORDEREXEC_EMPTY_CODES, getLSUSDeposit, getLSUSHoldings, cancelLSUSOrder, LS_CANCEL_TR_CONFIRMED, isUSOrderSuccess,
   decideUSCashPayment, usCashOnlyUsdCap, usOrderableQty, formatCashOrderableLine,
-  computeUSOrderQty, formatUSOrderQty,
+  computeUSOrderQty, formatUSSize, isCashOnly, crossWonAdoptedUsdCap,
   evaluateCrossWon, formatCrossWonCheck, formatCrossWonLiveCand, formatUSLiveGate, maskLSResponse, CROSS_WON_ADOPTED_FIELD, LS_US_CROSS_WON_TR_CONFIRMED, type LSUSDeposit,
   placeLSKRBuyOrder, queryLSKROrderExec, cancelLSKRBuyOrder, krIsuNo, isKROrderSuccess, getLSKRStockMaster,
   getLSUSStockMasterPage,
@@ -720,56 +720,93 @@ describe('해외 주문/체결/예수금 (공식 필드)', () => {
     expect(usCashOnlyUsdCap(dep({ overseasMargin: 5000 }), { crossWonVerified: true })).toBe(0);
   });
 
-  // ── P0-29A: 예산기반 주문수량 산정(computeUSOrderQty) — 전량매수 금지 + 예산 미설정 fail-closed ──
-  describe('P0-29A computeUSOrderQty — 1회 거래예산 기반 정수주', () => {
-    it('finalQty = min(orderableQty, floor(예산/bestAsk)) — 예산이 상한', () => {
-      // cashOnlyCap=10000/bestAsk=200 → orderableQty=50, 예산 1000/200 → budgetQty=5 → finalQty=5
-      const d = computeUSOrderQty({ perTradeBudgetUsd: 1000, cashOnlyUsdCap: 10000, bestAsk: 200 });
-      expect(d).toMatchObject({ allowed: true, finalQty: 5, orderableQty: 50, budgetQty: 5, reason: 'OK' });
+  // ── P0-29A/B: 예산기반 주문수량 산정(computeUSOrderQty) — 통합증거금 orderableQty + 예산, 전량매수 금지 ──
+  describe('P0-29B computeUSOrderQty — 통합증거금 orderableQty + 1회 거래예산', () => {
+    // 요구 4 고정 예시
+    it('예시: 주가 $15 / 예산 $60 / orderableQty 6 → finalQty=4', () => {
+      const d = computeUSOrderQty({ perTradeBudgetUsd: 60, orderableQty: 6, bestAsk: 15 });
+      expect(d).toMatchObject({ allowed: true, finalQty: 4, orderableQty: 6, budgetQty: 4, eligibleForLiveSelection: true, reason: 'OK' });
     });
-    it('전량매수 금지: 현금상한이 커도 예산으로 잘라 orderableQty 전량을 사지 않는다', () => {
-      const d = computeUSOrderQty({ perTradeBudgetUsd: 500, cashOnlyUsdCap: 100000, bestAsk: 100 });
-      expect(d.orderableQty).toBe(1000);   // 현금상한 기준 매수가능 전량
-      expect(d.finalQty).toBe(5);          // 예산(500/100)으로 제한 → 전량 아님
+    it('예시: 주가 $20 / 예산 $60 / orderableQty 10 → finalQty=3', () => {
+      const d = computeUSOrderQty({ perTradeBudgetUsd: 60, orderableQty: 10, bestAsk: 20 });
+      expect(d).toMatchObject({ allowed: true, finalQty: 3, budgetQty: 3 });
+    });
+    it('예시: 주가 $100 / 예산 $60 → budgetQty=0 → 후보 제외(eligibleForLiveSelection=false)', () => {
+      const d = computeUSOrderQty({ perTradeBudgetUsd: 60, orderableQty: 10, bestAsk: 100 });
+      expect(d).toMatchObject({ allowed: false, finalQty: 0, budgetQty: 0, eligibleForLiveSelection: false, reason: 'BUDGET_TOO_SMALL' });
+    });
+    it('예시: 주가 $15 / 예산 $60 / orderableQty 2 → finalQty=2(전량매수 아님·현금상한이 낮음)', () => {
+      const d = computeUSOrderQty({ perTradeBudgetUsd: 60, orderableQty: 2, bestAsk: 15 });
+      expect(d).toMatchObject({ allowed: true, finalQty: 2, orderableQty: 2, budgetQty: 4 });
+    });
+    it('crossWonOrderableQty=2 / budgetQty=4 → finalQty=2', () => {
+      const d = computeUSOrderQty({ perTradeBudgetUsd: 60, orderableQty: 2, bestAsk: 15 });
+      expect(d.finalQty).toBe(2);
+    });
+    it('AAPL $305 / 예산 $60 → budgetQty=0 → 후보 제외', () => {
+      const d = computeUSOrderQty({ perTradeBudgetUsd: 60, orderableQty: 3, bestAsk: 305 });
+      expect(d.budgetQty).toBe(0);
+      expect(d.eligibleForLiveSelection).toBe(false);
+      expect(d.finalQty).toBe(0);
+    });
+    it('USD현금 orderableQty 0 이어도 통합증거금 orderableQty>=1 이면 산정됨(체결후 차단 버그 제거)', () => {
+      // 핵심: cashOnlyCap(USD현금) 이 아니라 호출측이 넘긴 crossWon orderableQty 를 사용
+      const d = computeUSOrderQty({ perTradeBudgetUsd: 60, orderableQty: 2, bestAsk: 15 });
       expect(d.allowed).toBe(true);
-    });
-    it('현금상한이 예산보다 작으면 orderableQty 가 상한(현금 부족 방향)', () => {
-      // 현금 700/bestAsk 300 → orderableQty=2, 예산 5000/300 → 16 → finalQty=min(2,16)=2
-      const d = computeUSOrderQty({ perTradeBudgetUsd: 5000, cashOnlyUsdCap: 700, bestAsk: 300 });
-      expect(d).toMatchObject({ allowed: true, finalQty: 2, orderableQty: 2, budgetQty: 16 });
+      expect(d.finalQty).toBe(2);
     });
     it('fail-closed: 예산 미설정(null) → allowed=false, finalQty=0, reason=BUDGET_UNSET', () => {
-      const d = computeUSOrderQty({ perTradeBudgetUsd: null, cashOnlyUsdCap: 10000, bestAsk: 200 });
-      expect(d).toMatchObject({ allowed: false, finalQty: 0, reason: 'BUDGET_UNSET' });
-      expect(d.orderableQty).toBe(50);   // 참고용으로 계산은 하되 주문은 금지
+      const d = computeUSOrderQty({ perTradeBudgetUsd: null, orderableQty: 50, bestAsk: 200 });
+      expect(d).toMatchObject({ allowed: false, finalQty: 0, eligibleForLiveSelection: false, reason: 'BUDGET_UNSET' });
     });
     it('fail-closed: 예산 <=0 → BUDGET_UNSET', () => {
-      expect(computeUSOrderQty({ perTradeBudgetUsd: 0, cashOnlyUsdCap: 10000, bestAsk: 200 }).reason).toBe('BUDGET_UNSET');
-      expect(computeUSOrderQty({ perTradeBudgetUsd: -5, cashOnlyUsdCap: 10000, bestAsk: 200 }).allowed).toBe(false);
+      expect(computeUSOrderQty({ perTradeBudgetUsd: 0, orderableQty: 50, bestAsk: 200 }).reason).toBe('BUDGET_UNSET');
+      expect(computeUSOrderQty({ perTradeBudgetUsd: -5, orderableQty: 50, bestAsk: 200 }).allowed).toBe(false);
+    });
+    it('unknown cash state(orderableQty 0) → CASH_INSUFFICIENT, fail-closed', () => {
+      const d = computeUSOrderQty({ perTradeBudgetUsd: 60, orderableQty: 0, bestAsk: 15 });
+      expect(d).toMatchObject({ allowed: false, finalQty: 0, orderableQty: 0, eligibleForLiveSelection: false, reason: 'CASH_INSUFFICIENT' });
     });
     it('bestAsk<=0(가격 미확보) → PRICE_UNAVAILABLE, 차단', () => {
-      const d = computeUSOrderQty({ perTradeBudgetUsd: 1000, cashOnlyUsdCap: 10000, bestAsk: 0 });
+      const d = computeUSOrderQty({ perTradeBudgetUsd: 60, orderableQty: 10, bestAsk: 0 });
       expect(d).toMatchObject({ allowed: false, finalQty: 0, reason: 'PRICE_UNAVAILABLE' });
     });
-    it('현금 1주 미만 → CASH_INSUFFICIENT', () => {
-      const d = computeUSOrderQty({ perTradeBudgetUsd: 1000, cashOnlyUsdCap: 100, bestAsk: 300 });
-      expect(d).toMatchObject({ allowed: false, finalQty: 0, orderableQty: 0, reason: 'CASH_INSUFFICIENT' });
-    });
-    it('예산이 1주 미만 → BUDGET_TOO_SMALL', () => {
-      const d = computeUSOrderQty({ perTradeBudgetUsd: 100, cashOnlyUsdCap: 10000, bestAsk: 300 });
-      expect(d).toMatchObject({ allowed: false, finalQty: 0, budgetQty: 0, reason: 'BUDGET_TOO_SMALL' });
-    });
     it('선택적 maxQty 상한 — 설정 시 finalQty 를 추가로 제한', () => {
-      // orderableQty=50, budgetQty=5, maxQty=3 → finalQty=3
-      const d = computeUSOrderQty({ perTradeBudgetUsd: 1000, cashOnlyUsdCap: 10000, bestAsk: 200, maxQty: 3 });
+      // orderableQty=6, budgetQty=4, maxQty=3 → finalQty=3
+      const d = computeUSOrderQty({ perTradeBudgetUsd: 60, orderableQty: 6, bestAsk: 15, maxQty: 3 });
       expect(d).toMatchObject({ allowed: true, finalQty: 3 });
     });
-    it('formatUSOrderQty — 한 줄 진단 로그(finalQty/allowed 노출)', () => {
-      const d = computeUSOrderQty({ perTradeBudgetUsd: 1000, cashOnlyUsdCap: 10000, bestAsk: 200 });
-      const s = formatUSOrderQty('AAPL', d, { perTradeBudgetUsd: 1000, cashOnlyUsdCap: 10000, bestAsk: 200 });
-      expect(s).toContain('[US-ORDER-QTY AAPL]');
-      expect(s).toContain('finalQty=5');
-      expect(s).toContain('allowed=true');
+    it('formatUSSize — [US-SIZE] 한 줄 로그(요구 필드 노출)', () => {
+      const d = computeUSOrderQty({ perTradeBudgetUsd: 60, orderableQty: 6, bestAsk: 15 });
+      const s = formatUSSize('AAL', d, { perTradeBudgetUsd: 60, bestAsk: 15 });
+      expect(s).toContain('[US-SIZE AAL]');
+      expect(s).toContain('perTradeBudgetUSD=60.00');
+      expect(s).toContain('crossWonOrderableQty=6');
+      expect(s).toContain('budgetQty=4');
+      expect(s).toContain('finalQty=4');
+      expect(s).toContain('eligibleForLiveSelection=true');
+    });
+  });
+
+  // ── P0-29B: isCashOnly / crossWonAdoptedUsdCap — FcurrPldgAmt 공식 의미 재검증 반영 ──
+  describe('P0-29B isCashOnly — 미수/대출만 권위 기준(FcurrPldgAmt 제외)', () => {
+    it('OvrsMgn=0 && LoanAmt=0 이면 FcurrPldgAmt>0 이어도 cash-only=true', () => {
+      expect(isCashOnly(dep({ overseasMargin: 0, loanAmt: 0, fcurrPldgAmt: 15.54 }))).toBe(true);
+    });
+    it('OvrsMgn>0 → cash-only=false', () => {
+      expect(isCashOnly(dep({ overseasMargin: 1 }))).toBe(false);
+    });
+    it('LoanAmt>0 → cash-only=false', () => {
+      expect(isCashOnly(dep({ loanAmt: 1 }))).toBe(false);
+    });
+    it('crossWonAdoptedUsdCap: FcurrPldgAmt>0(차입0) 이어도 상한 유지(0 으로 만들지 않음)', () => {
+      // 실계정 재현: usdOrderable(FcurrOrdAbleAmt)=0, 원화현금 100만, 환율 1418.8, FcurrPldgAmt=15.54
+      const d = dep({ usdOrderable: 0, krwCash: 1000742, krwWithdrawable: 1000742, baseXchRate: 1418.8, fcurrPldgAmt: 15.54 });
+      expect(crossWonAdoptedUsdCap(d)).toBeCloseTo(1000742 / 1418.8, 0);   // >0 (WonCashMin 환산)
+    });
+    it('crossWonAdoptedUsdCap: 실제 차입(LoanAmt>0) 있으면 0', () => {
+      const d = dep({ usdOrderable: 0, krwCash: 1000742, krwWithdrawable: 1000742, baseXchRate: 1418.8, loanAmt: 1 });
+      expect(crossWonAdoptedUsdCap(d)).toBe(0);
     });
   });
 
@@ -804,10 +841,11 @@ describe('해외 주문/체결/예수금 (공식 필드)', () => {
     expect(e.orderAllowed).toBe(false);
     expect(e.reason).toBe('HTS_QTY_MISMATCH');
   });
-  it('P0-18 cash-only: 미수/대출/담보 잔액 있으면 cashOnly=false + 차단필드 보고', () => {
+  it('P0-29B cash-only: 미수/대출만 차단필드로 보고(FcurrPldgAmt 제외)', () => {
     const e = evaluateCrossWon(dep({ overseasMargin: 5000, loanAmt: 100, fcurrPldgAmt: 3.5 }), 311, 2);
     expect(e.cashOnly).toBe(false);
-    expect(e.cashOnlyBlockers).toEqual(['OvrsMgn=5000', 'LoanAmt=100', 'FcurrPldgAmt=3.5']);
+    expect(e.cashOnlyBlockers).toEqual(['OvrsMgn=5000', 'LoanAmt=100']);   // FcurrPldgAmt 는 차단 아님
+    expect(e.pledgeNote).toContain('FcurrPldgAmt=3.5');                     // 진단으로만 노출
   });
   it('P0-18 cash-only: 잔액 전부 0 → cashOnly=true', () => {
     const e = evaluateCrossWon(dep({ overseasMargin: 0, loanAmt: 0, fcurrPldgAmt: 0 }), 311, 0);
@@ -857,7 +895,7 @@ describe('해외 주문/체결/예수금 (공식 필드)', () => {
     expect(e.adoptedField).toBe('WonCashMin');
     expect(e.programQty).toBe(2);
     expect(e.match).toBe(true);          // HTS=2 == PROGRAM=2
-    expect(e.cashOnly).toBe(true);       // OvrsMgn/Loan/Pldg 전부 0
+    expect(e.cashOnly).toBe(true);       // OvrsMgn/Loan 전부 0(P0-29B: FcurrPldgAmt 는 판정 제외)
     expect(e.orderAllowed).toBe(true);
     expect(e.reason).toBe('OK');
   });
@@ -928,10 +966,17 @@ describe('해외 주문/체결/예수금 (공식 필드)', () => {
     expect(e.orderAllowed).toBe(false); expect(e.reason).toBe('NOT_CASH_ONLY');
     expect(formatUSLiveGate('AAPL', { ...gateOn, e })).toContain('POST_ALLOWED=false');
   });
-  it('P0-20 차단: FcurrPldgAmt>0 → POST_ALLOWED=false (NOT_CASH_ONLY)', () => {
-    const e = evaluateCrossWon(dep({ ...real(), fcurrPldgAmt: 0.5 } as any), 313.22, 2);
+  it('P0-29B 허용(버그수정): FcurrPldgAmt>0 이어도 OvrsMgn=0/LoanAmt=0 이면 cashOnly=true → POST_ALLOWED=true', () => {
+    // 실계정 재현: 체결 후 FcurrPldgAmt=15.54 발생. 차입(미수/대출)이 0 이면 담보는 정상 결제/보유 금액 → 차단 안 함.
+    const e = evaluateCrossWon(dep({ ...real(), fcurrPldgAmt: 15.54 } as any), 313.22, 2);
+    expect(e.cashOnly).toBe(true);
+    expect(e.orderAllowed).toBe(true); expect(e.reason).toBe('OK');
+    expect(e.pledgeNote).toContain('FcurrPldgAmt=15.54');
+    expect(formatUSLiveGate('AAPL', { ...gateOn, e })).toContain('POST_ALLOWED=true');
+  });
+  it('P0-29B 차단 유지: FcurrPldgAmt>0 이면서 실제 차입(LoanAmt>0) 있으면 NOT_CASH_ONLY', () => {
+    const e = evaluateCrossWon(dep({ ...real(), fcurrPldgAmt: 15.54, loanAmt: 1 } as any), 313.22, 2);
     expect(e.orderAllowed).toBe(false); expect(e.reason).toBe('NOT_CASH_ONLY');
-    expect(formatUSLiveGate('AAPL', { ...gateOn, e })).toContain('POST_ALLOWED=false');
   });
   it('P0-20 게이트 OFF: LS_LIVE_TRADING=false → 주문가능해도 POST_ALLOWED=false(GATE_OFF)', () => {
     const e = evaluateCrossWon(real(), 313.22, 2);
