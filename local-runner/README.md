@@ -70,6 +70,35 @@ npm run ls:trade
 공식 TR(필드 확인분): 매수 `CSPAT00601`(BnsTpCode=2, OrdprcPtnCode=00) → OrdNo · 체결조회
 `CSPAQ13700`(OutBlock2 BuyOrdQty/BuyExecQty) · 취소 `CSPAT00801`(OrgOrdNo/IsuNo/OrdQty, rsp_cd 00156=취소접수).
 
+### 3-2) 국내 전 종목 라운드로빈 스캔 (P0-22) — `npm run ls:kr-scan`
+
+`ls:trade` 는 `LS_KR_SYMBOLS` 고정 소수 종목만 봅니다. 전 종목 스캔은 **별도 러너** `ls:kr-scan` 입니다.
+
+- **① 유니버스 자동 로드**: LS 공식 종목마스터 **`t8436`** (gubun=1 KOSPI, gubun=2 KOSDAQ) 로 전 종목 로드,
+  shcode dedup. 시작 로그 `[KR-UNIVERSE] total=.. eligible=.. excluded=.. (ETF_ETN=.. PREFERRED=.. SPAC=.. ..)
+  KOSPI=.. KOSDAQ=..`.
+- **② eligibility 필터**(요구 2): ETF/ETN(`etfgubun≠0`), SPAC(`spac_gubun=Y` 또는 이름 '스팩'), 우선주(이름 접미
+  '우'/코드 끝자리 non-0), 전일종가≤0(신규/거래정지 성격) 제외. `LS_KR_INCLUDE_ETF=true` 면 ETF/ETN 포함.
+  ⚠️ 거래정지/관리/정리매매/상폐예정 은 t8436 마스터에 확정 필드가 없어(추측 금지) 마스터 단계에선 전일종가≤0
+  만 거르고, 실제 정지 종목은 스캔 시 15분봉 데이터 없음/거래량 0 으로 자연 배제(런타임 liveness).
+- **③ rate limit 준수**(요구 4): `t8412`(15분봉) 공식 초당한도 = **개인 1/s, 법인 3/s**. `LS_KR_SCAN_REQ_PER_SEC`
+  (기본 1) 로 주입, 슬라이딩 1초 윈도우 rate limiter 가 **절대 초과하지 않음**.
+- **④ 라운드로빈 배치 스캔**(요구 4·5·12): eligible 전체를 커서로 순환. `[KR-CAPACITY]` 에 `전체1순환=..s
+  15분내전종목평가가능=true/false` 를 출력. ⚠️ **개인 1/s 로는 eligible ~2,000 을 15분(900s) 안에 전부 평가 불가**
+  (순환 ~33분) → 커서를 이어가며 순차 커버. 법인 3/s(≈667s) 면 15분 내 전종목 커버(요구 12 충족).
+- **⑤ 확정봉 캐시**(요구 6): 같은 15분 확정봉(`krConfirmedBucket`, KST 시장 공통 경계)은 재조회·재평가 안 함.
+  봉이 바뀌면 새 사이클.
+- **⑥ lightweight prefilter**(요구 7): 현재가/거래량/거래대금>0 만 먼저 확인 후 BB+RSI. **거래대금 상위 N 컷 없음**.
+- **⑦ 전략 불변**(요구 8): `calcBB(20,2)` + `calcRSI(14)` + `getBBSignal` 그대로. 확정봉 40개 이상.
+- **⑧ BUY 후보 순위**(요구 9): 거래대금 > 유동성 > BB 하단이탈/복귀강도 > RSI 반등강도. `[KR-SIGNAL]`/`[KR-RANK]`
+  로그. 상위 후보부터 실거래 게이트 적용.
+- **⑨ 안전장치 전부 유지**(요구 10): 현금만(`MnyOrdAbleAmt`, 신용/미수 미사용) · pending 차단 · 동일봉 중복금지 ·
+  주문 직전 현금 재확인(`executeKRBuyOrder`) · 하루 매수 1회 · maxQty 1. 실주문은 `LS_LIVE_TRADING=true` 일 때만.
+- **로그**(요구 11): `[KR-SCAN] batch=x/y processed=N remaining=N cycleElapsedSec=N`, `[KR-SIGNAL] BUY candidates=N`,
+  `[KR-RANK] 1 code=.. 2 code=..`.
+
+대량 유니버스에서 전 종목 OrderStore 를 즉시 만들지 않고(**lazy**), 상태파일이 있는 종목만 시작 시 복원.
+
 #### 🔴 중복주문 방지 (SK하이닉스 3중 체결 버그 수정)
 
 실계정에서 같은 15분봉에 1주씩 3회 체결된 사고를 다음으로 수정했습니다:

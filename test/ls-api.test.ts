@@ -6,7 +6,7 @@ import {
   placeLSUSBuyOrder, queryLSUSOrderExec, getLSUSDeposit, getLSUSHoldings, cancelLSUSOrder, LS_CANCEL_TR_CONFIRMED, isUSOrderSuccess,
   decideUSCashPayment, usCashOnlyUsdCap, usOrderableQty, formatCashOrderableLine,
   evaluateCrossWon, formatCrossWonCheck, formatCrossWonLiveCand, formatUSLiveGate, maskLSResponse, CROSS_WON_ADOPTED_FIELD, LS_US_CROSS_WON_TR_CONFIRMED, type LSUSDeposit,
-  placeLSKRBuyOrder, queryLSKROrderExec, cancelLSKRBuyOrder, krIsuNo, isKROrderSuccess,
+  placeLSKRBuyOrder, queryLSKROrderExec, cancelLSKRBuyOrder, krIsuNo, isKROrderSuccess, getLSKRStockMaster,
   toLSOverseasExchcd, LSApiError, configureLSRateLimiter, classifyChart,
   LS_G3203_MAX_QRYCNT_UNCOMPRESSED,
 } from '../src/lib/ls-api';
@@ -817,6 +817,34 @@ describe('해외 주문/체결/예수금 (공식 필드)', () => {
     const aapl = r.holdings.find(h => h.symbol === 'AAPL');
     expect(aapl?.balQty).toBe(1);
     expect(aapl?.sellableQty).toBe(1);
+  });
+});
+
+describe('국내 종목마스터 t8436 (P0-22)', () => {
+  it('t8436 파싱 — shcode/hname/market(gubun)/spac/etf/전일종가', async () => {
+    stubFetch((url, init) => {
+      expect(url).toBe('https://openapi.ls-sec.co.kr:8080/stock/etc');
+      expect(init.headers['tr_cd']).toBe('t8436');
+      expect(JSON.parse(init.body).t8436InBlock.gubun).toBe('1');
+      return { json: { rsp_cd: '00000', t8436OutBlock: [
+        { shcode: '005930', hname: '삼성전자', gubun: '1', spac_gubun: 'N', etfgubun: '0', jnilclose: 70000, uplmtprice: 91000, dnlmtprice: 49000, recprice: 70000, memedan: '00001', expcode: 'KR7005930003' },
+        { shcode: '069500', hname: 'KODEX 200', gubun: '1', spac_gubun: 'N', etfgubun: '1', jnilclose: 40000 },
+      ] } };
+    });
+    const r = await getLSKRStockMaster(cfg, 'T', '1');
+    expect(r.rspCd).toBe('00000');
+    expect(r.rows).toHaveLength(2);
+    expect(r.rows[0]).toMatchObject({ shcode: '005930', hname: '삼성전자', market: 'KOSPI', spac: false, etf: false, prevClose: 70000 });
+    expect(r.rows[1]).toMatchObject({ shcode: '069500', etf: true, etfgubun: '1' });   // ETF 구분
+  });
+  it('t8436 gubun=2 → market=KOSDAQ, spac_gubun=Y → spac=true', async () => {
+    stubFetch(() => ({ json: { rsp_cd: '00000', t8436OutBlock: [
+      { shcode: '247540', hname: '에코프로비엠', gubun: '2', spac_gubun: 'N', etfgubun: '0', jnilclose: 100000 },
+      { shcode: '456780', hname: '스팩1호', gubun: '2', spac_gubun: 'Y', etfgubun: '0', jnilclose: 2000 },
+    ] } }));
+    const r = await getLSKRStockMaster(cfg, 'T', '2');
+    expect(r.rows[0].market).toBe('KOSDAQ');
+    expect(r.rows[1].spac).toBe(true);
   });
 });
 

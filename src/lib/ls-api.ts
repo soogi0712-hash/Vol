@@ -321,6 +321,45 @@ export async function getLSKR15Min(cfg: LSConfig, token: string, shcode: string,
   };
 }
 
+// ── 국내 종목마스터 (t8436, /stock/etc) — KOSPI+KOSDAQ 전 종목 자동 로드 ──
+// 공식 resExample OutBlock: shcode/hname/gubun(시장구분)/spac_gubun(SPAC)/etfgubun(ETF)/bu12gubun/memedan/
+//   jnilclose(전일종가)/uplmtprice(상한)/dnlmtprice(하한)/recprice(기준가)/expcode(ISIN).
+// 요청 gubun: '1'=코스피(공식 예제 확인), '2'=코스닥(LS 표준). 응답 row.gubun 으로도 시장을 분류한다.
+// ⚠️ 공식 전송한도 t8436 = 초당 2건(개인)/5건(법인) — 시작 시 1~2회만 호출.
+export interface LSKRMasterRow {
+  shcode: string; hname: string; market: 'KOSPI' | 'KOSDAQ' | 'ETC'; gubunRaw: string;
+  spac: boolean; etf: boolean; etfgubun: string;
+  prevClose: number; upperLimit: number; lowerLimit: number; basePrice: number; memedan: string; expcode: string;
+}
+export const LS_KR_MASTER_KOSPI = '1';   // 공식 예제로 확인(gubun='1' → KOSPI 종목 반환)
+export const LS_KR_MASTER_KOSDAQ = '2';  // LS 표준(코스닥)
+function marketFromGubun(g: string): 'KOSPI' | 'KOSDAQ' | 'ETC' {
+  return g === '1' ? 'KOSPI' : g === '2' ? 'KOSDAQ' : 'ETC';
+}
+export async function getLSKRStockMaster(cfg: LSConfig, token: string, gubun: string): Promise<{ rspCd: string; rspMsg: string; rows: LSKRMasterRow[]; diag: LSHttpDiag }> {
+  const { data, rspCd, rspMsg, diag } = await lsPost(token, '/stock/etc', 't8436', { t8436InBlock: { gubun } });
+  const raw: any[] = data.t8436OutBlock || [];
+  const rows: LSKRMasterRow[] = raw.map(r => {
+    const gRaw = String(r.gubun ?? '');
+    return {
+      shcode: String(r.shcode ?? ''),
+      hname: String(r.hname ?? ''),
+      market: marketFromGubun(gRaw),
+      gubunRaw: gRaw,
+      spac: String(r.spac_gubun ?? 'N').toUpperCase() === 'Y',
+      etf: String(r.etfgubun ?? '0') !== '0',   // etfgubun '0'=일반, 그 외=ETF/ETN
+      etfgubun: String(r.etfgubun ?? '0'),
+      prevClose: toNum(r.jnilclose),
+      upperLimit: toNum(r.uplmtprice),
+      lowerLimit: toNum(r.dnlmtprice),
+      basePrice: toNum(r.recprice),
+      memedan: String(r.memedan ?? ''),
+      expcode: String(r.expcode ?? ''),
+    };
+  });
+  return { rspCd, rspMsg, rows, diag };
+}
+
 // ── 해외 15분봉 (g3203, ncnt=15) — OutBlock1: date/loctime/open/high/low/close/exevol ──
 // ⚠️ 공식 제한(g3203): comp_yn='N'(비압축) → qrycnt 최대 5. comp_yn='Y'(압축) → 최대 2000.
 //    압축응답 해제 방식은 공식 문서에서 확인되지 않았으므로 여기서는 비압축(N, 상한 5)만 사용한다.
