@@ -1,5 +1,6 @@
 // Phase 3A 실전 설정 — 환경변수에서 읽는다. 오늘 실전 제한을 코드로 강제한다.
-//   대상 1종목(NASDAQ:AAPL), 최대 1주, 지정가만, 하루 매수/매도 각 1회.
+//   지정가만, 하루 매수/매도 각 1회. 주문수량은 P0-29A 로 1회 거래예산(LS_US_PER_TRADE_BUDGET_USD)
+//   기반 정수주 계산으로 전환(테스트 maxQty=1 하드제한 해제). 예산 미설정 시 fail-closed(주문 금지).
 // ⚠️ 자동취소 REST(COSAT00311)는 공식 필드 미확인 → AUTO_CANCEL_MODE 불가.
 //    대신 MANUAL_CANCEL_MODE(수동취소)로 운영: 미체결 시 사용자 수동취소 요구, AS3 수신 시에만 다음 BUY.
 import { toLSOverseasExchcd, LS_CANCEL_TR_CONFIRMED, LS_US_CROSS_WON_TR_CONFIRMED, CROSS_WON_ADOPTED_FIELD } from '../src/lib/ls-api';
@@ -8,7 +9,8 @@ export interface LiveConfig {
   liveSymbol: string;          // 'AAPL'
   liveExchange: string;        // 'NASDAQ'
   liveExchcd: string;          // '82'
-  maxQty: number;              // 1 (상한 강제)
+  maxQty: number | null;       // 선택적 안전 상한(주수). 미설정=null → 예산이 상한을 결정(P0-29A, 하드1 제거)
+  perTradeBudgetUsd: number | null;  // LS_US_PER_TRADE_BUDGET_USD — 1회 거래예산(USD). 미설정=null → fail-closed
   dailyMaxBuys: number;        // 1
   dailyMaxSells: number;       // 1
   armed: boolean;              // LS_TRADING_ARMED
@@ -38,8 +40,11 @@ export function loadLiveConfig(): LiveConfig {
   const autoCancel = process.env.LS_AUTO_CANCEL_MODE === 'true' && LS_CANCEL_TR_CONFIRMED;   // 코드상수 false → 항상 false
   return {
     liveSymbol, liveExchange, liveExchcd,
-    maxQty: intEnv('LS_US_MAX_QTY', 1, 1, 1),               // 오늘은 상한 1주로 하드 제한
-    dailyMaxBuys: intEnv('LS_US_DAILY_MAX_BUYS', 1, 0, 1),  // 오늘은 최대 1
+    // 선택적 안전 상한(주수). 미설정=null → 1회 거래예산이 상한을 결정(P0-29A: maxQty=1 하드제한 제거).
+    maxQty: (() => { const v = process.env.LS_US_MAX_QTY; if (v == null || v.trim() === '') return null; const n = parseInt(v, 10); return Number.isFinite(n) && n > 0 ? n : null; })(),
+    // 1회 거래예산(USD). 미설정/비정상(<=0) → null → 주문 fail-closed(전량매수 방지의 핵심).
+    perTradeBudgetUsd: (() => { const v = process.env.LS_US_PER_TRADE_BUDGET_USD; if (v == null || v.trim() === '') return null; const n = Number(v); return Number.isFinite(n) && n > 0 ? n : null; })(),
+    dailyMaxBuys: intEnv('LS_US_DAILY_MAX_BUYS', 1, 0, 1),  // 오늘은 최대 1(하루 BUY 1회 유지)
     dailyMaxSells: intEnv('LS_US_DAILY_MAX_SELLS', 1, 0, 1),
     armed: process.env.LS_TRADING_ARMED === 'true',
     liveTrading: process.env.LS_LIVE_TRADING === 'true',

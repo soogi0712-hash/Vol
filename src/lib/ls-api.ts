@@ -951,6 +951,48 @@ export function decideUSCashPayment(dep: LSUSDeposit, priceUsd: number, qty: num
   return { ...base, paymentMode: 'NONE', orderAllowed: false, reason: 'ORDERABLE_QTY_INSUFFICIENT' };
 }
 
+// ── P0-29A: 미국 실거래 주문수량 산정 (테스트 maxQty=1 하드제한 해제 → 1회 거래예산 기반 정수주 계산) ──
+// 원칙(안전 최우선):
+//   · 전량매수 금지: qty=orderableQty(가용 전량) 로 사지 않는다. 1회 거래예산(perTradeBudgetUsd)으로 상한을 둔다.
+//   · fail-closed: 예산(LS_US_PER_TRADE_BUDGET_USD) 미설정/비정상(<=0) 이면 주문 금지(finalQty=0, allowed=false).
+//   · cash-only 유지: orderableQty = floor(cashOnlyUsdCap / bestAsk). cashOnlyUsdCap 은 신용/미수/증거금을 제외한
+//     현금상한(usCashOnlyUsdCap) 이므로 이 수량을 초과 주문하지 않는다(레버리지 절대 미사용).
+//   · finalQty = min(orderableQty, floor(perTradeBudgetUsd / bestAsk)) [설정 시 maxQty 상한 추가 적용].
+export interface USQtyDecision {
+  allowed: boolean;
+  finalQty: number;
+  orderableQty: number;   // 현금상한 기준 매수가능 주수 = floor(cashOnlyUsdCap / bestAsk)
+  budgetQty: number;      // 1회 거래예산 기준 주수 = floor(perTradeBudgetUsd / bestAsk)
+  reason: string;         // 'OK' | 'PRICE_UNAVAILABLE' | 'BUDGET_UNSET' | 'CASH_INSUFFICIENT' | 'BUDGET_TOO_SMALL'
+}
+export function computeUSOrderQty(p: {
+  perTradeBudgetUsd: number | null;   // LS_US_PER_TRADE_BUDGET_USD. null/<=0 = 미설정 → fail-closed
+  cashOnlyUsdCap: number;             // usCashOnlyUsdCap(dep) — cash-only USD 상한
+  bestAsk: number;                    // 매수 지정가(=GSH ask) USD
+  maxQty?: number | null;             // 선택적 안전 상한(설정 시). 미설정=null → 예산이 상한을 결정
+}): USQtyDecision {
+  const zero = { finalQty: 0, orderableQty: 0, budgetQty: 0 };
+  if (!(p.bestAsk > 0)) return { ...zero, allowed: false, reason: 'PRICE_UNAVAILABLE' };
+  const cap = p.cashOnlyUsdCap > 0 ? p.cashOnlyUsdCap : 0;
+  const orderableQty = Math.max(0, Math.floor(cap / p.bestAsk));
+  // fail-closed: 예산 미설정/비정상 → 절대 주문하지 않는다(전량매수 방지의 핵심 장치).
+  if (p.perTradeBudgetUsd == null || !(p.perTradeBudgetUsd > 0)) {
+    return { ...zero, orderableQty, allowed: false, reason: 'BUDGET_UNSET' };
+  }
+  const budgetQty = Math.max(0, Math.floor(p.perTradeBudgetUsd / p.bestAsk));
+  if (orderableQty < 1) return { finalQty: 0, orderableQty, budgetQty, allowed: false, reason: 'CASH_INSUFFICIENT' };
+  if (budgetQty < 1) return { finalQty: 0, orderableQty, budgetQty, allowed: false, reason: 'BUDGET_TOO_SMALL' };
+  let finalQty = Math.min(orderableQty, budgetQty);
+  if (p.maxQty != null && p.maxQty > 0) finalQty = Math.min(finalQty, Math.floor(p.maxQty));
+  return { finalQty, orderableQty, budgetQty, allowed: finalQty >= 1, reason: finalQty >= 1 ? 'OK' : 'QTY_ZERO' };
+}
+// [US-ORDER-QTY] 산정 진단 로그 한 줄.
+export function formatUSOrderQty(symbol: string, d: USQtyDecision, p: { perTradeBudgetUsd: number | null; cashOnlyUsdCap: number; bestAsk: number }): string {
+  return `[US-ORDER-QTY ${symbol}] bestAsk=${p.bestAsk.toFixed(2)} 예산=${p.perTradeBudgetUsd == null ? '미설정' : p.perTradeBudgetUsd.toFixed(2)}USD`
+    + ` cashOnlyCap=${p.cashOnlyUsdCap.toFixed(2)}USD → orderableQty=${d.orderableQty} budgetQty=${d.budgetQty}`
+    + ` finalQty=${d.finalQty} allowed=${d.allowed}${d.allowed ? '' : ` (${d.reason})`}`;
+}
+
 // ── ARMED cashOrderable 한 줄 로그 (P0-17) — 항상 캐시 기준. "미조회" 는 절대 출력하지 않는다 ──
 // 성공(ok): `cashOrderable=<금액> USD (rsp_cd=...)`. 실패: `cashOrderable=조회실패 rsp_cd=... rsp_msg=...`.
 // rspMsg 는 호출측에서 마스킹(scrub) 후 넘긴다.

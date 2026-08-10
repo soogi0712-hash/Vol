@@ -1,24 +1,40 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { loadLiveConfig, isLiveSymbol } from '../local-runner/live-config';
 
-const KEYS = ['LS_US_LIVE_SYMBOL', 'LS_US_MAX_QTY', 'LS_US_DAILY_MAX_BUYS', 'LS_US_DAILY_MAX_SELLS', 'LS_TRADING_ARMED', 'LS_LIVE_TRADING', 'LS_CANCEL_TR_CONFIRMED', 'LS_US_PENDING_TIMEOUT_SEC', 'LS_US_HTS_ORDERABLE_QTY', 'LS_US_CROSS_WON_VERIFIED'];
+const KEYS = ['LS_US_LIVE_SYMBOL', 'LS_US_MAX_QTY', 'LS_US_PER_TRADE_BUDGET_USD', 'LS_US_DAILY_MAX_BUYS', 'LS_US_DAILY_MAX_SELLS', 'LS_TRADING_ARMED', 'LS_LIVE_TRADING', 'LS_CANCEL_TR_CONFIRMED', 'LS_US_PENDING_TIMEOUT_SEC', 'LS_US_HTS_ORDERABLE_QTY', 'LS_US_CROSS_WON_VERIFIED'];
 let saved: Record<string, string | undefined>;
 beforeEach(() => { saved = {}; for (const k of KEYS) { saved[k] = process.env[k]; delete process.env[k]; } });
 afterEach(() => { for (const k of KEYS) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]; } });
 
 describe('loadLiveConfig — 오늘 실전 제한 강제', () => {
-  it('기본값: NASDAQ:AAPL, 1주, 하루 1/1, armed/live/cancel=false', () => {
+  it('기본값: NASDAQ:AAPL, maxQty=null(하드1 제거), 예산=null(미설정), 하루 1/1, armed/live/cancel=false', () => {
     const c = loadLiveConfig();
-    expect(c).toMatchObject({ liveSymbol: 'AAPL', liveExchange: 'NASDAQ', liveExchcd: '82', maxQty: 1, dailyMaxBuys: 1, dailyMaxSells: 1, armed: false, liveTrading: false, cancelConfirmed: false });
+    expect(c).toMatchObject({ liveSymbol: 'AAPL', liveExchange: 'NASDAQ', liveExchcd: '82', maxQty: null, perTradeBudgetUsd: null, dailyMaxBuys: 1, dailyMaxSells: 1, armed: false, liveTrading: false, cancelConfirmed: false });
   });
   it('LS_US_LIVE_SYMBOL 파싱(NYSE:BA → exchcd 81)', () => {
     process.env.LS_US_LIVE_SYMBOL = 'NYSE:BA';
     const c = loadLiveConfig();
     expect(c.liveSymbol).toBe('BA'); expect(c.liveExchcd).toBe('81');
   });
-  it('maxQty 는 1로 상한 강제(2 요청해도 1)', () => {
-    process.env.LS_US_MAX_QTY = '2';
-    expect(loadLiveConfig().maxQty).toBe(1);
+  it('P0-29A: maxQty 하드1 제거 — 미설정=null, 설정 시 선택적 안전 상한(정수>0)만 반영', () => {
+    expect(loadLiveConfig().maxQty).toBeNull();       // 미설정 → 예산이 상한 결정
+    process.env.LS_US_MAX_QTY = '5';
+    expect(loadLiveConfig().maxQty).toBe(5);
+    process.env.LS_US_MAX_QTY = '0';                  // 비정상 → null
+    expect(loadLiveConfig().maxQty).toBeNull();
+    process.env.LS_US_MAX_QTY = '   ';
+    expect(loadLiveConfig().maxQty).toBeNull();
+  });
+  it('P0-29A: LS_US_PER_TRADE_BUDGET_USD — 미설정=null(fail-closed), 설정 시 양수 파싱', () => {
+    expect(loadLiveConfig().perTradeBudgetUsd).toBeNull();
+    process.env.LS_US_PER_TRADE_BUDGET_USD = '1500';
+    expect(loadLiveConfig().perTradeBudgetUsd).toBe(1500);
+    process.env.LS_US_PER_TRADE_BUDGET_USD = '999.5';
+    expect(loadLiveConfig().perTradeBudgetUsd).toBe(999.5);
+    process.env.LS_US_PER_TRADE_BUDGET_USD = '0';     // 비정상(<=0) → null
+    expect(loadLiveConfig().perTradeBudgetUsd).toBeNull();
+    process.env.LS_US_PER_TRADE_BUDGET_USD = '   ';
+    expect(loadLiveConfig().perTradeBudgetUsd).toBeNull();
   });
   it('일일 매수/매도 상한 1로 강제', () => {
     process.env.LS_US_DAILY_MAX_BUYS = '5';

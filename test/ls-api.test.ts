@@ -5,6 +5,7 @@ import {
   getLSUSTicks, getLSUSTicksPaged, lsOverseasChartRaw,
   placeLSUSBuyOrder, queryLSUSOrderExec, classifyOrderExec, LS_US_ORDEREXEC_EMPTY_CODES, getLSUSDeposit, getLSUSHoldings, cancelLSUSOrder, LS_CANCEL_TR_CONFIRMED, isUSOrderSuccess,
   decideUSCashPayment, usCashOnlyUsdCap, usOrderableQty, formatCashOrderableLine,
+  computeUSOrderQty, formatUSOrderQty,
   evaluateCrossWon, formatCrossWonCheck, formatCrossWonLiveCand, formatUSLiveGate, maskLSResponse, CROSS_WON_ADOPTED_FIELD, LS_US_CROSS_WON_TR_CONFIRMED, type LSUSDeposit,
   placeLSKRBuyOrder, queryLSKROrderExec, cancelLSKRBuyOrder, krIsuNo, isKROrderSuccess, getLSKRStockMaster,
   getLSUSStockMasterPage,
@@ -717,6 +718,59 @@ describe('해외 주문/체결/예수금 (공식 필드)', () => {
     expect(usCashOnlyUsdCap(dep({ usdOrderable: 0, krwCash: 1000742, krwWithdrawable: 1000742, baseXchRate: 1418.8 }), { crossWonVerified: true })).toBeCloseTo(1000742 / 1418.8, 0);
     // cashOnly 아님(미수>0) → 0
     expect(usCashOnlyUsdCap(dep({ overseasMargin: 5000 }), { crossWonVerified: true })).toBe(0);
+  });
+
+  // ── P0-29A: 예산기반 주문수량 산정(computeUSOrderQty) — 전량매수 금지 + 예산 미설정 fail-closed ──
+  describe('P0-29A computeUSOrderQty — 1회 거래예산 기반 정수주', () => {
+    it('finalQty = min(orderableQty, floor(예산/bestAsk)) — 예산이 상한', () => {
+      // cashOnlyCap=10000/bestAsk=200 → orderableQty=50, 예산 1000/200 → budgetQty=5 → finalQty=5
+      const d = computeUSOrderQty({ perTradeBudgetUsd: 1000, cashOnlyUsdCap: 10000, bestAsk: 200 });
+      expect(d).toMatchObject({ allowed: true, finalQty: 5, orderableQty: 50, budgetQty: 5, reason: 'OK' });
+    });
+    it('전량매수 금지: 현금상한이 커도 예산으로 잘라 orderableQty 전량을 사지 않는다', () => {
+      const d = computeUSOrderQty({ perTradeBudgetUsd: 500, cashOnlyUsdCap: 100000, bestAsk: 100 });
+      expect(d.orderableQty).toBe(1000);   // 현금상한 기준 매수가능 전량
+      expect(d.finalQty).toBe(5);          // 예산(500/100)으로 제한 → 전량 아님
+      expect(d.allowed).toBe(true);
+    });
+    it('현금상한이 예산보다 작으면 orderableQty 가 상한(현금 부족 방향)', () => {
+      // 현금 700/bestAsk 300 → orderableQty=2, 예산 5000/300 → 16 → finalQty=min(2,16)=2
+      const d = computeUSOrderQty({ perTradeBudgetUsd: 5000, cashOnlyUsdCap: 700, bestAsk: 300 });
+      expect(d).toMatchObject({ allowed: true, finalQty: 2, orderableQty: 2, budgetQty: 16 });
+    });
+    it('fail-closed: 예산 미설정(null) → allowed=false, finalQty=0, reason=BUDGET_UNSET', () => {
+      const d = computeUSOrderQty({ perTradeBudgetUsd: null, cashOnlyUsdCap: 10000, bestAsk: 200 });
+      expect(d).toMatchObject({ allowed: false, finalQty: 0, reason: 'BUDGET_UNSET' });
+      expect(d.orderableQty).toBe(50);   // 참고용으로 계산은 하되 주문은 금지
+    });
+    it('fail-closed: 예산 <=0 → BUDGET_UNSET', () => {
+      expect(computeUSOrderQty({ perTradeBudgetUsd: 0, cashOnlyUsdCap: 10000, bestAsk: 200 }).reason).toBe('BUDGET_UNSET');
+      expect(computeUSOrderQty({ perTradeBudgetUsd: -5, cashOnlyUsdCap: 10000, bestAsk: 200 }).allowed).toBe(false);
+    });
+    it('bestAsk<=0(가격 미확보) → PRICE_UNAVAILABLE, 차단', () => {
+      const d = computeUSOrderQty({ perTradeBudgetUsd: 1000, cashOnlyUsdCap: 10000, bestAsk: 0 });
+      expect(d).toMatchObject({ allowed: false, finalQty: 0, reason: 'PRICE_UNAVAILABLE' });
+    });
+    it('현금 1주 미만 → CASH_INSUFFICIENT', () => {
+      const d = computeUSOrderQty({ perTradeBudgetUsd: 1000, cashOnlyUsdCap: 100, bestAsk: 300 });
+      expect(d).toMatchObject({ allowed: false, finalQty: 0, orderableQty: 0, reason: 'CASH_INSUFFICIENT' });
+    });
+    it('예산이 1주 미만 → BUDGET_TOO_SMALL', () => {
+      const d = computeUSOrderQty({ perTradeBudgetUsd: 100, cashOnlyUsdCap: 10000, bestAsk: 300 });
+      expect(d).toMatchObject({ allowed: false, finalQty: 0, budgetQty: 0, reason: 'BUDGET_TOO_SMALL' });
+    });
+    it('선택적 maxQty 상한 — 설정 시 finalQty 를 추가로 제한', () => {
+      // orderableQty=50, budgetQty=5, maxQty=3 → finalQty=3
+      const d = computeUSOrderQty({ perTradeBudgetUsd: 1000, cashOnlyUsdCap: 10000, bestAsk: 200, maxQty: 3 });
+      expect(d).toMatchObject({ allowed: true, finalQty: 3 });
+    });
+    it('formatUSOrderQty — 한 줄 진단 로그(finalQty/allowed 노출)', () => {
+      const d = computeUSOrderQty({ perTradeBudgetUsd: 1000, cashOnlyUsdCap: 10000, bestAsk: 200 });
+      const s = formatUSOrderQty('AAPL', d, { perTradeBudgetUsd: 1000, cashOnlyUsdCap: 10000, bestAsk: 200 });
+      expect(s).toContain('[US-ORDER-QTY AAPL]');
+      expect(s).toContain('finalQty=5');
+      expect(s).toContain('allowed=true');
+    });
   });
 
   // ── P0-18: 통합증거금(타통화+원화) 실측대조 엔진 ──

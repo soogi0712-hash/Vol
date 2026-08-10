@@ -11,6 +11,7 @@ import {
   getLSUS15MinPaged, getLSUS15MinOlderThan, getLSUSTicksPaged, getLSUSDeposit, getLSUSStockMasterPage,
   placeLSUSBuyOrder, queryLSUSOrderExec, cancelLSUSOrder, LSApiError, LS_US_ORDEREXEC_EMPTY_CODES,
   decideUSCashPayment, usCashOnlyUsdCap, usOrderableQty, formatCashOrderableLine,
+  computeUSOrderQty, formatUSOrderQty,
   evaluateCrossWon, formatCrossWonCheck, formatCrossWonLiveCand, formatUSLiveGate, LS_US_CROSS_WON_TR_CONFIRMED, type LSUSDeposit,
 } from '../src/lib/ls-api';
 import { loadUSUniverse, selectUSLiveCandidate, probeUSMasterExgubun, exgubunWithNyseAmex } from './us-universe';
@@ -291,7 +292,8 @@ async function main() {
   // 최종 주문허용(하드 게이트): 응답정상 + 가격>0 + 결정 orderAllowed(=USD현금 확정경로만) + HTS 불일치 아님.
   function usOrderAllowed(priceUsd: number): { allowed: boolean; reason: string; dec: ReturnType<typeof decideUSCashPayment> | null } {
     if (!depOk || !depFull || !(priceUsd > 0)) return { allowed: false, reason: !depOk ? 'DEPOSIT_QUERY_FAILED' : 'PRICE_UNAVAILABLE', dec: null };
-    const dec = decideUSCashPayment(depFull, priceUsd, liveCfg.maxQty, { crossWonVerified: liveCfg.crossWonVerified });
+    // P0-29A: 최소 1주 결제가능 여부(확정경로) 게이트. 실제 주문수량은 computeUSOrderQty(예산기반)가 별도 산정.
+    const dec = decideUSCashPayment(depFull, priceUsd, 1, { crossWonVerified: liveCfg.crossWonVerified });
     const cmp = htsCompare(priceUsd);
     if (cmp.mismatch === true) return { allowed: false, reason: 'HTS_QTY_MISMATCH', dec };
     return { allowed: dec.orderAllowed, reason: dec.reason, dec };
@@ -358,7 +360,7 @@ async function main() {
   if (!liveCfg.crossWonVerified) log.warn(`[P0-20] CROSS_WON_VERIFIED=false(kill-switch 또는 코드상수 미확정) → 통합증거금 경로 비활성 → US BUY 차단.`);
 
   log.info(`[P0] US_LIVE_READY=${p0.US_LIVE_READY} · CROSS_WON_VERIFIED=${liveCfg.crossWonVerified} · 시작현금조회=${startupCashOk} · LS_LIVE_TRADING=${liveCfg.liveTrading} → 오늘 미국장 ${liveCapable ? '실주문 가능(paymentMode=CROSS_WON)' : `실주문 차단${liveCfg.liveTrading ? '' : '(LS_LIVE_TRADING=false)'}`}`);
-  log.info(`[LIVE-CFG] 대상=${liveCfg.liveExchange}:${liveCfg.liveSymbol}(exchcd=${liveCfg.liveExchcd}) maxQty=${liveCfg.maxQty} 하루매수=${liveCfg.dailyMaxBuys} 하루매도=${liveCfg.dailyMaxSells} 미체결타임아웃=${liveCfg.pendingTimeoutSec}s`);
+  log.info(`[LIVE-CFG] 대상=${liveCfg.liveExchange}:${liveCfg.liveSymbol}(exchcd=${liveCfg.liveExchcd}) 1회거래예산=${liveCfg.perTradeBudgetUsd == null ? '미설정(fail-closed)' : `${liveCfg.perTradeBudgetUsd}USD`} maxQty상한=${liveCfg.maxQty ?? '없음(예산결정)'} 하루매수=${liveCfg.dailyMaxBuys} 하루매도=${liveCfg.dailyMaxSells} 미체결타임아웃=${liveCfg.pendingTimeoutSec}s`);
   log.info(`ARMED=${armedMode} · LS_LIVE_TRADING=${liveCfg.liveTrading} · US_LIVE_READY=${p0.US_LIVE_READY} · CROSS_WON_VERIFIED=${liveCfg.crossWonVerified} · 취소TR확인(env)=${liveCfg.cancelConfirmed}/(코드)=false → 실주문 ${liveCapable ? '가능' : '차단'}`);
   // 시작 시점 US-LIVE-GATE(가격 미확보면 PROGRAM_QTY=0 — GSH 수신 후 재출력)
   if (depFull) log.info(formatUSLiveGate(liveCfg.liveSymbol, { liveTrading: liveCfg.liveTrading, usLiveReady: p0.US_LIVE_READY, crossWonVerified: liveCfg.crossWonVerified, e: evaluateCrossWon(depFull, startupPrice, liveCfg.htsOrderableQty) }));
@@ -617,13 +619,21 @@ async function main() {
     //   · 비-BUY 틱: 60초 캐시 그대로 사용(만료 시에만 자동 재조회). BUY 신호(확정봉≥20): 직전 강제 재조회.
     //   · ARMED 로그는 캐시 기준으로 cashOrderable=<금액> USD 또는 cashOrderable=조회실패 둘 중 하나만.
     let orderableQtyOk = false;
+    let orderQty = 0;                       // P0-29A: 예산기반 최종 주문수량(0 = 미확정/차단)
     const isBuySignal = sig.action === 'BUY' && ctx.builder.confirmedCount >= MIN_RT_CANDLES;
     if (isBuySignal) {
       await refreshDeposit(true);          // BUY 직전 강제 재조회(P0-17 #4,#6 / P0-18 #9 재검증)
       // 통합증거금(타통화+원화, 채택=WonCashMin) 경로: BUY 직전 재조회로 cash-only·가능수량 재확인(P0-20).
       const crossWon = depFull ? evaluateCrossWon(depFull, buyPrice, liveCfg.htsOrderableQty) : null;
-      // 확정경로(USD현금) 또는 통합증거금 경로(qty>=1 && cashOnly) 중 하나라도 허용이면 통과.
-      orderableQtyOk = usOrderAllowed(buyPrice).allowed || !!(crossWon && crossWon.orderAllowed);
+      // 확정경로(USD현금) 또는 통합증거금 경로(qty>=1 && cashOnly) 중 하나라도 최소1주 결제 허용이면 통과.
+      const cashPathOk = usOrderAllowed(buyPrice).allowed || !!(crossWon && crossWon.orderAllowed);
+      // P0-29A: 실제 주문수량 산정 — 1회 거래예산 기반. 예산 미설정이면 fail-closed(allowed=false).
+      //   orderableQty = floor(cashOnlyUsdCap / bestAsk), finalQty = min(orderableQty, floor(예산/bestAsk)).
+      const qtyDec = computeUSOrderQty({ perTradeBudgetUsd: liveCfg.perTradeBudgetUsd, cashOnlyUsdCap: depCash, bestAsk: buyPrice, maxQty: liveCfg.maxQty });
+      log.info(formatUSOrderQty(ctx.symbol, qtyDec, { perTradeBudgetUsd: liveCfg.perTradeBudgetUsd, cashOnlyUsdCap: depCash, bestAsk: buyPrice }));
+      orderQty = qtyDec.finalQty;
+      // 최종 게이트: 현금경로 허용 AND 예산기반 수량 산정 성공(전량매수 금지·예산 미설정 fail-closed).
+      orderableQtyOk = cashPathOk && qtyDec.allowed;
       logUSCashDiag('BUY-US-CASH', buyPrice);              // BUY 직전 상세 진단(P0-16)
       logCrossWon('BUY-CROSS-WON', buyPrice);              // BUY 직전 통합증거금 실측대조(P0-18)
       if (crossWon) log.info(formatUSLiveGate(ctx.symbol, { liveTrading: liveCfg.liveTrading, usLiveReady: computeUSP0Checklist(liveCfg).US_LIVE_READY, crossWonVerified: liveCfg.crossWonVerified, e: crossWon }));   // [US-LIVE-GATE] BUY 직전 최종(P0-20 #13)
@@ -652,10 +662,12 @@ async function main() {
 
     const live = canExecuteLive(g.armed, liveCfg.liveTrading, { manualCancel: liveCfg.manualCancel, cancelEnvConfirmed: liveCfg.cancelConfirmed });
     if (!live.execute) { log.info(`[ARMED-READY ${ctx.symbol}] 전 10개 조건 충족 · 매수지정가=${buyPrice}(ask) · 주문 없음 — ${live.reason}`); return 'LIVE_OFF'; }
-    // 도달 시 trader 가 한도/중복/미체결 재검증.
+    // P0-29A 방어: 예산기반 최종수량이 1주 미만이면 주문 금지(전량매수/예산 미설정 fail-closed 이중 확인).
+    if (!(orderQty >= 1)) { log.warn(`[US-ORDER-QTY-BLOCK ${ctx.symbol}] finalQty=${orderQty} (예산 미설정/현금 부족) → 주문 차단`); return 'CASH_GATE'; }
+    // 도달 시 trader 가 한도/중복/미체결/현금 재검증.
     const outcome = await executeBuyOrder(traderDeps, {
       orders: ctx.orders, exchcd: ctx.exchcd, symbol: ctx.symbol, candleDatetime: sig.candleDatetime,
-      qty: liveCfg.maxQty, price: buyPrice, etDate, dailyMaxBuys: liveCfg.dailyMaxBuys,
+      qty: orderQty, price: buyPrice, etDate, dailyMaxBuys: liveCfg.dailyMaxBuys,
     });
     log.info(`[ORDER-RESULT ${ctx.symbol}] status=${outcome.status} ordNo=${outcome.ordNo ?? '-'}${outcome.abortCode ? ` abortCode=${outcome.abortCode}` : ''} ${outcome.reason}`);
     if (outcome.status === 'placed-filled' || outcome.status === 'placed-pending') return 'ORDERED';
