@@ -14,6 +14,20 @@ describe('P0-22 라운드로빈 스캐너', () => {
   it('빈 유니버스 → 빈 배치', () => {
     expect(new RoundRobinScanner([]).nextBatch(5)).toEqual([]);
   });
+  it('P0-25 US WS 로테이션: 상시구독(AAPL/TSLA/BA)+로테이션 슬라이스 → batch1≠batch2, 상시구독 유지', () => {
+    const alwaysOn = ['AAPL', 'TSLA', 'BA'];
+    const rotationPool = ['S1', 'S2', 'S3', 'S4', 'S5'];   // 상시구독 제외 로테이션 대상
+    const rotateBatchSize = 2;   // wsMaxSubs(5) - 상시(3)
+    const scanner = new RoundRobinScanner(rotationPool);
+    const makeBatch = () => [...alwaysOn, ...scanner.nextBatch(rotateBatchSize)];
+    const batch1 = makeBatch();   // AAPL,TSLA,BA + S1,S2
+    const batch2 = makeBatch();   // AAPL,TSLA,BA + S3,S4  ← 600s 후 전환
+    expect(batch1).toEqual(['AAPL', 'TSLA', 'BA', 'S1', 'S2']);
+    expect(batch2).toEqual(['AAPL', 'TSLA', 'BA', 'S3', 'S4']);   // ★ batch=2 로 실제 전환(로테이션 슬라이스 이동)
+    // 상시구독은 두 배치 모두 유지
+    for (const a of alwaysOn) { expect(batch1).toContain(a); expect(batch2).toContain(a); }
+    expect(batch1.slice(3)).not.toEqual(batch2.slice(3));         // 로테이션 부분은 달라짐
+  });
   it('setSymbols — 커서 범위 밖이면 0으로', () => {
     const s = new RoundRobinScanner(['A', 'B', 'C', 'D']);
     s.nextBatch(3);                 // cursor=3

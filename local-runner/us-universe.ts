@@ -86,12 +86,14 @@ export async function loadUSUniverse(
         rowsForGubun += r.rows.length;
         const resTrCont = (r.resTrCont ?? '').trim();
         const resTrContKey = (r.resTrContKey ?? '').trim();
-        // ── 종료 판정 — tr_cont_key 동일 여부로 판단하지 않는다(값이 '0' 고정이어도 진행 가능). newRows/resTrCont 기준(요구 1·2·3) ──
+        // ── 종료 판정 — tr_cont_key 동일 여부로 판단하지 않는다(값이 '0' 고정이어도 진행 가능). newRows/resTrCont 기준 ──
+        //   ⚠️ P0-25: newRows=0(전부 중복)은 "이 exgubun 이 다른 exgubun 과 중복=redundant" 이므로 정상 종료로 본다.
+        //     이미 공식 DONE 된 다른 exgubun 의 완료를 무효화하지 않는다(complete=false 아님). 하드 실패는 MAX_PAGES/예외뿐.
         let stop: string | null = null;
         if (r.rows.length === 0) stop = 'ROWS_0';                        // 빈 페이지 → 정상 종료
         else if (resTrCont !== 'Y') stop = 'DONE(tr_cont≠Y)';           // 공식 종료 신호(헤더) → 정상 완료
-        else if (newRows === 0) { stop = 'DUP_PAGE(newRows=0)'; complete = false; }   // 페이지 전체가 기존과 완전중복 → 진행 불가 → 미완료
-        else if (pages >= maxPages) { stop = `MAX_PAGES(${maxPages})`; complete = false; }   // 상한(전체 다 못 읽음) → 미완료
+        else if (newRows === 0) stop = pages === 1 ? 'REDUNDANT_EXGUBUN(newRows=0)' : 'DUP_PAGE(newRows=0)';   // 전부 중복 → 정상 종료(미완료 아님)
+        else if (pages >= maxPages) { stop = `MAX_PAGES(${maxPages})`; complete = false; }   // 상한(전체 다 못 읽음) → 진짜 미완료
         // ★ newRows>0 && resTrCont==='Y' 이면 tr_cont_key 가 같아도 다음 페이지 반드시 시도(요구 2·4)
         opts.onPage?.({ exgubun, page: pages, trContIn: trCont, trContKeyIn: trContKey, resTrCont, resTrContKey, rows: r.rows.length, newRows, rspCd: r.rspCd, stop });
         if (stop) break;

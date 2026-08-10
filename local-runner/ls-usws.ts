@@ -99,7 +99,8 @@ async function main() {
   //   LS_US_SYMBOLS(예: AAPL) 는 유지 병합(기존 워밍 경로 보존). LS_US_UNIVERSE=off 면 유니버스 로드 생략.
   const wsMaxSubs = Math.max(1, Math.min(500, parseInt(process.env.LS_US_WS_MAX_SUBS || '30', 10) || 30));
   const universeOn = process.env.LS_US_UNIVERSE !== 'off';
-  let exgubunList = (process.env.LS_US_MASTER_EXGUBUN || '2').split(',').map(s => s.trim()).filter(Boolean);
+  // P0-25 실측 확정: exgubun 2=NASDAQ(82), 1·3=NYSE/AMEX(81). 4=중복(제외, DIAG 전용). 기본 전체시장='2,1,3'.
+  let exgubunList = (process.env.LS_US_MASTER_EXGUBUN || '2,1,3').split(',').map(s => s.trim()).filter(Boolean);
   const includeEtf = process.env.LS_US_INCLUDE_ETF === 'true';
   const subs = us.ok.map(s => ({ symbol: s.symbol, exchange: s.exchange, exchcd: s.exchcd }));
   let fullPool: { symbol: string; exchange: string; exchcd: string }[] = [...subs];   // 기본 = LS_US_SYMBOLS. 유니버스 로드 성공 시 전체로 교체.

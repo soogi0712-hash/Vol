@@ -86,12 +86,35 @@ describe('P0-23 US 유니버스 eligibility 필터', () => {
     expect(u.total).toBe(6);              // 3페이지 × 2 신규
     expect(u.ok).toBe(true); expect(u.complete).toBe(true);
   });
-  it('P0-23 continuation 종료: 페이지 전체가 기존과 완전중복(newRows=0) → DUP_PAGE, complete=false', async () => {
-    const dupPage = async () => ({ rspCd: '00000', rspMsg: '', diag: {} as any, recCount: 2, ctsValue: '', resTrCont: 'Y', resTrContKey: '0', rows: [row({ keysymbol: '82AAPL', symbol: 'AAPL' }), row({ keysymbol: '82MSFT', symbol: 'MSFT' })] });
+  it('P0-25 중복 exgubun: page1 전부 중복(newRows=0) → REDUNDANT_EXGUBUN 정상종료, complete 유지', async () => {
+    // exgubun '2' 가 먼저 AAPL/MSFT 로드 → exgubun '4' 는 같은 종목만 반환(전부 중복) → 미완료로 처리하면 안 됨
+    const page = async (_c: any, _t: string, p: { exgubun: string }) => {
+      if (p.exgubun === '2') return { rspCd: '00000', rspMsg: '', diag: {} as any, recCount: 1, ctsValue: '', resTrCont: 'N', resTrContKey: '', rows: [row({ keysymbol: '82AAPL', symbol: 'AAPL', exchcd: '82', market: 'NASDAQ' })] };
+      if (p.exgubun === '1') return { rspCd: '00000', rspMsg: '', diag: {} as any, recCount: 1, ctsValue: '', resTrCont: 'N', resTrContKey: '', rows: [row({ keysymbol: '81BA', symbol: 'BA', exchcd: '81', market: 'NYSE_AMEX' })] };
+      return { rspCd: '00000', rspMsg: '', diag: {} as any, recCount: 1, ctsValue: '', resTrCont: 'Y', resTrContKey: '0', rows: [row({ keysymbol: '82AAPL', symbol: 'AAPL', exchcd: '82', market: 'NASDAQ' })] };   // exgubun '4' = 중복
+    };
     const stops: (string | null)[] = [];
-    const u = await loadUSUniverse({} as any, 'T', ['2'], dupPage as any, { readcnt: 2, onPage: (i) => stops.push(i.stop) });
-    expect(stops.at(-1)).toBe('DUP_PAGE(newRows=0)');   // page1 신규2 → page2 신규0 → 종료
-    expect(u.complete).toBe(false);
+    const u = await loadUSUniverse({} as any, 'T', ['2', '1', '4'], page as any, { readcnt: 1, onPage: (i) => stops.push(i.stop) });
+    expect(u.total).toBe(2);                                  // AAPL, BA (4의 AAPL 은 중복)
+    expect(u.eligiblePerExchange.NASDAQ).toBe(1);
+    expect(u.eligiblePerExchange.NYSE_AMEX).toBe(1);
+    expect(stops.at(-1)).toBe('REDUNDANT_EXGUBUN(newRows=0)');
+    expect(u.complete).toBe(true);                           // ★ 중복 exgubun 이 정상완료를 무효화하지 않음(요구 4)
+  });
+  it('P0-25 실측 반영: 2(NASDAQ)+1(NYSE)+3(NYSE) 각각 공식 DONE → complete=true, 두 시장 다 존재', async () => {
+    const page = async (_c: any, _t: string, p: { exgubun: string }) => {
+      const map: Record<string, LSUSMasterRow[]> = {
+        '2': [row({ keysymbol: '82AAPL', symbol: 'AAPL', exchcd: '82', market: 'NASDAQ' })],
+        '1': [row({ keysymbol: '81BA', symbol: 'BA', exchcd: '81', market: 'NYSE_AMEX' })],
+        '3': [row({ keysymbol: '81GE', symbol: 'GE', exchcd: '81', market: 'NYSE_AMEX' })],
+      };
+      return { rspCd: '00000', rspMsg: '', diag: {} as any, recCount: 1, ctsValue: '', resTrCont: 'N', resTrContKey: '', rows: map[p.exgubun] ?? [] };
+    };
+    const u = await loadUSUniverse({} as any, 'T', ['2', '1', '3'], page as any, {});
+    expect(u.total).toBe(3);
+    expect(u.eligiblePerExchange.NASDAQ).toBe(1);
+    expect(u.eligiblePerExchange.NYSE_AMEX).toBe(2);
+    expect(u.complete).toBe(true);
   });
   it('P0-23 anti-hang: maxPages 상한 → complete=false (미완료로 표기)', async () => {
     let call = 0;
