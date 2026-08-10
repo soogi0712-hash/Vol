@@ -14,8 +14,9 @@ import {
   evaluateCrossWon, formatCrossWonCheck, formatCrossWonLiveCand, formatUSLiveGate, LS_US_CROSS_WON_TR_CONFIRMED, type LSUSDeposit,
 } from '../src/lib/ls-api';
 import { loadUSUniverse, selectUSLiveCandidate, probeUSMasterExgubun, exgubunWithNyseAmex } from './us-universe';
-import { computeScanCapacity } from './kr-rate-limiter';
+import { computeScanCapacity, RateLimiter } from './kr-rate-limiter';
 import { rankBuyCandidates, bbBreakStrength, rsiReboundStrength, RoundRobinScanner } from './kr-scanner';
+import { pickBackfillTarget, computeBackfillCapacity, BackfillStats, BACKFILL_MIN_CONFIRMED, BACKFILL_TARGET, type BackfillCand } from './us-backfill';
 import {
   LSUSRealtimeClient, RealtimeCandleBuilder, buildWsTrKey, evaluateReadiness, MIN_RT_CANDLES,
   aggregateTicksTo15Min, type RTCandle,
@@ -442,6 +443,96 @@ async function main() {
     log: (m) => log.info(scrub(m)),
   };
 
+  // ── P0-26: 과거 확정봉 백필 — READY 풀 가속 ──────────────────────────────
+  //   중앙 단일 REST 큐(동시 REST 금지) + rate limiter 로 g3203 개인 1req/s 절대 미초과.
+  //   우선순위(요구 3): 현재 WS 배치 중 confirmed<20 → 20에 가장 가까운 종목 → 로테이션 풀 나머지.
+  //   이미 20+ 확정봉(AAPL/TSLA/BA 등)은 백필하지 않음(요구 1·3). WS/주문과 별도(요구 9 — WS 는 REST 예산 무관).
+  const bfReqPerSec = Math.max(1, parseInt(process.env.LS_US_HISTORY_REQ_PER_SEC || '1', 10) || 1);   // g3203 개인=1/법인=10
+  const bfRl = new RateLimiter(bfReqPerSec);
+  const bfStats = new BackfillStats();
+  const bfFailed = new Map<string, number>();      // symbol → 실패/빈응답 백오프 만료 ms(요구 7)
+  const BF_FAIL_BACKOFF_MS = 5 * 60_000;           // 실패 5분 후 재시도(큐 뒤로)
+  const bfConfirmedCache = new Map<string, number>();   // 로테이션 풀 종목 저장 확정봉수 캐시(디스크 재로딩 최소화)
+  let pauseBackfill = false;                        // BUY 게이트 중 REST 예산 양보(요구 9)
+  let bfCursor = 0;                                 // 로테이션 풀 순회 커서(현 WS 배치 외 종목)
+
+  // 로테이션 풀 종목의 저장 확정봉수(캐시). 손상 파일은 백필 제외 위해 >=20 으로 취급.
+  function poolConfirmed(symbol: string): number {
+    const cached = bfConfirmedCache.get(symbol);
+    if (cached != null) return cached;
+    const st = new CandleStore(symbol); st.load();
+    const n = st.corrupt ? BACKFILL_MIN_CONFIRMED : st.confirmedCount;
+    bfConfirmedCache.set(symbol, n);
+    return n;
+  }
+  // 우선순위 2: 현 WS 배치 외 로테이션 풀에서 confirmed<20 첫 종목(커서 순회, 백오프 제외).
+  function pickPoolBackfillTarget(now: number): { symbol: string; exchcd: string } | null {
+    const n = fullPool.length;
+    for (let i = 0; i < n; i++) {
+      const idx = (bfCursor + i) % n;
+      const s = fullPool[idx];
+      if (ctxs.has(s.symbol)) continue;                     // 현 배치는 우선순위1(ctx)에서 처리
+      if ((bfFailed.get(s.symbol) ?? 0) > now) continue;    // 백오프 중
+      if (poolConfirmed(s.symbol) >= BACKFILL_MIN_CONFIRMED) continue;   // 이미 READY
+      bfCursor = (idx + 1) % n;
+      return { symbol: s.symbol, exchcd: s.exchcd };
+    }
+    return null;
+  }
+
+  // REST g3203 1회 백필. 반환 true=실제 REST 호출 수행(1req/s 페이싱됨), false=대상 없음/양보(루프는 짧게 대기).
+  async function backfillOne(): Promise<boolean> {
+    if (!quote.delaygb) return false;   // delaygb 미설정 → REST 불가(WS 로만 진행)
+    const now = Date.now();
+    // 우선순위 1: 현재 WS 배치(ctxs) 중 confirmed<20 (요구 3).
+    const ctxMap = new Map<string, SymCtx>();
+    const ctxCands: BackfillCand[] = [];
+    for (const c of ctxs.values()) {
+      if (c.store.corrupt) continue;
+      if (c.builder.confirmedCount >= BACKFILL_MIN_CONFIRMED) continue;
+      ctxMap.set(c.symbol, c);
+      ctxCands.push({ symbol: c.symbol, confirmed: c.builder.confirmedCount, failedUntilMs: bfFailed.get(c.symbol) ?? 0 });
+    }
+    const ctxTargetSym = pickBackfillTarget(ctxCands, now);
+    let target: { symbol: string; exchcd: string } | null = null;
+    if (ctxTargetSym) { const cx = ctxMap.get(ctxTargetSym)!; target = { symbol: cx.symbol, exchcd: cx.exchcd }; }
+    else target = pickPoolBackfillTarget(now);   // 우선순위 2: 로테이션 풀 나머지
+    if (!target) return false;                    // 백필 대상 없음(전부 READY/백오프)
+
+    await bfRl.acquire();                          // g3203 개인 1req/s 준수(양보 대기 후 실제 페이싱)
+    if (pauseBackfill || shuttingDown) return false;   // 대기 중 BUY 게이트 진입/종료 → 이번 요청 양보
+
+    const cx = ctxs.get(target.symbol);
+    const store = cx ? cx.store : (() => { const st = new CandleStore(target.symbol); st.load(); return st; })();
+    const before = cx ? cx.builder.confirmedCount : poolConfirmed(target.symbol);
+    bfStats.requests++;
+    try {
+      const r = await getLSUS15MinPaged(cfg, token, target.symbol, target.exchcd, quote.delaygb, { target: BACKFILL_TARGET, maxCalls: 6, ncnt: 15, sdate });
+      if (store.corrupt) { bfStats.error++; return true; }
+      const fetched = r.candles.map(c => ({ datetime: c.datetime, open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume }));
+      if (fetched.length === 0) {
+        bfStats.empty++;
+        bfFailed.set(target.symbol, Date.now() + BF_FAIL_BACKOFF_MS);   // 빈 응답 → 큐 뒤로(요구 7)
+        log.warn(`[US-BACKFILL] ${target.symbol} before=${before} fetched=0 after=${before} remaining=${Math.max(0, BACKFILL_MIN_CONFIRMED - before)} → 빈 응답, 백오프`);
+        return true;
+      }
+      let dirty = false;
+      for (const c of fetched) if (store.upsertConfirmed(c)) dirty = true;   // 저장 봉 중복 재수집 금지(요구 1·5)
+      if (dirty) store.flush();                                              // 즉시 영구 저장(요구 4)
+      if (cx) cx.builder.seed(fetched);                                      // 현 배치면 실시간 ctx 에도 병합 → 즉시 READY 판정
+      const after = cx ? cx.builder.confirmedCount : store.confirmedCount;
+      bfConfirmedCache.set(target.symbol, after);
+      bfStats.success++; bfFailed.delete(target.symbol);
+      const remaining = Math.max(0, BACKFILL_MIN_CONFIRMED - after);
+      log.info(`[US-BACKFILL] ${target.symbol} before=${before} fetched=${fetched.length} after=${after} remaining=${remaining}${after >= BACKFILL_MIN_CONFIRMED ? ' → READY(확정봉 20+)' : ''}`);
+    } catch (e) {
+      bfStats.error++;
+      bfFailed.set(target.symbol, Date.now() + BF_FAIL_BACKOFF_MS);
+      log.warn(`[US-BACKFILL] ${target.symbol} 실패(무시, 백오프): ${scrub(String(e))}`);
+    }
+    return true;
+  }
+
   // 반환: 이 틱의 결과 사유(거래 0건 분류용, req 9).
   async function evaluateArmed(ctx: SymCtx, sig: { action: string; candleDatetime: string }, now: number): Promise<keyof typeof noTradeCounts | 'ORDERED' | 'LIVE_OFF'> {
     const etDate = etDateStr(now);
@@ -548,6 +639,13 @@ async function main() {
 
       log.info(`[US-SCAN] cycle=${scanCycle} processed=${processed} remaining=0 ready=${readyCount} warmup=${warmupCount} session=${inSession} wsReady=${wsReady}`);
 
+      // ── P0-26 백필 진행/READY 풀 상태(요구 8·12) — 현 배치 ready/warming + 로테이션 대기 ──
+      const poolQueued = Math.max(0, fullPool.length - ctxs.size);
+      log.info(`[US-READY-POOL] ready=${readyCount} warming=${warmupCount} queued=${poolQueued}(로테이션 대기) · 풀=${fullPool.length}${quote.delaygb ? '' : ' (백필 비활성: delaygb 미설정)'}`);
+      log.info(`[US-BACKFILL-RATE] ${bfStats.line(bfReqPerSec)}`);
+      const bfCap = computeBackfillCapacity({ eligible: fullPool.length, alreadyReady: readyCount, reqPerSec: bfReqPerSec });
+      log.info(`[US-BACKFILL-CAPACITY] toBackfill=${bfCap.toBackfill} 종목/시간=${bfCap.symbolsPerHour} 전체READY예상=${bfCap.hoursForAll === Infinity ? '∞' : bfCap.hoursForAll.toFixed(1)}h (호출/종목=${bfCap.callsPerSymbol}, ${bfCap.candlesPerRequest}봉/요청, target=${BACKFILL_TARGET})`);
+
       // ── 후보 랭킹 → 랭킹 1위부터 LIVE 게이트(요구 9·10·11) ──
       let tickReason = 'NO_BUY_SIGNAL';
       if (!inSession) tickReason = 'MARKET_CLOSED';
@@ -566,7 +664,10 @@ async function main() {
         else if (armedMode) {
           const selCtx = ctxs.get(sel.symbol)!; const selCand = buyCands.find(c => c.symbol === sel.symbol)!;
           log.info(`[US-LIVE-SELECT] 랭킹1위 실거래 대상 symbol=${sel.symbol}(exchcd=${sel.exchcd}) — AAPL 하드코딩 아님`);
-          tickReason = await evaluateArmed(selCtx, { action: 'BUY', candleDatetime: selCand.candleDatetime }, Date.now());
+          // 요구 9: BUY 게이트 REST(예수금 재조회/주문/미체결) 동안 백필 REST 예산 양보(주문 판단 비차단).
+          pauseBackfill = true;
+          try { tickReason = await evaluateArmed(selCtx, { action: 'BUY', candleDatetime: selCand.candleDatetime }, Date.now()); }
+          finally { pauseBackfill = false; }
           if (tickReason === 'ORDERED') accountBoughtDate = etDate;
         } else tickReason = 'NOT_ARMED';
       }
@@ -618,6 +719,22 @@ async function main() {
   };
   process.on('SIGINT', () => shutdown('SIGINT'));
   process.on('SIGTERM', () => shutdown('SIGTERM'));
+
+  // ── P0-26: 백필 백그라운드 루프 — 중앙 단일 큐(동시 REST 없음). WS/주문과 독립(별도 전송, 요구 9) ──
+  if (quote.delaygb) {
+    void (async () => {
+      while (!shuttingDown) {
+        if (pauseBackfill) { await new Promise(r => setTimeout(r, 500)); continue; }   // BUY 게이트 중 → 양보
+        let did = false;
+        try { did = await backfillOne(); }
+        catch (e) { log.warn(`[US-BACKFILL] 루프 예외(무시): ${scrub(String(e))}`); await new Promise(r => setTimeout(r, 1000)); continue; }
+        if (!did) await new Promise(r => setTimeout(r, 5000));   // 대상 없음/양보 → 5s 후 재확인(핫스핀 방지)
+      }
+    })();
+    log.info(`[US-BACKFILL] 백필 루프 시작 — reqPerSec=${bfReqPerSec}(개인 1/법인 10) · target=${BACKFILL_TARGET}봉/종목 · 중앙 단일 큐 · WS/주문 비차단`);
+  } else {
+    log.warn(`[US-BACKFILL] 백필 비활성 — delaygb 미설정(${quote.error ?? 'LS_US_DELAYGB'}) → WS 실시간으로만 워밍(가짜봉 없음)`);
+  }
 
   log.info(`지속 실행 중 — 종료하려면 Ctrl+C. READY/OBSERVE/ARMED 는 10초마다 기록됩니다.${armedMode ? ' (ARMED=조건 감시만, 주문 없음)' : ''}`);
   await new Promise(() => { /* SIGINT 까지 유지 */ });
