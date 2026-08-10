@@ -73,13 +73,25 @@ describe('P0-23 US 유니버스 eligibility 필터', () => {
     expect(u.total).toBe(3);
     expect(u.ok).toBe(true); expect(u.complete).toBe(true);
   });
-  it('P0-23 continuation 오류: 연속페이지가 전부 중복 → CONTINUATION_DUP, ok=false/complete=false (성공 아님)', async () => {
-    const dupPage = async () => ({ rspCd: '00000', rspMsg: '', diag: {} as any, recCount: 2, ctsValue: '', resTrCont: 'Y', resTrContKey: 'SAME', rows: [row({ keysymbol: '82AAPL', symbol: 'AAPL' }), row({ keysymbol: '82MSFT', symbol: 'MSFT' })] });
+  it('P0-23 실계정 버그 재현: tr_cont_key 가 상수 "0" 이어도 newRows>0 면 계속 페이징(STUCK 오판 금지)', async () => {
+    let call = 0; const news: number[] = [];
+    const constKey = async (_c: any, _t: string, p: { exgubun: string; trContKey?: string }) => {
+      call++;
+      if (call <= 3) return { rspCd: '00000', rspMsg: '', diag: {} as any, recCount: 2, ctsValue: '', resTrCont: 'Y', resTrContKey: '0', rows: [row({ keysymbol: '82A' + call, symbol: 'A' + call }), row({ keysymbol: '82B' + call, symbol: 'B' + call })] };
+      return { rspCd: '00000', rspMsg: '', diag: {} as any, recCount: 0, ctsValue: '', resTrCont: 'N', resTrContKey: '0', rows: [] };
+    };
+    const u = await loadUSUniverse({} as any, 'T', ['2'], constKey as any, { readcnt: 2, onPage: (i) => news.push(i.newRows) });
+    expect(call).toBe(4);                 // ★ tr_cont_key='0' 고정이지만 newRows>0 이라 page2,3 진행 → page4 에서 tr_cont=N 종료
+    expect(news.slice(0, 3)).toEqual([2, 2, 2]);
+    expect(u.total).toBe(6);              // 3페이지 × 2 신규
+    expect(u.ok).toBe(true); expect(u.complete).toBe(true);
+  });
+  it('P0-23 continuation 종료: 페이지 전체가 기존과 완전중복(newRows=0) → DUP_PAGE, complete=false', async () => {
+    const dupPage = async () => ({ rspCd: '00000', rspMsg: '', diag: {} as any, recCount: 2, ctsValue: '', resTrCont: 'Y', resTrContKey: '0', rows: [row({ keysymbol: '82AAPL', symbol: 'AAPL' }), row({ keysymbol: '82MSFT', symbol: 'MSFT' })] });
     const stops: (string | null)[] = [];
     const u = await loadUSUniverse({} as any, 'T', ['2'], dupPage as any, { readcnt: 2, onPage: (i) => stops.push(i.stop) });
-    // page1 신규2 → page2 tr_cont_key 'SAME' 반복 → CONTINUATION_STUCK 또는 DUP
-    expect(u.ok).toBe(false); expect(u.complete).toBe(false);
-    expect(stops.at(-1)).toMatch(/CONTINUATION/);
+    expect(stops.at(-1)).toBe('DUP_PAGE(newRows=0)');   // page1 신규2 → page2 신규0 → 종료
+    expect(u.complete).toBe(false);
   });
   it('P0-23 anti-hang: maxPages 상한 → complete=false (미완료로 표기)', async () => {
     let call = 0;

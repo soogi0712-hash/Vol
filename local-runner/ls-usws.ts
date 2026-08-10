@@ -15,7 +15,7 @@ import {
 } from '../src/lib/ls-api';
 import { loadUSUniverse, selectUSLiveCandidate } from './us-universe';
 import { computeScanCapacity } from './kr-rate-limiter';
-import { rankBuyCandidates, bbBreakStrength, rsiReboundStrength } from './kr-scanner';
+import { rankBuyCandidates, bbBreakStrength, rsiReboundStrength, RoundRobinScanner } from './kr-scanner';
 import {
   LSUSRealtimeClient, RealtimeCandleBuilder, buildWsTrKey, evaluateReadiness, MIN_RT_CANDLES,
   aggregateTicksTo15Min, type RTCandle,
@@ -101,7 +101,8 @@ async function main() {
   const universeOn = process.env.LS_US_UNIVERSE !== 'off';
   const exgubunList = (process.env.LS_US_MASTER_EXGUBUN || '2').split(',').map(s => s.trim()).filter(Boolean);
   const includeEtf = process.env.LS_US_INCLUDE_ETF === 'true';
-  let subs = us.ok.map(s => ({ symbol: s.symbol, exchange: s.exchange, exchcd: s.exchcd }));
+  const subs = us.ok.map(s => ({ symbol: s.symbol, exchange: s.exchange, exchcd: s.exchcd }));
+  let fullPool: { symbol: string; exchange: string; exchcd: string }[] = [...subs];   // 기본 = LS_US_SYMBOLS. 유니버스 로드 성공 시 전체로 교체.
   if (universeOn) {
     log.info(`[BOOT-STEP] 2 load-us-universe-start exgubun=[${exgubunList.join(',')}]`);
     try {
@@ -109,8 +110,7 @@ async function main() {
         includeEtf, maxPages: 60, readcnt: 500, timeoutMs: 10000,
         // 요구 1: 각 g3190 요청/응답(시장별 page/cts/rows/신규행/종료사유)을 계측
         onPage: (i) => {
-          log.info(`[BOOT-STEP] 3 g3190-request exgubun=${i.exgubun} page=${i.page} tr_cont=${i.trContIn} tr_cont_key='${i.trContKeyIn}'`);
-          log.info(`[BOOT-STEP] 4 g3190-response exgubun=${i.exgubun} page=${i.page} rows=${i.rows} newRows=${i.newRows} rsp_cd=${i.rspCd} resTrCont='${i.resTrCont}'${i.stop ? ` stop=${i.stop}` : ''}`);
+          log.info(`[BOOT-STEP] 4 g3190 exgubun=${i.exgubun} page=${i.page} rows=${i.rows} newRows=${i.newRows} resTrCont='${i.resTrCont}' resTrContKey='${i.resTrContKey}' rsp_cd=${i.rspCd}${i.stop ? ` stop=${i.stop}` : ''}`);
         },
       });
       const exSum = Object.entries(uni.excludedByReason).map(([k, v]) => `${k}=${v}`).join(' ');
@@ -127,21 +127,36 @@ async function main() {
       const capReq = Math.max(1, parseInt(process.env.LS_US_REST_REQ_PER_SEC || '1', 10) || 1);   // g3203 개인 1/s·법인 10/s
       const cap = computeScanCapacity(uni.eligible.length, capReq, wsMaxSubs, 900);
       log.info(`[US-CAPACITY] eligible=${cap.eligible}(${complete ? '전체시장' : '부분/미완료'}) WS배치=${wsMaxSubs} REST시드/s=${capReq} 전체REST시드1순환=${cap.fullCycleSec}s(${(cap.fullCycleSec / 60).toFixed(1)}분) 15분내전종목평가가능=${cap.coversWithinCandle}${complete ? '' : ' ⚠️(부분집합 기준 — 성공 아님)'}`);
-      const uniSubs = uni.eligible.slice(0, wsMaxSubs).map(r => ({ symbol: r.symbol, exchange: r.market === 'NASDAQ' ? 'NASDAQ' : 'NYSE', exchcd: r.exchcd }));
+      // P0-24: 전체 eligible 을 로테이션 풀에 병합(LS_US_SYMBOLS 우선). 첫 배치만 즉시 구독, 나머지는 로테이션.
+      const uniSubs = uni.eligible.map(r => ({ symbol: r.symbol, exchange: r.market === 'NASDAQ' ? 'NASDAQ' : 'NYSE', exchcd: r.exchcd }));
       const merged = new Map(subs.map(s => [s.symbol, s]));
       for (const s of uniSubs) if (!merged.has(s.symbol)) merged.set(s.symbol, s);
-      subs = [...merged.values()].slice(0, wsMaxSubs);
-      log.info(`[US-SUBS] WS 구독 ${subs.length}종목(첫 배치, 최대 ${wsMaxSubs}) — ${subs.slice(0, 10).map(s => s.symbol).join(',')}${subs.length > 10 ? ' …' : ''}`);
+      fullPool = [...merged.values()];
+      log.info(`[US-SUBS] 로테이션 풀 ${fullPool.length}종목 · WS 배치크기=${wsMaxSubs} · 총 배치=${Math.max(1, Math.ceil(fullPool.length / wsMaxSubs))}`);
     } catch (e) { log.error(`[BOOT-STEP] 5 load-us-universe-FAILED: ${scrub(String(e))} — LS_US_SYMBOLS 로 폴백(없으면 종료)`); }
   }
   // 요구 5: 유니버스 실패 + 폴백 종목도 없으면 무한대기 말고 즉시 종료.
-  if (!subs.length) { log.error('[BOOT-STEP] 종료 — 관찰 US 종목 없음(유니버스 로드 실패 + LS_US_SYMBOLS 비어있음)'); process.exit(1); return; }
-  // 이하 로직은 subs 를 종목 소스로 사용(기존 us.ok 대체).
-  const usOk = subs;
+  if (!fullPool.length) { log.error('[BOOT-STEP] 종료 — 관찰 US 종목 없음(유니버스 로드 실패 + LS_US_SYMBOLS 비어있음)'); process.exit(1); return; }
+  // ── P0-24: 로테이션 스캐너(전체 풀) + 첫 배치 선택 ──
+  const poolBySymbol = new Map(fullPool.map(s => [s.symbol, s]));
+  const rotateScanner = new RoundRobinScanner(fullPool.map(s => s.symbol));
+  const batchCount = Math.max(1, Math.ceil(fullPool.length / wsMaxSubs));
+  let rotateBatchNo = 1;
+  let usOk = rotateScanner.nextBatch(wsMaxSubs).map(sym => poolBySymbol.get(sym)!);
+  log.info(`[US-WS-ROTATE] batch=1/${batchCount} symbols=${usOk.slice(0, 10).map(s => s.symbol).join(',')}${usOk.length > 10 ? ' …' : ''}`);
 
   const ctxs = new Map<string, SymCtx>();
   const quote = resolveUSQuote();
   const sdate = kstYmd(10);
+
+  // P0-24 로테이션용: 저장된 확정봉만으로 ctx 생성(REST 미사용 → 빠름). WS 로 전방 워밍.
+  const seedStoredCtx = (s: { symbol: string; exchange: string; exchcd: string }): SymCtx => {
+    const store = new CandleStore(s.symbol); store.load();
+    const orders = new OrderStore(s.symbol); orders.load();
+    const builder = new RealtimeCandleBuilder();
+    if (!store.corrupt) builder.seed(store.confirmedSorted().map(c => ({ ...c })));
+    return { symbol: s.symbol, exchange: s.exchange, exchcd: s.exchcd, builder, store, orders, lastGSCat: null, lastGSHat: null, lastPrice: 0, bestBid: 0, bestAsk: 0, crossWonLiveDone: false };
+  };
 
   // ── 시작 시: 저장된 확정봉 복원 → REST g3203 시드 병합(실패해도 진행) ──
   log.info(`[BOOT-STEP] 6 seed-candles (${usOk.length}종목)`);
@@ -484,7 +499,8 @@ async function main() {
       // 후보(요구 9): symbol/exchcd/candleDatetime + 순위재료(거래대금/유동성/BB강도/RSI강도)
       const buyCands: Array<{ symbol: string; exchcd: string; candleDatetime: string; tradingValue: number; volume: number; bbBreakStrength: number; rsiReboundStrength: number }> = [];
 
-      for (const ctx of ctxs.values()) {
+      const ctxList = [...ctxs.values()];   // 스냅샷 — 로테이션(ctxs 교체)과 tick 이 겹쳐도 안전
+      for (const ctx of ctxList) {
         processed++;
         const r = evaluateReadiness({
           websocketConnected: wsReady, lastGSCatMs: ctx.lastGSCat, lastGSHatMs: ctx.lastGSHat,
@@ -541,12 +557,36 @@ async function main() {
     } finally { ticking = false; }
   }, 10_000);
 
+  // ── P0-24: WS 배치 로테이션 — 첫 30개에 고정되지 않고 전체 풀을 순환 구독 ──
+  const rotateSec = Math.max(60, Math.min(7200, parseInt(process.env.LS_US_WS_ROTATE_SEC || '600', 10) || 600));
+  let rotating = false;
+  const rotateIv = fullPool.length <= wsMaxSubs ? null : setInterval(() => {
+    if (rotating || ticking) return;   // tick 과 겹치지 않게
+    rotating = true;
+    try {
+      // 안전: 현재 배치에 미체결이 있으면 감시 유지를 위해 이번 로테이션 보류.
+      for (const c of ctxs.values()) if (!c.store.corrupt && c.orders.hasPending()) { log.warn('[US-WS-ROTATE] 미체결 존재 → 이번 로테이션 보류(감시 유지)'); return; }
+      // 형성봉 저장(현재 배치) 후 다음 배치로 교체.
+      for (const c of ctxs.values()) { if (c.store.corrupt) continue; try { const f = c.builder.formingCandle(); c.store.setForming(f ? toStored(f) : null); c.store.flush(); } catch { /* noop */ } }
+      const next = rotateScanner.nextBatch(wsMaxSubs);
+      rotateBatchNo = rotateBatchNo % batchCount + 1;
+      log.info(`[US-WS-ROTATE] batch=${rotateBatchNo}/${batchCount} (${next.length}종목) symbols=${next.slice(0, 10).join(',')}${next.length > 10 ? ' …' : ''}`);
+      ctxs.clear();
+      for (const sym of next) { const s = poolBySymbol.get(sym); if (s) ctxs.set(sym, seedStoredCtx(s)); }
+      usOk = next.map(sym => poolBySymbol.get(sym)).filter((x): x is NonNullable<typeof x> => !!x);
+      client.connect(usOk.map(s => ({ exchcd: s.exchcd, symbol: s.symbol })));   // 새 배치 재구독(P0-21 client 가 이전 소켓 정리)
+    } finally { rotating = false; }
+  }, rotateSec * 1000);
+  if (rotateIv) log.info(`[US-WS-ROTATE] 로테이션 활성 — ${rotateSec}s 마다 다음 ${wsMaxSubs}종목 배치로 교체(총 ${batchCount}배치)`);
+  else log.info(`[US-WS-ROTATE] 풀(${fullPool.length}) ≤ 배치크기(${wsMaxSubs}) → 로테이션 불필요(전 종목 상시 구독)`);
+
   // ── 정상 종료(SIGINT/SIGTERM): 형성봉 저장 후 종료 ──
   let shuttingDown = false;
   const shutdown = (sigName: string) => {
     if (shuttingDown) return;
     shuttingDown = true;
     clearInterval(iv);
+    if (rotateIv) clearInterval(rotateIv);
     try { client.close(); } catch { /* noop */ }
     for (const ctx of ctxs.values()) {
       if (ctx.store.corrupt) continue;   // 손상 파일에는 추가 저장 안 함
