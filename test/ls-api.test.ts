@@ -7,6 +7,7 @@ import {
   decideUSCashPayment, usCashOnlyUsdCap, usOrderableQty, formatCashOrderableLine,
   evaluateCrossWon, formatCrossWonCheck, formatCrossWonLiveCand, formatUSLiveGate, maskLSResponse, CROSS_WON_ADOPTED_FIELD, LS_US_CROSS_WON_TR_CONFIRMED, type LSUSDeposit,
   placeLSKRBuyOrder, queryLSKROrderExec, cancelLSKRBuyOrder, krIsuNo, isKROrderSuccess, getLSKRStockMaster,
+  getLSUSStockMasterPage,
   toLSOverseasExchcd, LSApiError, configureLSRateLimiter, classifyChart,
   LS_G3203_MAX_QRYCNT_UNCOMPRESSED,
 } from '../src/lib/ls-api';
@@ -817,6 +818,27 @@ describe('해외 주문/체결/예수금 (공식 필드)', () => {
     const aapl = r.holdings.find(h => h.symbol === 'AAPL');
     expect(aapl?.balQty).toBe(1);
     expect(aapl?.sellableQty).toBe(1);
+  });
+});
+
+describe('해외 종목마스터 g3190 (P0-23)', () => {
+  it('g3190 페이징 파싱 — exchcd/suspend/sellonly/expire_date/clos + cts_value', async () => {
+    stubFetch((url, init) => {
+      expect(url).toBe('https://openapi.ls-sec.co.kr:8080/overseas-stock/market-data');
+      expect(init.headers['tr_cd']).toBe('g3190');
+      const b = JSON.parse(init.body).g3190InBlock;
+      expect(b.natcode).toBe('US'); expect(b.exgubun).toBe('2'); expect(b.cts_value).toBe('');
+      return { json: { rsp_cd: '00000', g3190OutBlock: { cts_value: 'NEXT01', rec_count: 3 }, g3190OutBlock1: [
+        { keysymbol: '82AAPL', exchcd: '82', symbol: 'AAPL', engname: 'APPLE INC', currency: 'USD', clos: '230.5', suspend: 'N', sellonly: '0', expire_date: '00000000', listed_date: '19801212', marketcap: 3500000 },
+        { keysymbol: '82HALT', exchcd: '82', symbol: 'HALT', clos: '5', suspend: 'Y', sellonly: '0', expire_date: '00000000' },
+        { keysymbol: '81BA', exchcd: '81', symbol: 'BA', clos: '180', suspend: 'N', sellonly: '1', expire_date: '20260930' },
+      ] } };
+    });
+    const r = await getLSUSStockMasterPage(cfg, 'T', { exgubun: '2', ctsValue: '' });
+    expect(r.ctsValue).toBe('NEXT01');
+    expect(r.rows[0]).toMatchObject({ symbol: 'AAPL', exchcd: '82', market: 'NASDAQ', suspend: false, sellOnly: false, delisting: false, prevClose: 230.5 });
+    expect(r.rows[1].suspend).toBe(true);
+    expect(r.rows[2]).toMatchObject({ symbol: 'BA', market: 'NYSE_AMEX', sellOnly: true, delisting: true });   // expire_date≠0 → 상폐예정
   });
 });
 

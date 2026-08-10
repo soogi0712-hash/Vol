@@ -8,11 +8,14 @@ import { loadConfig, getTokenCached, resolveUSQuote, type LocalLSConfig } from '
 import { loadUSSymbols } from './universe';
 import { makeScrubber } from './mask';
 import {
-  getLSUS15MinPaged, getLSUSTicksPaged, getLSUSDeposit,
+  getLSUS15MinPaged, getLSUSTicksPaged, getLSUSDeposit, getLSUSStockMasterPage,
   placeLSUSBuyOrder, queryLSUSOrderExec, cancelLSUSOrder, LSApiError,
   decideUSCashPayment, usCashOnlyUsdCap, usOrderableQty, formatCashOrderableLine,
   evaluateCrossWon, formatCrossWonCheck, formatCrossWonLiveCand, formatUSLiveGate, LS_US_CROSS_WON_TR_CONFIRMED, type LSUSDeposit,
 } from '../src/lib/ls-api';
+import { loadUSUniverse, selectUSLiveCandidate } from './us-universe';
+import { computeScanCapacity } from './kr-rate-limiter';
+import { rankBuyCandidates, bbBreakStrength, rsiReboundStrength } from './kr-scanner';
 import {
   LSUSRealtimeClient, RealtimeCandleBuilder, buildWsTrKey, evaluateReadiness, MIN_RT_CANDLES,
   aggregateTicksTo15Min, type RTCandle,
@@ -22,7 +25,7 @@ import { OrderStore } from './order-store';
 import { parseAccountEvent, applyOrderEvent } from './order-events';
 import { evaluateTradeGate, canExecuteLive, etDateStr, isUSRegularSession, type GateState } from './trade-gate';
 import { executeBuyOrder, reconcilePending, linkTrackedToOrders, type TraderDeps } from './trader';
-import { loadLiveConfig, isLiveSymbol, type LiveConfig } from './live-config';
+import { loadLiveConfig, type LiveConfig } from './live-config';
 import { computeUSP0Checklist, formatUSP0Checklist } from './us-live-checklist';
 import { calcBB, calcRSI, getBBSignal, validateCandleData } from '../src/lib/bollinger';
 
@@ -88,14 +91,43 @@ async function main() {
 
   const us = loadUSSymbols();
   for (const u of us.unsupported) log.warn(`[US:${u.token}] UNSUPPORTED_EXCHANGE(${u.exchange}) 스킵(추측 금지)`);
-  if (!us.ok.length) { log.error('관찰 US 종목 없음 (LS_US_SYMBOLS 확인)'); process.exit(1); return; }
+
+  // ── P0-23: 미국 전체 유니버스 로드(g3190) + eligibility 필터 → WS 구독 배치 구성 ──
+  //   전체 유니버스는 라운드로빈 배치로 WS 등록(요구 6). ⚠️ LS 공식 카탈로그에 해외 WS 동시등록 한도가 미기재
+  //   (GSC/GSH requestLimit='') → 보수적 배치크기(LS_US_WS_MAX_SUBS, 기본 30)를 설정값으로 사용(추측 금지·정직 보고).
+  //   LS_US_SYMBOLS(예: AAPL) 는 유지 병합(기존 워밍 경로 보존). LS_US_UNIVERSE=off 면 유니버스 로드 생략.
+  const wsMaxSubs = Math.max(1, Math.min(500, parseInt(process.env.LS_US_WS_MAX_SUBS || '30', 10) || 30));
+  const universeOn = process.env.LS_US_UNIVERSE !== 'off';
+  const exgubunList = (process.env.LS_US_MASTER_EXGUBUN || '2').split(',').map(s => s.trim()).filter(Boolean);
+  const includeEtf = process.env.LS_US_INCLUDE_ETF === 'true';
+  let subs = us.ok.map(s => ({ symbol: s.symbol, exchange: s.exchange, exchcd: s.exchcd }));
+  if (universeOn) {
+    try {
+      const uni = await loadUSUniverse(cfg, token, exgubunList, getLSUSStockMasterPage, { includeEtf });
+      const exSum = Object.entries(uni.excludedByReason).map(([k, v]) => `${k}=${v}`).join(' ');
+      log.info(`[US-UNIVERSE] total=${uni.total} eligible=${uni.eligible.length} NASDAQ=${uni.eligiblePerExchange.NASDAQ} NYSE_AMEX=${uni.eligiblePerExchange.NYSE_AMEX} excluded=${uni.excluded} (${exSum || '없음'}) · ${uni.note}`);
+      // 라운드로빈 등록: 오늘은 첫 배치(wsMaxSubs)만 구독. 전체는 배치 순환으로 커버(요구 4·6).
+      const capReq = Math.max(1, parseInt(process.env.LS_US_REST_REQ_PER_SEC || '1', 10) || 1);   // g3203 개인 1/s·법인 10/s
+      const cap = computeScanCapacity(uni.eligible.length, capReq, wsMaxSubs, 900);
+      log.info(`[US-CAPACITY] eligible=${cap.eligible} WS배치=${wsMaxSubs} REST시드/s=${capReq} 전체REST시드1순환=${cap.fullCycleSec}s(${(cap.fullCycleSec / 60).toFixed(1)}분) 15분내전종목평가가능=${cap.coversWithinCandle}`);
+      if (!cap.coversWithinCandle) log.warn(`[US-CAPACITY] ⚠️ 개인계정 REST ${capReq}/s 로는 eligible ${cap.eligible} 종목의 15분봉 워밍/평가를 15분(900s) 안에 전부 못함(약 ${(cap.fullCycleSec / 60).toFixed(1)}분). WS 배치 순환으로 순차 커버. 법인(10/s) 필요.`);
+      const uniSubs = uni.eligible.slice(0, wsMaxSubs).map(r => ({ symbol: r.symbol, exchange: r.market === 'NASDAQ' ? 'NASDAQ' : 'NYSE', exchcd: r.exchcd }));
+      const merged = new Map(subs.map(s => [s.symbol, s]));
+      for (const s of uniSubs) if (!merged.has(s.symbol)) merged.set(s.symbol, s);
+      subs = [...merged.values()].slice(0, wsMaxSubs);
+      log.info(`[US-SUBS] WS 구독 ${subs.length}종목(첫 배치, 최대 ${wsMaxSubs}) — ${subs.slice(0, 10).map(s => s.symbol).join(',')}${subs.length > 10 ? ' …' : ''}`);
+    } catch (e) { log.warn(`[US-UNIVERSE] 로드 실패(무시, LS_US_SYMBOLS 로 진행): ${scrub(String(e))}`); }
+  }
+  if (!subs.length) { log.error('관찰 US 종목 없음 (LS_US_SYMBOLS/유니버스 확인)'); process.exit(1); return; }
+  // 이하 로직은 subs 를 종목 소스로 사용(기존 us.ok 대체).
+  const usOk = subs;
 
   const ctxs = new Map<string, SymCtx>();
   const quote = resolveUSQuote();
   const sdate = kstYmd(10);
 
   // ── 시작 시: 저장된 확정봉 복원 → REST g3203 시드 병합(실패해도 진행) ──
-  for (const s of us.ok) {
+  for (const s of usOk) {
     const store = new CandleStore(s.symbol);
     store.load();
     const orders = new OrderStore(s.symbol);
@@ -285,6 +317,7 @@ async function main() {
   else if (tracker.size) log.info(`[ACCT] 주문상태 ${tracker.size}건 복원(원주문번호 기준)`);
 
   // ── WebSocket 연결 (시세 GSC/GSH + 계좌 AS0~AS4) ──
+  let crossWonLiveGlobalDone = false;   // 최초 bestAsk 수신 시 계정 단위 CROSS-WON 1회 재계산(P0-23)
   const client = new LSUSRealtimeClient(token, {
     // 계좌 주문이벤트: 상태머신 반영 + 영구저장(민감정보 미저장/미출력). ⚠️ AS3 는 취소 결과 확인 이벤트일 뿐,
     // 취소 "요청"이 아니다. LIVE 취소 완료는 REST 취소 성공 + AS3 둘 다 필요(현재 REST 취소 미구현).
@@ -324,9 +357,9 @@ async function main() {
       ctx.bestBid = q.bestBid;
       ctx.bestAsk = q.bestAsk;
       log.info(`[GSH ${q.symbol}] bid=${q.bestBid}(${q.bidRem}) ask=${q.bestAsk}(${q.askRem})`);
-      // P0-19 #2: 최초 유효 bestAsk>0 수신 직후 실계정 종목에 대해 CROSS-WON 후보 1회 자동 재계산
-      if (!ctx.crossWonLiveDone && q.bestAsk > 0 && isLiveSymbol(liveCfg, q.symbol)) {
-        ctx.crossWonLiveDone = true;
+      // P0-19/23 #2: 최초 유효 bestAsk>0 수신 직후(구독 종목 무관, 계정 단위 CROSS-WON) 1회 자동 재계산
+      if (!crossWonLiveGlobalDone && q.bestAsk > 0) {
+        crossWonLiveGlobalDone = true; ctx.crossWonLiveDone = true;
         void runCrossWonLive(ctx);
       }
     },
@@ -340,7 +373,7 @@ async function main() {
     accountEvents: usAccountEvents,          // AS0~AS4 계좌 이벤트 등록(env 로 격리 테스트 가능)
     deferAccountEvents: usDeferAccountEvents, // 첫 데이터 수신 후 AS 등록(원인 격리, req 3)
   });
-  client.connect(us.ok.map(s => ({ exchcd: s.exchcd, symbol: s.symbol })));
+  client.connect(usOk.map(s => ({ exchcd: s.exchcd, symbol: s.symbol })));
 
   const traderDeps: TraderDeps = {
     place: (pp) => placeLSUSBuyOrder(cfg, token, pp),
@@ -413,59 +446,78 @@ async function main() {
     return outcome.status === 'placed-filled' || outcome.status === 'placed-pending' ? 'ORDERED' : 'CASH_GATE';
   }
 
-  // ── 10초마다 readiness + OBSERVE + ARMED (상태 항목별 출력) ──
+  // ── 10초마다 전 구독종목 스캔 → BUY 후보 랭킹 → 랭킹 1위부터 LIVE 게이트 (P0-23, AAPL 하드코딩 제거) ──
   let ticking = false;
+  let scanCycle = 0;
+  let accountBoughtDate: string | null = null;   // 하루 BUY 1회는 '계정 전체' 기준(요구 11)
   const iv = setInterval(async () => {
-    if (ticking) return;   // 이전 틱(예수금 조회 등) 진행 중이면 건너뜀
+    if (ticking) return;
     ticking = true;
     try {
+      const now = Date.now();
+      const etDate = etDateStr(now);
+      if (accountBoughtDate && accountBoughtDate !== etDate) accountBoughtDate = null;   // 날짜 변경 → 리셋
+      const wsReady = client.connected && client.dataReady;
+      const inSession = isUSRegularSession(now);
+      scanCycle++;
+      let readyCount = 0; let warmupCount = 0; let processed = 0;
+      // 후보(요구 9): symbol/exchcd/candleDatetime + 순위재료(거래대금/유동성/BB강도/RSI강도)
+      const buyCands: Array<{ symbol: string; exchcd: string; candleDatetime: string; tradingValue: number; volume: number; bbBreakStrength: number; rsiReboundStrength: number }> = [];
+
       for (const ctx of ctxs.values()) {
-        const now = Date.now();
-        // req 2: socket open 만으로 연결성공 아님 — 첫 GSC/GSH 데이터(dataReady) 까지 websocketConnected=false 유지.
-        const wsReady = client.connected && client.dataReady;
+        processed++;
         const r = evaluateReadiness({
-          websocketConnected: wsReady,
-          lastGSCatMs: ctx.lastGSCat,
-          lastGSHatMs: ctx.lastGSHat,
-          lastPrice: ctx.lastPrice,
-          bestBid: ctx.bestBid,
-          bestAsk: ctx.bestAsk,
-          confirmedCount: ctx.builder.confirmedCount,
-          storeCorrupted: ctx.store.corrupt,
+          websocketConnected: wsReady, lastGSCatMs: ctx.lastGSCat, lastGSHatMs: ctx.lastGSHat,
+          lastPrice: ctx.lastPrice, bestBid: ctx.bestBid, bestAsk: ctx.bestAsk,
+          confirmedCount: ctx.builder.confirmedCount, storeCorrupted: ctx.store.corrupt,
         }, now);
-        log.info(
-          `[READY ${ctx.symbol}] READY=${r.ready} warmup=${r.warmup}${r.warmup ? ` remaining=${r.warmupRemaining}` : ''}`
-          + ` confirmed=${ctx.builder.confirmedCount}/${MIN_RT_CANDLES} forming=${ctx.builder.hasForming}`
-          + ` gscAgeSec=${r.gscAgeSec ?? '-'} gshAgeSec=${r.gshAgeSec ?? '-'} socketOpen=${client.connected} dataReady=${client.dataReady} LIVE_WS_READY=${wsReady} wsAttempt=${client.attemptCount}`
-          + ` bid=${ctx.bestBid || '-'} ask=${ctx.bestAsk || '-'} lastPrice=${ctx.lastPrice || '-'}`
-          + ` 신규매수허용=${r.allowNewBuy} 신호계산허용=${r.allowSignal} 보유매도허용=${r.allowSellExisting}`
-          + (r.reasons.length ? ` | ${r.reasons.join(', ')}` : ''),
-        );
-        // BB/RSI/Signal 은 Warm-up 동안에도 계속 계산(확정봉>0). 형성봉 제외(req 2·9).
+        if (r.ready) readyCount++;
+        if (r.warmup) warmupCount++;
+        log.info(`[READY ${ctx.symbol}] READY=${r.ready} warmup=${r.warmup}${r.warmup ? ` remaining=${r.warmupRemaining}` : ''} confirmed=${ctx.builder.confirmedCount}/${MIN_RT_CANDLES} socketOpen=${client.connected} dataReady=${client.dataReady} LIVE_WS_READY=${wsReady} wsAttempt=${client.attemptCount} bid=${ctx.bestBid || '-'} ask=${ctx.bestAsk || '-'}${r.reasons.length ? ` | ${r.reasons.join(', ')}` : ''}`);
         const sig = observeSignal(log, ctx, r.warmup, r.warmupRemaining);
-        // ARMED/실주문은 실전 대상 1종목(예: NASDAQ:AAPL)에만, Warm-up 종료(확정봉≥20)+GSC신선일 때만 평가.
-        if (isLiveSymbol(liveCfg, ctx.symbol)) {
-          // 미체결 조정: 체결완료→해소 / 타임아웃→취소. 취소TR 미확인이면 취소는 실패로 남고 pending 유지(req15).
-          if (ctx.orders.hasPending()) {
-            if (liveCapable) {
-              const rec = await reconcilePending(traderDeps, { orders: ctx.orders, exchcd: ctx.exchcd, ordDate: etDateStr(Date.now()), timeoutMs: liveCfg.pendingTimeoutSec * 1000, autoCancel: liveCfg.autoCancel });
-              for (const o of rec) log.info(`[RECONCILE ${ctx.symbol}] ordNo=${o.ordNo} ${o.status} — ${o.reason}`);
-            } else {
-              log.warn(`[RECONCILE ${ctx.symbol}] 미체결 ${ctx.orders.pending.length}건 존재하나 실주문/취소 비활성 → 수동 확인 필요(신규주문 차단)`);
-            }
-          }
-          // ── 거래 0건 사유 분류 + 카운터(req 9) ──
-          let reason: keyof typeof noTradeCounts | 'ORDERED' | 'LIVE_OFF';
-          if (!isUSRegularSession(now)) reason = 'MARKET_CLOSED';
-          else if (!client.connected || !client.dataReady || r.stale) reason = 'WS_NOT_READY';   // WS 미연결/데이터 미수신/stale
-          else if (r.warmup) reason = 'WARMUP';
-          else if (armedMode && sig && r.allowSignal) reason = await evaluateArmed(ctx, sig, Date.now());
-          else reason = 'NO_BUY_SIGNAL';
-          if (reason !== 'ORDERED' && reason !== 'LIVE_OFF') bumpNoTrade(reason);
-          const counts = Object.entries(noTradeCounts).filter(([, v]) => v > 0).map(([k, v]) => `${k}=${v}`).join(' ');
-          log.info(`[NO-TRADE-COUNTS ${ctx.symbol}] 이번틱=${reason} · 누적: ${counts || '없음'}`);
+        // 미체결 조정(모든 구독종목) — pending 있으면 신규 금지, 취소TR 미확인이면 유지(req15)
+        if (ctx.orders.hasPending() && liveCapable) {
+          const rec = await reconcilePending(traderDeps, { orders: ctx.orders, exchcd: ctx.exchcd, ordDate: etDate, timeoutMs: liveCfg.pendingTimeoutSec * 1000, autoCancel: liveCfg.autoCancel });
+          for (const o of rec) log.info(`[RECONCILE ${ctx.symbol}] ordNo=${o.ordNo} ${o.status} — ${o.reason}`);
+        }
+        // BUY 후보 수집(전략 불변 · warmup 종료 · GSC/GSH 신선 · 세션 · dataReady 일 때만)
+        if (sig?.action === 'BUY' && !r.warmup && r.allowSignal && inSession && wsReady && !r.stale) {
+          const confirmed = ctx.builder.confirmedCandles();
+          const closes = confirmed.map(c => c.close); const dts = confirmed.map(c => c.datetime);
+          const bands = calcBB(closes, dts, 20, 2); const rsi = calcRSI(closes, 14);
+          const lastC = confirmed[confirmed.length - 1]; const lower = bands[bands.length - 1]?.lower ?? 0;
+          const vol = lastC?.volume ?? 0; const px = ctx.lastPrice || lastC?.close || 0;
+          buyCands.push({ symbol: ctx.symbol, exchcd: ctx.exchcd, candleDatetime: sig.candleDatetime, tradingValue: px * vol, volume: vol, bbBreakStrength: bbBreakStrength(lastC.low, lastC.close, lower), rsiReboundStrength: rsiReboundStrength(rsi) });
         }
       }
+
+      log.info(`[US-SCAN] cycle=${scanCycle} processed=${processed} remaining=0 ready=${readyCount} warmup=${warmupCount} session=${inSession} wsReady=${wsReady}`);
+
+      // ── 후보 랭킹 → 랭킹 1위부터 LIVE 게이트(요구 9·10·11) ──
+      let tickReason = 'NO_BUY_SIGNAL';
+      if (!inSession) tickReason = 'MARKET_CLOSED';
+      else if (!wsReady) tickReason = 'WS_NOT_READY';
+      else if (buyCands.length) {
+        const ranked = rankBuyCandidates(buyCands.map(c => ({ shcode: c.symbol, tradingValue: c.tradingValue, volume: c.volume, bbBreakStrength: c.bbBreakStrength, rsiReboundStrength: c.rsiReboundStrength })));
+        log.info(`[US-SIGNAL] BUY candidates=${ranked.length}`);
+        log.info(`[US-RANK] ` + ranked.slice(0, 5).map(c => `${c.rank} symbol=${c.shcode} exchange=${ctxs.get(c.shcode)?.exchange ?? '-'} score=${Math.round(c.score)}`).join(' '));
+        const rankedUS = ranked.map(c => ({ symbol: c.shcode, exchcd: ctxs.get(c.shcode)?.exchcd ?? '', rank: c.rank, score: c.score }));
+        const sel = selectUSLiveCandidate(rankedUS, (sym) => {
+          const cx = ctxs.get(sym);
+          return { warmedUp: !!cx && cx.builder.confirmedCount >= MIN_RT_CANDLES, hasPending: !!cx && cx.orders.hasPending(), dailyExhausted: accountBoughtDate === etDate };
+        });
+        if (accountBoughtDate === etDate) tickReason = 'DAILY_LIMIT';
+        else if (!sel) tickReason = 'NO_ELIGIBLE_CANDIDATE';
+        else if (armedMode) {
+          const selCtx = ctxs.get(sel.symbol)!; const selCand = buyCands.find(c => c.symbol === sel.symbol)!;
+          log.info(`[US-LIVE-SELECT] 랭킹1위 실거래 대상 symbol=${sel.symbol}(exchcd=${sel.exchcd}) — AAPL 하드코딩 아님`);
+          tickReason = await evaluateArmed(selCtx, { action: 'BUY', candleDatetime: selCand.candleDatetime }, Date.now());
+          if (tickReason === 'ORDERED') accountBoughtDate = etDate;
+        } else tickReason = 'NOT_ARMED';
+      }
+      if (Object.prototype.hasOwnProperty.call(noTradeCounts, tickReason)) bumpNoTrade(tickReason as keyof typeof noTradeCounts);
+      const counts = Object.entries(noTradeCounts).filter(([, v]) => v > 0).map(([k, v]) => `${k}=${v}`).join(' ');
+      log.info(`[NO-TRADE-COUNTS] 이번틱=${tickReason} · 누적: ${counts || '없음'}`);
     } finally { ticking = false; }
   }, 10_000);
 

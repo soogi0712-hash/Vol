@@ -38,8 +38,14 @@ describe('P0-10 최종 체크리스트', () => {
     expect(c.US_CROSS_WON_VERIFIED).toBe(false);
     expect(c.US_LIVE_READY).toBe(false);
   });
-  it('일일제한 위반(종목/수량) → US_DAILY_BUY_LIMIT=false, US_LIVE_READY=false', () => {
+  it('P0-23: 종목 하드코딩 제거 — TSLA 여도 qty1/하루1 이면 US_DAILY_BUY_LIMIT=true(AAPL 강제 아님)', () => {
     process.env.LS_US_LIVE_SYMBOL = 'NASDAQ:TSLA';
+    const c = computeUSP0Checklist(loadLiveConfig());
+    expect(c.US_DAILY_BUY_LIMIT).toBe(true);   // 종목 무관, 수량/한도만 확인
+    expect(c.US_LIVE_READY).toBe(true);
+  });
+  it('일일제한 위반(수량>1 요청은 코드에서 1로 강제되나, dailyMaxBuys=0 이면 차단)', () => {
+    process.env.LS_US_DAILY_MAX_BUYS = '0';
     const c = computeUSP0Checklist(loadLiveConfig());
     expect(c.US_DAILY_BUY_LIMIT).toBe(false);
     expect(c.US_LIVE_READY).toBe(false);

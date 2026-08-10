@@ -18,7 +18,8 @@ export interface USP0Checklist {
 
 // 구현된 안전장치 플래그(코드로 보장). 설정 의존 플래그는 cfg 로 판정.
 export function computeUSP0Checklist(cfg: LiveConfig): USP0Checklist {
-  const dailyOk = cfg.liveSymbol === 'AAPL' && cfg.maxQty === 1 && cfg.dailyMaxBuys === 1;
+  // P0-23: 종목 하드코딩(AAPL) 제거 — 오늘 첫 전체종목 실전 안전제한(qty1/하루BUY1)만 확인.
+  const dailyOk = cfg.maxQty === 1 && cfg.dailyMaxBuys === 1;
   const base = {
     MANUAL_CANCEL_MODE: cfg.manualCancel,
     AUTO_CANCEL_MODE: cfg.autoCancel,

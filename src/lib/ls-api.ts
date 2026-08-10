@@ -360,6 +360,52 @@ export async function getLSKRStockMaster(cfg: LSConfig, token: string, gubun: st
   return { rspCd, rspMsg, rows, diag };
 }
 
+// ── 해외 종목마스터 (g3190, /overseas-stock/market-data) — 미국(NASDAQ/NYSE/AMEX) 전 종목 자동 로드 ──
+// 공식 resExample OutBlock1: keysymbol/exchcd(82=NASDAQ,81=NYSE/AMEX)/symbol/korname/engname/currency/
+//   clos(전일종가)/pcls/suspend(거래정지 N/Y)/sellonly(정리매매/매도전용 '0'=정상)/listed_date/expire_date(상폐예정,
+//   '00000000'=없음)/marketcap/share. OutBlock.cts_value 로 페이징(연속조회).
+// 요청: delaygb/natcode(US)/exgubun/readcnt/cts_value. exgubun 값 의미는 공식 카탈로그 미기재(추측 금지) →
+//   호출측이 exgubun 을 주입하고, 시장분류는 각 row 의 공식 exchcd 로 한다.
+// ⚠️ 공식 전송한도 g3190 = 초당 10건(개인)/50건(법인).
+export interface LSUSMasterRow {
+  keysymbol: string; symbol: string; exchcd: string; market: 'NASDAQ' | 'NYSE_AMEX' | 'ETC';
+  engname: string; korname: string; currency: string;
+  prevClose: number; suspend: boolean; sellOnly: boolean; delisting: boolean; expireDate: string;
+  listedDate: string; marketcap: number;
+}
+function usMarketFromExchcd(exchcd: string): 'NASDAQ' | 'NYSE_AMEX' | 'ETC' {
+  return exchcd === '82' ? 'NASDAQ' : exchcd === '81' ? 'NYSE_AMEX' : 'ETC';
+}
+export function parseLSUSMasterRow(r: any): LSUSMasterRow {
+  const exchcd = String(r.exchcd ?? '');
+  const expire = String(r.expire_date ?? '00000000');
+  return {
+    keysymbol: String(r.keysymbol ?? ''),
+    symbol: String(r.symbol ?? ''),
+    exchcd,
+    market: usMarketFromExchcd(exchcd),
+    engname: String(r.engname ?? ''),
+    korname: String(r.korname ?? ''),
+    currency: String(r.currency ?? ''),
+    prevClose: toNum(r.clos) || toNum(r.pcls),
+    suspend: String(r.suspend ?? 'N').toUpperCase() === 'Y',
+    sellOnly: String(r.sellonly ?? '0') !== '0',
+    delisting: expire !== '00000000' && expire !== '' && expire !== '0',
+    expireDate: expire,
+    listedDate: String(r.listed_date ?? ''),
+    marketcap: toNum(r.marketcap),
+  };
+}
+// 한 페이지(readcnt) 조회. cts_value='' 로 시작, 응답 cts_value 를 다음 호출에 넘겨 페이징.
+export async function getLSUSStockMasterPage(cfg: LSConfig, token: string, p: { natcode?: string; exgubun: string; readcnt?: number; ctsValue?: string; delaygb?: string }): Promise<{ rspCd: string; rspMsg: string; rows: LSUSMasterRow[]; ctsValue: string; recCount: number; diag: LSHttpDiag }> {
+  const { data, rspCd, rspMsg, diag } = await lsPost(token, '/overseas-stock/market-data', 'g3190', {
+    g3190InBlock: { delaygb: p.delaygb ?? 'R', natcode: p.natcode ?? 'US', exgubun: p.exgubun, readcnt: p.readcnt ?? 500, cts_value: p.ctsValue ?? '' },
+  });
+  const raw: any[] = data.g3190OutBlock1 || [];
+  const ob = data.g3190OutBlock || {};
+  return { rspCd, rspMsg, rows: raw.map(parseLSUSMasterRow), ctsValue: String(ob.cts_value ?? ''), recCount: toNum(ob.rec_count), diag };
+}
+
 // ── 해외 15분봉 (g3203, ncnt=15) — OutBlock1: date/loctime/open/high/low/close/exevol ──
 // ⚠️ 공식 제한(g3203): comp_yn='N'(비압축) → qrycnt 최대 5. comp_yn='Y'(압축) → 최대 2000.
 //    압축응답 해제 방식은 공식 문서에서 확인되지 않았으므로 여기서는 비압축(N, 상한 5)만 사용한다.

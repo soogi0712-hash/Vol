@@ -329,6 +329,32 @@ HTS_QTY / PROGRAM_QTY(최신 bestAsk 재계산) / cashOnly / paymentMode=CROSS_W
 && (WonCashMin programQty≥1 && cashOnly)**. 시작 로그의 "실주문 가능" 문구도 동일 최종 게이트와 일치하도록
 `US_LIVE_READY && CROSS_WON_VERIFIED && LS_LIVE_TRADING && 시작현금조회` 를 모두 만족할 때만 출력한다(P0-20 #12).
 
+### P0-23 — 미국 전체 유니버스 스캔 + AAPL 하드코딩 제거
+
+`ls:usws` 를 AAPL 1종목 LIVE 에서 **전체 유니버스 후보선정** 구조로 확장.
+
+- **① 공식 유니버스 로드**: LS 해외 종목마스터 **`g3190`**(natcode=US, `cts_value` 페이징) 로 NASDAQ/NYSE/AMEX
+  전 종목 로드. 각 row 의 공식 **`exchcd`**(82=NASDAQ, 81=NYSE/AMEX)로 거래소 분류(추측 금지, 요구 12).
+- **② eligibility 필터**(요구 2): 거래정지(`suspend=Y`), 정리매매/매도전용(`sellonly≠0`), 상폐예정(`expire_date≠00000000`),
+  가격 0(`clos≤0`), 유닛/워런트/우선주 심볼(`.`/`-`/접미 U·W·R·P) 제외. ETF/ETN 은 옵션(`LS_US_INCLUDE_ETF`) —
+  ⚠️ g3190 에 ETF 확정 플래그가 없어(추측 금지) 심볼 휴리스틱만.
+- **③ [US-UNIVERSE] 로그**: `total / eligible / NASDAQ / NYSE_AMEX / excluded (사유별)`.
+- **④ 한도 준수**(요구 5): 공식 전송한도 확인 — g3190 마스터=개인 10/s·법인 50/s, g3203 분봉=개인 1/s·법인 10/s.
+  **⚠️ 해외 WS(GSC/GSH) 동시등록 한도는 공식 카탈로그에 미기재**(`requestLimit=''`) → 수천 종목 동시등록 금지,
+  보수적 배치크기 `LS_US_WS_MAX_SUBS`(기본 30)를 **설정값**으로 사용하고 라운드로빈 순환 등록(요구 6). 정직 보고.
+- **⑤ [US-CAPACITY]**: eligible·WS배치·REST시드/s 로 전체 1순환시간·15분 커버 가능여부 산출. **개인 1/s 로는
+  전 종목 15분 내 워밍/평가 불가** → WS 배치 순환으로 순차 커버(법인 10/s 필요).
+- **⑥ 전략 불변**(요구 7·8): WS GSC 로 15분봉 로컬 생성(`CandleStore` 재사용) + `calcBB(20,2)`+`calcRSI(14)` 그대로.
+  확정봉 20개 확보 후 자동 READY, 가짜봉 없음.
+- **⑦ BUY 후보 랭킹**(요구 9): 거래대금>유동성>BB강도>RSI강도. `[US-SCAN]`/`[US-SIGNAL]`/`[US-RANK]` 로그.
+  **유니버스를 상위 N 으로 자르지 않음** — WS 배치는 순환 커버, 랭킹은 후보 정렬용.
+- **⑧ AAPL 하드코딩 제거**(요구 11): LIVE 대상 = `selectUSLiveCandidate`(랭킹1위부터 warm-up 완료+미보유+한도내).
+  `[US-LIVE-SELECT] symbol=..` 로 선택. 안전상 **qty=1 · 하루 BUY 1회(계정 전체)** 유지. `US_DAILY_BUY_LIMIT`
+  체크리스트에서 AAPL 강제 제거(수량/한도만 확인).
+- **⑨ 안전장치 전부 유지**(요구 10·14): CROSS_WON cash-only(WonCashMin)·미수/대출/담보 금지·주문직전 COSOQ02701
+  재조회·pending 차단·동일 candle 중복 POST 금지·candle lock·OrdNo 저장·AS0/1/3/4 연동·MANUAL_CANCEL·하루한도.
+  P0-21 WS 수정 유지(socketOpen≠READY, dataReady 필요, stale 시 BUY 금지, storm 방지).
+
 ### P0-21 — WebSocket 무한 재연결(1초 storm) 장애 수정
 
 증상: 소켓 open → 등록 → 서버가 곧바로 close → `재연결 대기 1000ms` 를 1초마다 무한 반복. GSC/GSH stale.
