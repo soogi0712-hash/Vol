@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { classifyUSSymbol, isDerivedUSSymbol, buildUSUniverse, loadUSUniverse, selectUSLiveCandidate } from '../local-runner/us-universe';
+import { classifyUSSymbol, isDerivedUSSymbol, buildUSUniverse, loadUSUniverse, selectUSLiveCandidate, probeUSMasterExgubun, exgubunWithNyseAmex } from '../local-runner/us-universe';
 import type { LSUSMasterRow } from '../src/lib/ls-api';
 
 function row(o: Partial<LSUSMasterRow> = {}): LSUSMasterRow {
@@ -115,6 +115,35 @@ describe('P0-23 US 유니버스 eligibility 필터', () => {
     expect(u.eligiblePerExchange.NASDAQ).toBe(1);
     expect(u.eligiblePerExchange.NYSE_AMEX).toBe(1);
     expect(u.complete).toBe(true);
+  });
+});
+
+describe('P0-25 exgubun 실측 탐색(추측 금지)', () => {
+  const rowE = (exchcd: string, symbol: string): LSUSMasterRow => row({ exchcd, symbol, keysymbol: exchcd + symbol, market: exchcd === '82' ? 'NASDAQ' : 'NYSE_AMEX' });
+  it('후보 exgubun 별 첫 페이지 1회 조회 → exchcd81/82 분포 집계', async () => {
+    const calls: string[] = [];
+    const page = async (_c: any, _t: string, p: { exgubun: string; trCont?: string }) => {
+      calls.push(`${p.exgubun}:${p.trCont}`);
+      if (p.exgubun === '2') return { rspCd: '00000', rspMsg: '', diag: {} as any, recCount: 2, ctsValue: '', resTrCont: 'Y', resTrContKey: '0', rows: [rowE('82', 'AAPL'), rowE('82', 'MSFT')] };
+      if (p.exgubun === '3') return { rspCd: '00000', rspMsg: '', diag: {} as any, recCount: 2, ctsValue: '', resTrCont: 'Y', resTrContKey: '0', rows: [rowE('81', 'BA'), rowE('81', 'GE')] };
+      return { rspCd: '00000', rspMsg: '', diag: {} as any, recCount: 0, ctsValue: '', resTrCont: 'N', resTrContKey: '', rows: [] };
+    };
+    const probes = await probeUSMasterExgubun({} as any, 'T', ['2', '3', '4'], page as any, { readcnt: 100 });
+    expect(calls).toEqual(['2:N', '3:N', '4:N']);   // 각 후보 첫 페이지 1회(trCont='N')
+    expect(probes[0]).toMatchObject({ exgubun: '2', exchcd82: 2, exchcd81: 0 });
+    expect(probes[1]).toMatchObject({ exgubun: '3', exchcd81: 2, exchcd82: 0 });
+    expect(probes[0].sampleSymbols).toContain('AAPL(82)');
+    // exchcd81(NYSE/AMEX) 반환 값 = '3'
+    expect(exgubunWithNyseAmex(probes)).toEqual(['3']);
+  });
+  it('조회 실패 후보는 error 기록(다음 후보 계속)', async () => {
+    const page = async (_c: any, _t: string, p: { exgubun: string }) => {
+      if (p.exgubun === '1') throw new Error('타임아웃');
+      return { rspCd: '00000', rspMsg: '', diag: {} as any, recCount: 1, ctsValue: '', resTrCont: 'N', resTrContKey: '', rows: [rowE('82', 'AAPL')] };
+    };
+    const probes = await probeUSMasterExgubun({} as any, 'T', ['1', '2'], page as any, {});
+    expect(probes[0].error).toMatch(/타임아웃/);
+    expect(probes[1].exchcd82).toBe(1);
   });
 });
 

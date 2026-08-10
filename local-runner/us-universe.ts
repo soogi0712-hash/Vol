@@ -107,6 +107,35 @@ export async function loadUSUniverse(
   return { ...u, complete };
 }
 
+// ── exgubun 실측 탐색(P0-25) — 추측 금지. 후보 exgubun 값별로 첫 페이지 1회만 조회해 exchcd 분포 확인 ──
+//   exgubun=2 는 NASDAQ(82)만 반환됨이 실측 확인. exchcd=81(NYSE/AMEX)을 반환하는 exgubun 값을 찾는다.
+export interface ExgubunProbe { exgubun: string; rows: number; exchcd81: number; exchcd82: number; otherExch: number; sampleSymbols: string[]; rspCd: string; error?: string; }
+export async function probeUSMasterExgubun(
+  cfg: LSConfig, token: string, candidates: string[],
+  fetchPage: typeof getLSUSStockMasterPage = getLSUSStockMasterPage,
+  opts: { readcnt?: number; timeoutMs?: number } = {},
+): Promise<ExgubunProbe[]> {
+  const out: ExgubunProbe[] = [];
+  for (const exgubun of candidates) {
+    try {
+      const r = await fetchPage(cfg, token, { exgubun, trCont: 'N', trContKey: '', readcnt: opts.readcnt ?? 100, timeoutMs: opts.timeoutMs ?? 10000 });
+      let e81 = 0, e82 = 0, other = 0; const sample: string[] = [];
+      for (const row of r.rows) {
+        if (row.exchcd === '81') e81++; else if (row.exchcd === '82') e82++; else other++;
+        if (sample.length < 8) sample.push(`${row.symbol}(${row.exchcd})`);
+      }
+      out.push({ exgubun, rows: r.rows.length, exchcd81: e81, exchcd82: e82, otherExch: other, sampleSymbols: sample, rspCd: r.rspCd });
+    } catch (e) {
+      out.push({ exgubun, rows: 0, exchcd81: 0, exchcd82: 0, otherExch: 0, sampleSymbols: [], rspCd: '', error: e instanceof Error ? e.message : String(e) });
+    }
+  }
+  return out;
+}
+// 실측 결과 → exchcd81(NYSE/AMEX)을 반환한 exgubun 값 목록(중복 제거).
+export function exgubunWithNyseAmex(probes: ExgubunProbe[]): string[] {
+  return [...new Set(probes.filter(p => p.exchcd81 > 0).map(p => p.exgubun))];
+}
+
 // ── LIVE 후보 선정(요구 11) — AAPL 하드코딩 제거. 랭킹 1위부터 준비완료+eligible 후보를 선택 ──
 export interface USCandidateReadiness { warmedUp: boolean; hasPending: boolean; dailyExhausted: boolean; }
 export interface RankedUSCandidate { symbol: string; exchcd: string; rank: number; score: number; }

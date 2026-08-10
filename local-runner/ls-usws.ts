@@ -13,7 +13,7 @@ import {
   decideUSCashPayment, usCashOnlyUsdCap, usOrderableQty, formatCashOrderableLine,
   evaluateCrossWon, formatCrossWonCheck, formatCrossWonLiveCand, formatUSLiveGate, LS_US_CROSS_WON_TR_CONFIRMED, type LSUSDeposit,
 } from '../src/lib/ls-api';
-import { loadUSUniverse, selectUSLiveCandidate } from './us-universe';
+import { loadUSUniverse, selectUSLiveCandidate, probeUSMasterExgubun, exgubunWithNyseAmex } from './us-universe';
 import { computeScanCapacity } from './kr-rate-limiter';
 import { rankBuyCandidates, bbBreakStrength, rsiReboundStrength, RoundRobinScanner } from './kr-scanner';
 import {
@@ -99,11 +99,23 @@ async function main() {
   //   LS_US_SYMBOLS(예: AAPL) 는 유지 병합(기존 워밍 경로 보존). LS_US_UNIVERSE=off 면 유니버스 로드 생략.
   const wsMaxSubs = Math.max(1, Math.min(500, parseInt(process.env.LS_US_WS_MAX_SUBS || '30', 10) || 30));
   const universeOn = process.env.LS_US_UNIVERSE !== 'off';
-  const exgubunList = (process.env.LS_US_MASTER_EXGUBUN || '2').split(',').map(s => s.trim()).filter(Boolean);
+  let exgubunList = (process.env.LS_US_MASTER_EXGUBUN || '2').split(',').map(s => s.trim()).filter(Boolean);
   const includeEtf = process.env.LS_US_INCLUDE_ETF === 'true';
   const subs = us.ok.map(s => ({ symbol: s.symbol, exchange: s.exchange, exchcd: s.exchcd }));
   let fullPool: { symbol: string; exchange: string; exchcd: string }[] = [...subs];   // 기본 = LS_US_SYMBOLS. 유니버스 로드 성공 시 전체로 교체.
   if (universeOn) {
+    // ── P0-25: exgubun 실측 탐색(주문 없음). exchcd=81(NYSE/AMEX) 반환 값을 찾아 로드 대상에 자동 추가 ──
+    if (process.env.LS_US_MASTER_EXGUBUN_DIAG === 'true') {
+      const cands = (process.env.LS_US_MASTER_EXGUBUN_DIAG_VALUES || '0,1,2,3,4,5,6,7,8,9').split(',').map(s => s.trim()).filter(Boolean);
+      log.info(`[US-EXGUBUN-DIAG] 후보 exgubun 탐색(주문없음, 각 첫 페이지 1회): [${cands.join(',')}]`);
+      try {
+        const probes = await probeUSMasterExgubun(cfg, token, cands, getLSUSStockMasterPage, { readcnt: 100 });
+        for (const p of probes) log.info(`[US-EXGUBUN-DIAG] exgubun=${p.exgubun} rows=${p.rows} exchcd81=${p.exchcd81} exchcd82=${p.exchcd82} other=${p.otherExch} sample=[${p.sampleSymbols.join(' ')}]${p.error ? ` ERROR=${scrub(p.error)}` : ''}`);
+        const nyse = exgubunWithNyseAmex(probes);
+        log.info(`[US-EXGUBUN-DIAG] exchcd81(NYSE/AMEX) 반환 exgubun=[${nyse.join(',') || '없음'}]${nyse.length ? ' → 이번 로드에 자동 추가' : ' — 후보에서 NYSE/AMEX 미발견(LS_US_MASTER_EXGUBUN_DIAG_VALUES 확대 필요)'}`);
+        exgubunList = [...new Set([...exgubunList, ...nyse])];   // 실측으로 확인된 값만 추가(요구 3·4)
+      } catch (e) { log.error(`[US-EXGUBUN-DIAG] 탐색 실패: ${scrub(String(e))}`); }
+    }
     log.info(`[BOOT-STEP] 2 load-us-universe-start exgubun=[${exgubunList.join(',')}]`);
     try {
       const uni = await loadUSUniverse(cfg, token, exgubunList, getLSUSStockMasterPage, {
@@ -137,13 +149,19 @@ async function main() {
   }
   // 요구 5: 유니버스 실패 + 폴백 종목도 없으면 무한대기 말고 즉시 종료.
   if (!fullPool.length) { log.error('[BOOT-STEP] 종료 — 관찰 US 종목 없음(유니버스 로드 실패 + LS_US_SYMBOLS 비어있음)'); process.exit(1); return; }
-  // ── P0-24: 로테이션 스캐너(전체 풀) + 첫 배치 선택 ──
+  // ── P0-24/25: 로테이션 — LS_US_SYMBOLS(AAPL/TSLA/BA 등 워밍된 LIVE 종목)는 항상 구독, 나머지만 순환(요구 7) ──
   const poolBySymbol = new Map(fullPool.map(s => [s.symbol, s]));
-  const rotateScanner = new RoundRobinScanner(fullPool.map(s => s.symbol));
-  const batchCount = Math.max(1, Math.ceil(fullPool.length / wsMaxSubs));
+  const alwaysOn = subs.filter(s => poolBySymbol.has(s.symbol));            // 상시 구독(워밍 유지)
+  const alwaysOnSet = new Set(alwaysOn.map(s => s.symbol));
+  const rotationSyms = fullPool.map(s => s.symbol).filter(sym => !alwaysOnSet.has(sym));   // 로테이션 대상(상시구독 제외)
+  const rotateBatchSize = Math.max(1, wsMaxSubs - alwaysOn.length);
+  const rotateScanner = new RoundRobinScanner(rotationSyms);
+  const batchCount = Math.max(1, Math.ceil(rotationSyms.length / rotateBatchSize));
+  const makeBatch = () => [...alwaysOn.map(s => s.symbol), ...rotateScanner.nextBatch(rotateBatchSize)]
+    .map(sym => poolBySymbol.get(sym)).filter((x): x is NonNullable<typeof x> => !!x);
   let rotateBatchNo = 1;
-  let usOk = rotateScanner.nextBatch(wsMaxSubs).map(sym => poolBySymbol.get(sym)!);
-  log.info(`[US-WS-ROTATE] batch=1/${batchCount} symbols=${usOk.slice(0, 10).map(s => s.symbol).join(',')}${usOk.length > 10 ? ' …' : ''}`);
+  let usOk = makeBatch();
+  log.info(`[US-WS-ROTATE] batch=1/${batchCount} 상시구독=${alwaysOn.length}(${alwaysOn.map(s => s.symbol).join(',')}) + 로테이션${rotateBatchSize} · 총 ${usOk.length}종목`);
 
   const ctxs = new Map<string, SymCtx>();
   const quote = resolveUSQuote();
@@ -560,25 +578,25 @@ async function main() {
   // ── P0-24: WS 배치 로테이션 — 첫 30개에 고정되지 않고 전체 풀을 순환 구독 ──
   const rotateSec = Math.max(60, Math.min(7200, parseInt(process.env.LS_US_WS_ROTATE_SEC || '600', 10) || 600));
   let rotating = false;
-  const rotateIv = fullPool.length <= wsMaxSubs ? null : setInterval(() => {
-    if (rotating || ticking) return;   // tick 과 겹치지 않게
+  const rotateIv = rotationSyms.length <= rotateBatchSize ? null : setInterval(() => {
+    if (rotating) return;   // 중복 로테이션 방지. tick 은 ctxs 스냅샷으로 순회하므로 겹쳐도 안전.
     rotating = true;
     try {
       // 안전: 현재 배치에 미체결이 있으면 감시 유지를 위해 이번 로테이션 보류.
       for (const c of ctxs.values()) if (!c.store.corrupt && c.orders.hasPending()) { log.warn('[US-WS-ROTATE] 미체결 존재 → 이번 로테이션 보류(감시 유지)'); return; }
       // 형성봉 저장(현재 배치) 후 다음 배치로 교체.
       for (const c of ctxs.values()) { if (c.store.corrupt) continue; try { const f = c.builder.formingCandle(); c.store.setForming(f ? toStored(f) : null); c.store.flush(); } catch { /* noop */ } }
-      const next = rotateScanner.nextBatch(wsMaxSubs);
+      const next = makeBatch();   // 상시구독(AAPL/TSLA/BA) + 다음 로테이션 슬라이스
       rotateBatchNo = rotateBatchNo % batchCount + 1;
-      log.info(`[US-WS-ROTATE] batch=${rotateBatchNo}/${batchCount} (${next.length}종목) symbols=${next.slice(0, 10).join(',')}${next.length > 10 ? ' …' : ''}`);
+      log.info(`[US-WS-ROTATE] batch=${rotateBatchNo}/${batchCount} (${next.length}종목, 상시=${alwaysOn.length}) symbols=${next.slice(0, 10).map(s => s.symbol).join(',')}${next.length > 10 ? ' …' : ''}`);
       ctxs.clear();
-      for (const sym of next) { const s = poolBySymbol.get(sym); if (s) ctxs.set(sym, seedStoredCtx(s)); }
-      usOk = next.map(sym => poolBySymbol.get(sym)).filter((x): x is NonNullable<typeof x> => !!x);
+      for (const s of next) ctxs.set(s.symbol, seedStoredCtx(s));
+      usOk = next;
       client.connect(usOk.map(s => ({ exchcd: s.exchcd, symbol: s.symbol })));   // 새 배치 재구독(P0-21 client 가 이전 소켓 정리)
     } finally { rotating = false; }
   }, rotateSec * 1000);
-  if (rotateIv) log.info(`[US-WS-ROTATE] 로테이션 활성 — ${rotateSec}s 마다 다음 ${wsMaxSubs}종목 배치로 교체(총 ${batchCount}배치)`);
-  else log.info(`[US-WS-ROTATE] 풀(${fullPool.length}) ≤ 배치크기(${wsMaxSubs}) → 로테이션 불필요(전 종목 상시 구독)`);
+  if (rotateIv) log.info(`[US-WS-ROTATE] 로테이션 활성 — ${rotateSec}s 마다 다음 ${rotateBatchSize}종목 로테이션(총 ${batchCount}배치, 상시구독 ${alwaysOn.length} 제외)`);
+  else log.info(`[US-WS-ROTATE] 로테이션 대상(${rotationSyms.length}) ≤ 로테이션 배치(${rotateBatchSize}) → 로테이션 불필요(전 종목 상시 구독)`);
 
   // ── 정상 종료(SIGINT/SIGTERM): 형성봉 저장 후 종료 ──
   let shuttingDown = false;
