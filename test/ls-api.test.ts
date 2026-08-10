@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
   getLSAccessToken, getLSKRBalance, getLSUSBalance,
-  getLSKRPrice, getLSUSPrice, getLSKR15Min, getLSUS15Min, getLSUS15MinPaged,
+  getLSKRPrice, getLSUSPrice, getLSKR15Min, getLSUS15Min, getLSUS15MinPaged, getLSUS15MinOlderThan, prevYmd,
   getLSUSTicks, getLSUSTicksPaged, lsOverseasChartRaw,
   placeLSUSBuyOrder, queryLSUSOrderExec, classifyOrderExec, LS_US_ORDEREXEC_EMPTY_CODES, getLSUSDeposit, getLSUSHoldings, cancelLSUSOrder, LS_CANCEL_TR_CONFIRMED, isUSOrderSuccess,
   decideUSCashPayment, usCashOnlyUsdCap, usOrderableQty, formatCashOrderableLine,
@@ -471,6 +471,41 @@ describe('해외 주문/체결/예수금 (공식 필드)', () => {
     expect(isUSOrderSuccess('99999', '141')).toBe(true);     // 코드 몰라도 OrdNo 있으면 성공
     expect(isUSOrderSuccess('40510', null)).toBe(false);     // 거부
     expect(isUSOrderSuccess('99999', '(unknown)')).toBe(false);
+  });
+  it('P0-28 prevYmd — 하루 전(월/년 경계 포함)', () => {
+    expect(prevYmd('20260807')).toBe('20260806');
+    expect(prevYmd('20260801')).toBe('20260731');
+    expect(prevYmd('20260101')).toBe('20251231');
+    expect(prevYmd('20260301')).toBe('20260228');   // 2026 비윤년
+  });
+  it('P0-28 getLSUS15MinOlderThan — storeOldest 보다 오래된 확정봉을 edate 과거이동으로 확보(최근봉 반복 아님)', async () => {
+    const edates: string[] = [];
+    stubFetch((url, init) => {
+      expect(url).toBe('https://openapi.ls-sec.co.kr:8080/overseas-stock/chart');
+      const b = JSON.parse(init.body).g3203InBlock;
+      expect(b.tr_cd ?? 'g3203');   // g3203 경로 확인은 url 로 충분
+      edates.push(b.edate);
+      const d = b.edate;
+      const rows = ['150000', '151500', '153000', '154500', '160000'].map((lt, i) => ({
+        date: d, loctime: lt, open: '10', high: '11', low: '9', close: String(10 + i), exevol: 100, amount: 0,
+      }));
+      return { json: { g3203OutBlock: { cts_date: d, cts_time: '150000', rec_count: 5 }, g3203OutBlock1: rows, rsp_cd: '00000', rsp_msg: '조회완료' } };
+    });
+    const r = await getLSUS15MinOlderThan(cfg, 'T', 'AAPL', '82', 'R', { beforeYmdHms: '20260807154500', target: 6, maxCalls: 8, lookbackDays: 10 });
+    expect(edates[0]).toBe('20260807');                          // 최초 edate=storeOldest 날짜
+    expect(Number(edates[1])).toBeLessThan(Number(edates[0]));   // ★ 다음 요청은 과거로 이동(최근봉 반복 아님)
+    expect(r.olderCount).toBeGreaterThanOrEqual(6);
+    for (const c of r.candles) expect(c.datetime < '20260807154500').toBe(true);   // ★ 전부 storeOldest 보다 오래됨(req3)
+    expect(r.responseOldest < r.responseNewest).toBe(true);
+    expect(r.requestEdateFirst).toBe('20260807');
+    expect(r.responseNewest).toBe('20260807160000');
+  });
+  it('P0-28 getLSUS15MinOlderThan — 과거 데이터 없음(빈 응답) → olderCount=0(성공 아님)', async () => {
+    stubFetch(() => ({ json: { g3203OutBlock: {}, g3203OutBlock1: [], rsp_cd: '00000', rsp_msg: '조회완료' } }));
+    const r = await getLSUS15MinOlderThan(cfg, 'T', 'AAPL', '82', 'R', { beforeYmdHms: '20260807154500', target: 6, maxCalls: 3 });
+    expect(r.olderCount).toBe(0);
+    expect(r.candles).toEqual([]);
+    expect(r.calls).toBe(3);   // maxCalls 까지 시도 후 종료(무한루프 없음)
   });
   it('COSAQ00102 체결/미체결 조회 — OutBlock3 파싱(OrdNo/ExecQty/UnercQty)', async () => {
     stubFetch((url, init) => {

@@ -8,7 +8,7 @@ import { loadConfig, getTokenCached, resolveUSQuote, type LocalLSConfig } from '
 import { loadUSSymbols } from './universe';
 import { makeScrubber } from './mask';
 import {
-  getLSUS15MinPaged, getLSUSTicksPaged, getLSUSDeposit, getLSUSStockMasterPage,
+  getLSUS15MinPaged, getLSUS15MinOlderThan, getLSUSTicksPaged, getLSUSDeposit, getLSUSStockMasterPage,
   placeLSUSBuyOrder, queryLSUSOrderExec, cancelLSUSOrder, LSApiError, LS_US_ORDEREXEC_EMPTY_CODES,
   decideUSCashPayment, usCashOnlyUsdCap, usOrderableQty, formatCashOrderableLine,
   evaluateCrossWon, formatCrossWonCheck, formatCrossWonLiveCand, formatUSLiveGate, LS_US_CROSS_WON_TR_CONFIRMED, type LSUSDeposit,
@@ -524,54 +524,77 @@ async function main() {
     const cx = ctxs.get(target.symbol);
     const store = cx ? cx.store : (() => { const st = new CandleStore(target.symbol); st.load(); return st; })();
     if (store.corrupt) { bfStats.error++; bfFailed.set(target.symbol, Date.now() + BF_FAIL_BACKOFF_MS); return true; }
-    // 기존 보유 timestamp(store 가 진실원). 신규 unique 판정 기준(issue2 req1·2).
+    // 기존 보유 timestamp(store 가 진실원, 오름차순). 신규 unique 판정 기준.
     const existingTs = store.confirmedSorted().map(c => c.datetime);
     const before = existingTs.length;
-    // 과거 봉까지 도달하려면 현재 보유보다 더 뒤(과거)로 continuation 되도록 target 을 동적으로 키운다(issue2 req4).
+    const storeOldest = existingTs[0] ?? '';   // 가장 오래된 보유 봉(과거방향 조회 기준, P0-28 req3·4)
     const gap = Math.max(0, BACKFILL_MIN_CONFIRMED - before);
-    const dynTarget = Math.max(BACKFILL_TARGET, before + gap + 4);
-    const dynMaxCalls = Math.min(12, Math.max(6, Math.ceil(dynTarget / 5) + 2));
     bfStats.requests++;
     try {
-      const r = await getLSUS15MinPaged(cfg, token, target.symbol, target.exchcd, quote.delaygb, { target: dynTarget, maxCalls: dynMaxCalls, ncnt: 15, sdate });
-      const fetched = r.candles.map(c => ({ datetime: c.datetime, open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume }));
-      const rawRows = r.pages.reduce((a, p) => a + p.rawCount, 0);
-      const contPages = r.pages.length;
-      const delta = computeBackfillDelta(existingTs, fetched.map(c => c.datetime));   // ← rawRows 아닌 newUnique
-      // issue2 req3: continuation 진행 검증 — 각 페이지 tr_cont/tr_cont_key + 반환 봉 timestamp 범위 로그.
-      const tsSorted = fetched.map(c => c.datetime).sort();
-      const contDiag = r.pages.map((p, i) => `p${i + 1}(rows=${p.rawCount},tr_cont=${p.resTrCont || '-'},key='${p.resTrContKey || ''}')`).join(' ');
-      log.info(`[US-BACKFILL-CONT ${target.symbol}] pages=${contPages} ${contDiag} tsRange=[${tsSorted[0] ?? '-'}..${tsSorted[tsSorted.length - 1] ?? '-'}] storeOldest=${existingTs[0] ?? '-'}`);
+      let fetched: Array<{ datetime: string; open: number; high: number; low: number; close: number; volume: number }>;
+      let rawRows: number; let contPages: number;
+      let responseNewest = ''; let responseOldest = ''; let olderThanStoreOldest = 0;
+      let mode: 'OLDER' | 'BOOTSTRAP';
+
+      if (storeOldest) {
+        // ── P0-28: storeOldest 보다 오래된 확정봉을 edate 과거이동으로 조회(공식 sdate/edate 만 사용) ──
+        mode = 'OLDER';
+        const want = Math.max(BACKFILL_TARGET - before, gap + 2, 6);
+        const r = await getLSUS15MinOlderThan(cfg, token, target.symbol, target.exchcd, quote.delaygb, {
+          beforeYmdHms: storeOldest, target: want, maxCalls: 8, ncnt: 15, lookbackDays: 10,
+        });
+        fetched = r.candles.map(c => ({ datetime: c.datetime, open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume }));
+        rawRows = r.pages.reduce((a, p) => a + p.rawCount, 0);
+        contPages = r.calls;
+        responseNewest = r.responseNewest; responseOldest = r.responseOldest; olderThanStoreOldest = r.olderCount;
+        // req4: 요청 기준시각 로그. req5: 응답 newest/oldest/olderThanStoreOldest 로그.
+        const pageDiag = r.pages.map((p, i) => `c${i + 1}(edate=${p.edate},rows=${p.rawCount},older+${p.olderAdded})`).join(' ');
+        log.info(`[US-BACKFILL-REQ ${target.symbol}] storeOldest=${storeOldest} requestEdateFirst=${r.requestEdateFirst} requestSdate=${r.requestSdate} calls=${r.calls} ${pageDiag}`);
+        log.info(`[US-BACKFILL-RESP ${target.symbol}] responseNewest=${responseNewest || '-'} responseOldest=${responseOldest || '-'} olderThanStoreOldest=${olderThanStoreOldest} (storeOldest=${storeOldest})`);
+      } else {
+        // ── 최초 부트스트랩(보유 0): 최근 창을 시드 ──
+        mode = 'BOOTSTRAP';
+        const r = await getLSUS15MinPaged(cfg, token, target.symbol, target.exchcd, quote.delaygb, { target: BACKFILL_TARGET, maxCalls: 6, ncnt: 15, sdate });
+        fetched = r.candles.map(c => ({ datetime: c.datetime, open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume }));
+        rawRows = r.pages.reduce((a, p) => a + p.rawCount, 0);
+        contPages = r.pages.length;
+        const dts = fetched.map(c => c.datetime).sort();
+        responseNewest = dts[dts.length - 1] ?? ''; responseOldest = dts[0] ?? '';
+        log.info(`[US-BACKFILL-REQ ${target.symbol}] storeOldest=(없음·부트스트랩) mode=BOOTSTRAP calls=${contPages}`);
+      }
+
+      const delta = computeBackfillDelta(existingTs, fetched.map(c => c.datetime));   // ← rawRows 아닌 newUnique(store 에 없던 것)
 
       if (fetched.length === 0) {
         bfStats.empty++;
-        bfFailed.set(target.symbol, Date.now() + BF_FAIL_BACKOFF_MS);   // 빈 응답 → 큐 뒤로(요구 7)
-        log.warn(`[US-BACKFILL] symbol=${target.symbol} before=${before} rawRows=0 newUnique=0 after=${before} remaining=${gap} continuationPages=${contPages} stopReason=EMPTY_RESPONSE`);
-        return true;
-      }
-      // 신규 unique 0 = 진전 없음(동일 최근봉만 반환). 성공으로 세지 말고 backoff 후 다음 종목(issue2 req2·5 — 무한루프 금지).
-      if (delta.newUnique === 0) {
-        bfStats.noNewUnique++;
         bfFailed.set(target.symbol, Date.now() + BF_FAIL_BACKOFF_MS);
-        const lastPg = r.pages[r.pages.length - 1];
-        const stopReason = lastPg && lastPg.resTrCont !== 'Y' ? 'NO_NEW_UNIQUE(연속조회 종료 tr_cont=N)' : 'NO_NEW_UNIQUE(동일봉 반복)';
-        log.warn(`[US-BACKFILL] symbol=${target.symbol} before=${before} rawRows=${rawRows} newUnique=0 after=${before} remaining=${gap} continuationPages=${contPages} stopReason=${stopReason} → 백오프(다음 종목)`);
+        log.warn(`[US-BACKFILL] symbol=${target.symbol} before=${before} rawRows=0 newUnique=0 after=${before} remaining=${gap} calls=${contPages} responseNewest=- responseOldest=- olderThanStoreOldest=${olderThanStoreOldest} stopReason=EMPTY_RESPONSE`);
         return true;
       }
-      // 신규 unique 확정봉만 저장/반영(중복 재수집 금지, 요구 1·5). 즉시 영구 저장(요구 4).
+      // req6: OLDER 모드에서 storeOldest 보다 오래된 봉이 0 이면(=과거로 못 감) 성공 아님. newUnique=0 도 진전 없음.
+      const noProgress = delta.newUnique === 0 || (mode === 'OLDER' && olderThanStoreOldest === 0);
+      if (noProgress) {
+        bfStats.noNewUnique++;
+        bfFailed.set(target.symbol, Date.now() + BF_FAIL_BACKOFF_MS);   // 진전 없음 → 백오프 후 다음 종목(무한루프 금지)
+        const stopReason = mode === 'OLDER' && olderThanStoreOldest === 0 ? 'NO_OLDER_THAN_STORE_OLDEST' : 'NO_NEW_UNIQUE';
+        log.warn(`[US-BACKFILL] symbol=${target.symbol} before=${before} rawRows=${rawRows} newUnique=${delta.newUnique} after=${before} remaining=${gap} calls=${contPages} responseNewest=${responseNewest || '-'} responseOldest=${responseOldest || '-'} olderThanStoreOldest=${olderThanStoreOldest} stopReason=${stopReason} → 백오프`);
+        return true;
+      }
+      // 신규 unique 확정봉만 저장/반영(중복 재수집 금지). 즉시 영구 저장(req4).
       let dirty = false;
       for (const c of fetched) if (store.upsertConfirmed(c)) dirty = true;
       if (dirty) store.flush();
-      if (cx) cx.builder.seed(fetched);   // 현 배치 → 실시간 ctx 에 즉시 병합(16→20+ 시 즉시 READY, issue2 req7)
+      if (cx) cx.builder.seed(fetched);   // 현 배치 → 실시간 ctx 즉시 병합(before>=19 시 20 도달 → 즉시 READY, req7)
       const after = cx ? cx.builder.confirmedCount : store.confirmedCount;
       bfConfirmedCache.set(target.symbol, after);
       bfStats.success++;
       const remaining = Math.max(0, BACKFILL_MIN_CONFIRMED - after);
       const ready = after >= BACKFILL_MIN_CONFIRMED;
-      if (ready) bfFailed.delete(target.symbol);   // READY 도달 → 백오프 해제(재백필 불필요)
-      else bfFailed.set(target.symbol, Date.now() + Math.min(BF_FAIL_BACKOFF_MS, 60_000));   // 아직 부족 → 짧은 간격 후 재시도(다른 종목 우선)
+      if (ready) bfFailed.delete(target.symbol);
+      else bfFailed.set(target.symbol, Date.now() + Math.min(BF_FAIL_BACKOFF_MS, 60_000));   // 아직 부족 → 짧은 간격 후 재시도
       const stopReason = ready ? 'READY(20+)' : 'PARTIAL(추가 필요)';
-      log.info(`[US-BACKFILL] symbol=${target.symbol} before=${before} rawRows=${rawRows} newUnique=${delta.newUnique} after=${after} remaining=${remaining} continuationPages=${contPages} stopReason=${stopReason}`);
+      // req8 형식 유지 + P0-28 필드(responseNewest/oldest/olderThanStoreOldest) 추가.
+      log.info(`[US-BACKFILL] symbol=${target.symbol} before=${before} rawRows=${rawRows} newUnique=${delta.newUnique} after=${after} remaining=${remaining} calls=${contPages} responseNewest=${responseNewest || '-'} responseOldest=${responseOldest || '-'} olderThanStoreOldest=${olderThanStoreOldest} mode=${mode} stopReason=${stopReason}`);
     } catch (e) {
       bfStats.error++;
       bfFailed.set(target.symbol, Date.now() + BF_FAIL_BACKOFF_MS);
@@ -699,7 +722,11 @@ async function main() {
       log.info(`[US-READY-POOL] ready=${readyCount} warming=${warmupCount} queued=${poolQueued}(로테이션 대기) · 풀=${fullPool.length}${quote.delaygb ? '' : ' (백필 비활성: delaygb 미설정)'}`);
       log.info(`[US-BACKFILL-RATE] ${bfStats.line(bfReqPerSec)}`);
       const bfCap = computeBackfillCapacity({ eligible: fullPool.length, alreadyReady: readyCount, reqPerSec: bfReqPerSec });
-      log.info(`[US-BACKFILL-CAPACITY] toBackfill=${bfCap.toBackfill} 종목/시간=${bfCap.symbolsPerHour} 전체READY예상=${bfCap.hoursForAll === Infinity ? '∞' : bfCap.hoursForAll.toFixed(1)}h (호출/종목=${bfCap.callsPerSymbol}, ${bfCap.candlesPerRequest}봉/요청, target=${BACKFILL_TARGET})`);
+      // req9: 이론적 최대치(theoretical)와 실측 유효율(actual effective rate)을 분리 표기 — success/requests 로 계산.
+      const bfSuccessRate = bfStats.requests > 0 ? bfStats.success / bfStats.requests : 0;
+      const effSymbolsPerHour = Math.round(bfCap.symbolsPerHour * bfSuccessRate);
+      log.info(`[US-BACKFILL-CAPACITY] THEORETICAL: toBackfill=${bfCap.toBackfill} 종목/시간=${bfCap.symbolsPerHour} (호출/종목=${bfCap.callsPerSymbol}, ${bfCap.candlesPerRequest}봉/요청, target=${BACKFILL_TARGET})`);
+      log.info(`[US-BACKFILL-EFFECTIVE] ACTUAL: successRate=${(bfSuccessRate * 100).toFixed(1)}%(${bfStats.success}/${bfStats.requests}) 유효처리=${effSymbolsPerHour}종목/시간 · noNewUnique=${bfStats.noNewUnique} empty=${bfStats.empty} error=${bfStats.error} ⚠️실측 유효율 기준(이론치 아님)`);
 
       // ── 후보 랭킹 → 랭킹 1위부터 LIVE 게이트(요구 9·10·11) ──
       let tickReason = 'NO_BUY_SIGNAL';

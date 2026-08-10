@@ -507,6 +507,67 @@ export async function getLSUS15MinPaged(
   return { candles, calls, pages, last };
 }
 
+// ── P0-28: g3203 과거방향(older-than) 조회 — storeOldest 보다 오래된 확정봉 확보 ──────────────
+// ⚠️ 근본원인: 공식 g3203InBlock 은 [delaygb,keysymbol,exchcd,symbol,ncnt,qrycnt,comp_yn,sdate,edate] 뿐이고
+//    cts_date/cts_time 은 **output 전용**(blocks.json 확인). tr_cont 헤더 연속조회는 실계정에서 page2 rows=0 으로
+//    과거로 진행하지 못한다(실측). 따라서 최근 5봉만 반복 조회되던 것 → edate(종료일)를 **하루씩 과거로 이동**해
+//    각 날짜의 확정봉(qrycnt=5 비압축 상한)을 모아 storeOldest 이전(=timestamp 더 작은) 봉을 확보한다(추측 없음, 공식 필드만).
+export function prevYmd(ymd: string): string {
+  const y = +ymd.slice(0, 4), m = +ymd.slice(4, 6), d = +ymd.slice(6, 8);
+  const dt = new Date(Date.UTC(y, m - 1, d) - 86400_000);
+  return `${dt.getUTCFullYear()}${String(dt.getUTCMonth() + 1).padStart(2, '0')}${String(dt.getUTCDate()).padStart(2, '0')}`;
+}
+export interface LSChartOlder {
+  candles: LSCandle[];        // storeOldest 보다 오래된(=datetime < before) 확정봉, 중복제거·오름차순
+  olderCount: number;         // olderThanStoreOldest count (req5·6)
+  responseNewest: string;     // 응답 전체에서 관측된 최신 datetime ('' 없음)
+  responseOldest: string;     // 응답 전체에서 관측된 최고(最古) datetime
+  requestEdateFirst: string;  // 최초 요청 edate (req4)
+  requestSdate: string;       // 요청 sdate (floor)
+  calls: number;
+  pages: Array<{ edate: string; rawCount: number; resTrCont: string; oldest: string; newest: string; olderAdded: number }>;
+}
+export async function getLSUS15MinOlderThan(
+  cfg: LSConfig, token: string, symbol: string, exchcd: string, delaygb: string,
+  opts: { beforeYmdHms: string; target?: number; maxCalls?: number; ncnt?: number; lookbackDays?: number },
+): Promise<LSChartOlder> {
+  const before = opts.beforeYmdHms;              // 이보다 오래된 봉만 채택(strict <)
+  const target = Math.max(1, opts.target ?? 8);  // 이번 호출에서 확보 목표 older 봉 수
+  const maxCalls = Math.max(1, opts.maxCalls ?? 6);
+  const ncnt = opts.ncnt ?? 15;
+  const lookbackDays = Math.max(1, opts.lookbackDays ?? 10);
+  const beforeDate = before.slice(0, 8);
+  const sdateOf = (edate: string) => { let s = edate; for (let i = 0; i < lookbackDays; i++) s = prevYmd(s); return s; };
+  const seen = new Set<string>();
+  const older: LSCandle[] = [];
+  const pages: LSChartOlder['pages'] = [];
+  let respNewest = ''; let respOldest = '';
+  let edateCursor = beforeDate;                  // 시작: storeOldest 날짜(그 날의 더 이른 봉 포함 가능)
+  const requestEdateFirst = edateCursor;
+  const requestSdate = sdateOf(edateCursor);
+  let calls = 0;
+  while (calls < maxCalls && older.length < target) {
+    const sdate = sdateOf(edateCursor);
+    const r = await getLSUS15Min(cfg, token, symbol, exchcd, delaygb, { ncnt, qrycnt: LS_G3203_MAX_QRYCNT_UNCOMPRESSED, sdate, edate: edateCursor });
+    calls++;
+    const dts = r.rows.map(c => c.datetime).sort();
+    const pageOldest = dts[0] ?? '';
+    const pageNewest = dts[dts.length - 1] ?? '';
+    let olderAdded = 0;
+    for (const c of r.rows) if (c.datetime < before && !seen.has(c.datetime)) { seen.add(c.datetime); older.push(c); olderAdded++; }
+    pages.push({ edate: edateCursor, rawCount: r.rows.length, resTrCont: r.resTrCont, oldest: pageOldest, newest: pageNewest, olderAdded });
+    if (pageNewest && (!respNewest || pageNewest > respNewest)) respNewest = pageNewest;
+    if (pageOldest && (!respOldest || pageOldest < respOldest)) respOldest = pageOldest;
+    // 다음 edate: 이번 응답 최고(最古) 봉의 하루 전(반드시 과거로 진행 → 무한루프 방지). 빈 응답이면 현재 edate 하루 전.
+    const nextBase = pageOldest ? pageOldest.slice(0, 8) : edateCursor;
+    let nextEdate = prevYmd(nextBase);
+    if (nextEdate >= edateCursor) nextEdate = prevYmd(edateCursor);
+    edateCursor = nextEdate;
+  }
+  older.sort((a, b) => a.datetime.localeCompare(b.datetime));
+  return { candles: older, olderCount: older.length, responseNewest: respNewest, responseOldest: respOldest, requestEdateFirst, requestSdate, calls, pages };
+}
+
 // ── 해외 과거 틱 (g3202 NTICK) — 15분봉 재집계 fallback 용 ────────
 // g3203(NMIN)이 빈 응답일 때, 공식 g3202(과거 틱)로 틱을 받아 15분 OHLCV 로 재집계한다.
 // OutBlock1: date/loctime/open/high/low/close/exevol (+ jongchk/sign 등). 연속조회 위치 = OutBlock.cts_seq.

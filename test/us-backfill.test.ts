@@ -161,6 +161,23 @@ describe('P0-27a 백필 16→20→READY 결정적 재현(req7)', () => {
     expect(b.confirmedCount).toBe(MIN_RT_CANDLES);
   });
 
+  it('req7: before=19 → 과거봉 1개(newUnique=1) → after=20 → READY 전환', () => {
+    const b = new RealtimeCandleBuilder();
+    // 최신 19개(130501..130519), storeOldest=...130501
+    const have = Array.from({ length: 19 }, (_, i) => c(`202608101305${String(1 + i).padStart(2, '0')}`, 10 + i));
+    b.seed(have);
+    expect(b.confirmedCount).toBe(19);
+    expect(freshWs(b.confirmedCount).ready).toBe(false);   // 19 → 아직 아님
+
+    // getLSUS15MinOlderThan 가 storeOldest(130501) 보다 오래된 1봉(130500) 확보
+    const older = [c('20260810130500', 99)];
+    const delta = computeBackfillDelta(have.map(x => x.datetime), older.map(x => x.datetime));
+    expect(delta.newUnique).toBe(1);
+    expect(older.every(x => x.datetime < '20260810130501')).toBe(true);   // storeOldest 보다 오래됨
+    b.seed(older);
+    expect(b.confirmedCount).toBe(20);
+    expect(freshWs(b.confirmedCount).ready).toBe(true);   // ★ 19→20 → READY
+  });
   it('newUnique=0(전부 중복)면 confirmedCount 불변 → READY 전환 없음(무한 16 방지)', () => {
     const b = new RealtimeCandleBuilder();
     const have = have16();
