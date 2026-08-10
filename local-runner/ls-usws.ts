@@ -80,6 +80,7 @@ async function main() {
   const log = createLogger('ls-usws');
   log.info('===== LS 해외 실시간(WebSocket GSC/GSH) — 지속 실행형 · ARMED 감시(주문 없음) =====');
 
+  log.info('[BOOT-STEP] 1 load-config');
   let cfg: LocalLSConfig;
   try { cfg = loadConfig(); } catch (e) { log.error(String(e)); process.exit(1); return; }
 
@@ -102,9 +103,19 @@ async function main() {
   const includeEtf = process.env.LS_US_INCLUDE_ETF === 'true';
   let subs = us.ok.map(s => ({ symbol: s.symbol, exchange: s.exchange, exchcd: s.exchcd }));
   if (universeOn) {
+    log.info(`[BOOT-STEP] 2 load-us-universe-start exgubun=[${exgubunList.join(',')}]`);
     try {
-      const uni = await loadUSUniverse(cfg, token, exgubunList, getLSUSStockMasterPage, { includeEtf });
+      const uni = await loadUSUniverse(cfg, token, exgubunList, getLSUSStockMasterPage, {
+        includeEtf, maxPages: 40, readcnt: 500, timeoutMs: 10000,
+        // 요구 1: 각 g3190 요청/응답을 단계별로 계측(어디서 멈추는지 즉시 확인)
+        onPage: (i) => {
+          log.info(`[BOOT-STEP] 3 g3190-request exgubun=${i.exgubun} page=${i.page} cts='${i.ctsIn}'`);
+          log.info(`[BOOT-STEP] 4 g3190-response exgubun=${i.exgubun} page=${i.page} rows=${i.rows} rsp_cd=${i.rspCd} ctsOut='${i.ctsOut}'${i.stop ? ` stop=${i.stop}` : ''}`);
+        },
+      });
       const exSum = Object.entries(uni.excludedByReason).map(([k, v]) => `${k}=${v}`).join(' ');
+      log.info(`[BOOT-STEP] 5 load-us-universe-done total=${uni.total} eligible=${uni.eligible.length} ok=${uni.ok}`);
+      if (!uni.ok) log.error(`[US-UNIVERSE] 일부/전체 로드 실패 — ${uni.note}`);
       log.info(`[US-UNIVERSE] total=${uni.total} eligible=${uni.eligible.length} NASDAQ=${uni.eligiblePerExchange.NASDAQ} NYSE_AMEX=${uni.eligiblePerExchange.NYSE_AMEX} excluded=${uni.excluded} (${exSum || '없음'}) · ${uni.note}`);
       // 라운드로빈 등록: 오늘은 첫 배치(wsMaxSubs)만 구독. 전체는 배치 순환으로 커버(요구 4·6).
       const capReq = Math.max(1, parseInt(process.env.LS_US_REST_REQ_PER_SEC || '1', 10) || 1);   // g3203 개인 1/s·법인 10/s
@@ -116,9 +127,10 @@ async function main() {
       for (const s of uniSubs) if (!merged.has(s.symbol)) merged.set(s.symbol, s);
       subs = [...merged.values()].slice(0, wsMaxSubs);
       log.info(`[US-SUBS] WS 구독 ${subs.length}종목(첫 배치, 최대 ${wsMaxSubs}) — ${subs.slice(0, 10).map(s => s.symbol).join(',')}${subs.length > 10 ? ' …' : ''}`);
-    } catch (e) { log.warn(`[US-UNIVERSE] 로드 실패(무시, LS_US_SYMBOLS 로 진행): ${scrub(String(e))}`); }
+    } catch (e) { log.error(`[BOOT-STEP] 5 load-us-universe-FAILED: ${scrub(String(e))} — LS_US_SYMBOLS 로 폴백(없으면 종료)`); }
   }
-  if (!subs.length) { log.error('관찰 US 종목 없음 (LS_US_SYMBOLS/유니버스 확인)'); process.exit(1); return; }
+  // 요구 5: 유니버스 실패 + 폴백 종목도 없으면 무한대기 말고 즉시 종료.
+  if (!subs.length) { log.error('[BOOT-STEP] 종료 — 관찰 US 종목 없음(유니버스 로드 실패 + LS_US_SYMBOLS 비어있음)'); process.exit(1); return; }
   // 이하 로직은 subs 를 종목 소스로 사용(기존 us.ok 대체).
   const usOk = subs;
 
@@ -127,6 +139,7 @@ async function main() {
   const sdate = kstYmd(10);
 
   // ── 시작 시: 저장된 확정봉 복원 → REST g3203 시드 병합(실패해도 진행) ──
+  log.info(`[BOOT-STEP] 6 seed-candles (${usOk.length}종목)`);
   for (const s of usOk) {
     const store = new CandleStore(s.symbol);
     store.load();
@@ -283,6 +296,7 @@ async function main() {
   }
 
   // ── P0-13/P0-15: 프로그램 시작 직후 BUY 여부와 무관하게 예수금 1회 조회 + 진단 로그. 실패면 LIVE 금지 ──
+  log.info('[BOOT-STEP] 7 startup-cash');
   await refreshDeposit(true);
   const startupPrice = ctxs.get(liveCfg.liveSymbol)?.lastPrice ?? 0;   // 시작 시 알 수 있는 참조가(시드/실시간). 없으면 0
   if (depOk) log.info(`[STARTUP-CASH ${liveCfg.liveSymbol}] cashOrderable(cash-only)=${depCash.toFixed(2)} USD rsp_cd=${depRspCd}`);
@@ -373,6 +387,7 @@ async function main() {
     accountEvents: usAccountEvents,          // AS0~AS4 계좌 이벤트 등록(env 로 격리 테스트 가능)
     deferAccountEvents: usDeferAccountEvents, // 첫 데이터 수신 후 AS 등록(원인 격리, req 3)
   });
+  log.info(`[BOOT-STEP] 8 ws-connect (${usOk.length}종목)`);
   client.connect(usOk.map(s => ({ exchcd: s.exchcd, symbol: s.symbol })));
 
   const traderDeps: TraderDeps = {

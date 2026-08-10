@@ -182,23 +182,35 @@ async function runLimited<T>(op: () => Promise<T>): Promise<T> {
 // LS REST 공통 POST. rsp_cd 를 즉시 throw 하지 않고 블록을 파싱한다.
 // TR별 허용목록(LS_SUCCESS_CODES)에 없는 rsp_cd 만 실패. 네트워크/호출제한을 분류.
 // 전체 동작을 runLimited 로 감싸 직렬화 + IGW00201 재시도를 적용한다.
-async function lsPost(token: string, path: string, trCd: string, inBlock: Record<string, unknown>, cont: { trCont?: string; trContKey?: string } = {}): Promise<LSResult> {
+async function lsPost(token: string, path: string, trCd: string, inBlock: Record<string, unknown>, cont: { trCont?: string; trContKey?: string; timeoutMs?: number } = {}): Promise<LSResult> {
   const trCont = cont.trCont ?? 'N';
   const trContKey = cont.trContKey ?? '';
+  const timeoutMs = cont.timeoutMs ?? 15000;   // ⚠️ fetch 무한대기 방지 — 모든 LS REST 호출에 기본 15s 타임아웃
   const reqHeaders = { tr_cd: trCd, tr_cont: trCont, tr_cont_key: trContKey, content_type: 'application/json; charset=UTF-8' };
   return runLimited(async () => {
     let res: Response;
+    // AbortController 로 타임아웃(응답 헤더/본문 스트림 모두 취소). timeout 이면 명확한 오류로 던져 무한대기 차단.
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), timeoutMs);
     try {
-      res = await fetch(`${LS_BASE}${path}`, {
-        method: 'POST',
-        headers: lsHeaders(token, trCd, trCont, trContKey),
-        body: JSON.stringify(inBlock),
-      });
-    } catch (e) {
-      throw new LSApiError('NETWORK', `LS ${trCd} 네트워크 오류: ${e instanceof Error ? e.message : String(e)}`);
+      try {
+        res = await fetch(`${LS_BASE}${path}`, {
+          method: 'POST',
+          headers: lsHeaders(token, trCd, trCont, trContKey),
+          body: JSON.stringify(inBlock),
+          signal: ac.signal,
+        });
+      } catch (e) {
+        if (ac.signal.aborted) throw new LSApiError('NETWORK', `LS ${trCd} 타임아웃(${timeoutMs}ms 초과) — 요청 중단`);
+        throw new LSApiError('NETWORK', `LS ${trCd} 네트워크 오류: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    // JSON 파싱 전에 HTTP 원문 진단을 캡처(req 1). 본문 스트림도 타임아웃(abort) 대상.
+    let text: string;
+    try { text = await res.text(); }
+    catch (e) {
+      if (ac.signal.aborted) throw new LSApiError('NETWORK', `LS ${trCd} 타임아웃(${timeoutMs}ms 초과) — 본문 수신 중단`);
+      throw new LSApiError('NETWORK', `LS ${trCd} 본문 수신 오류: ${e instanceof Error ? e.message : String(e)}`);
     }
-    // JSON 파싱 전에 HTTP 원문 진단을 캡처(req 1)
-    const text = await res.text();
     const diag: LSHttpDiag = {
       reqHeaders,
       status: res.status,
@@ -224,6 +236,7 @@ async function lsPost(token: string, path: string, trCd: string, inBlock: Record
     }
     const empty = (LS_EMPTY_CODES[trCd] ?? []).includes(rspCd);
     return { data, rspCd, rspMsg, empty, diag };
+    } finally { clearTimeout(timer); }
   });
 }
 
@@ -397,10 +410,10 @@ export function parseLSUSMasterRow(r: any): LSUSMasterRow {
   };
 }
 // 한 페이지(readcnt) 조회. cts_value='' 로 시작, 응답 cts_value 를 다음 호출에 넘겨 페이징.
-export async function getLSUSStockMasterPage(cfg: LSConfig, token: string, p: { natcode?: string; exgubun: string; readcnt?: number; ctsValue?: string; delaygb?: string }): Promise<{ rspCd: string; rspMsg: string; rows: LSUSMasterRow[]; ctsValue: string; recCount: number; diag: LSHttpDiag }> {
+export async function getLSUSStockMasterPage(cfg: LSConfig, token: string, p: { natcode?: string; exgubun: string; readcnt?: number; ctsValue?: string; delaygb?: string; timeoutMs?: number }): Promise<{ rspCd: string; rspMsg: string; rows: LSUSMasterRow[]; ctsValue: string; recCount: number; diag: LSHttpDiag }> {
   const { data, rspCd, rspMsg, diag } = await lsPost(token, '/overseas-stock/market-data', 'g3190', {
     g3190InBlock: { delaygb: p.delaygb ?? 'R', natcode: p.natcode ?? 'US', exgubun: p.exgubun, readcnt: p.readcnt ?? 500, cts_value: p.ctsValue ?? '' },
-  });
+  }, { timeoutMs: p.timeoutMs ?? 10000 });   // g3190 페이지당 10s 타임아웃(무한대기 방지)
   const raw: any[] = data.g3190OutBlock1 || [];
   const ob = data.g3190OutBlock || {};
   return { rspCd, rspMsg, rows: raw.map(parseLSUSMasterRow), ctsValue: String(ob.cts_value ?? ''), recCount: toNum(ob.rec_count), diag };

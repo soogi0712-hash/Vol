@@ -54,13 +54,21 @@ export function buildUSUniverse(rows: LSUSMasterRow[], opts: USUniverseOpts = {}
 
 // g3190 페이징 로드(cts_value 연속조회) → 전 종목 병합(keysymbol dedup) → 필터.
 //   exgubunList: 공식 exgubun 값 목록(값 의미 미기재 → 주입). 각 값을 페이징 로드해 병합.
+export interface USUniverseLoadOpts extends USUniverseOpts {
+  maxPages?: number;      // exgubun 당 최대 페이지(무한루프 방지). 기본 40
+  readcnt?: number;       // 페이지당 요청 행수. 기본 500
+  timeoutMs?: number;     // g3190 요청당 타임아웃. 기본 10000
+  onPage?: (info: { exgubun: string; page: number; ctsIn: string; ctsOut: string; rows: number; rspCd: string; stop: string | null }) => void;
+}
 export async function loadUSUniverse(
   cfg: LSConfig, token: string,
   exgubunList: string[],
   fetchPage: typeof getLSUSStockMasterPage = getLSUSStockMasterPage,
-  opts: USUniverseOpts = {},
-  maxPages = 200,
+  opts: USUniverseLoadOpts = {},
 ): Promise<USUniverse> {
+  const maxPages = opts.maxPages ?? 40;
+  const readcnt = opts.readcnt ?? 500;
+  const timeoutMs = opts.timeoutMs ?? 10000;
   const seen = new Map<string, LSUSMasterRow>();
   const notes: string[] = [];
   let ok = true;
@@ -69,14 +77,25 @@ export async function loadUSUniverse(
     let pages = 0;
     let rowsForGubun = 0;
     try {
-      do {
-        const r = await fetchPage(cfg, token, { exgubun, ctsValue: cts, readcnt: 500 });
+      for (;;) {
+        const ctsIn = cts;
+        const r = await fetchPage(cfg, token, { exgubun, ctsValue: cts, readcnt, timeoutMs });
         for (const row of r.rows) if (row.keysymbol && !seen.has(row.keysymbol)) seen.set(row.keysymbol, row);
         rowsForGubun += r.rows.length;
-        cts = r.ctsValue;
         pages++;
-        if (r.rows.length === 0) break;
-      } while (cts && cts.trim() !== '' && !/^0+$/.test(cts.trim()) && pages < maxPages);
+        const ctsOut = (r.ctsValue ?? '').trim();
+        // 종료조건(무한루프 방지, 요구 2·4): 여러 공식/방어 조건 중 하나라도 만족 시 종료.
+        let stop: string | null = null;
+        if (r.rows.length === 0) stop = 'ROWS_0';                       // 빈 페이지
+        else if (r.rows.length < readcnt) stop = 'LAST_PAGE(rows<readcnt)'; // 마지막 페이지(요청보다 적음)
+        else if (ctsOut === '' ) stop = 'CTS_EMPTY';                    // 연속키 없음
+        else if (/^0+$/.test(ctsOut)) stop = 'CTS_ZERO';               // 연속키 0
+        else if (ctsOut === ctsIn.trim()) stop = 'CTS_UNCHANGED';       // ★ 연속키 안 바뀜 → 서버가 끝났거나 버그 → 종료
+        else if (pages >= maxPages) stop = `MAX_PAGES(${maxPages})`;    // 상한 도달
+        opts.onPage?.({ exgubun, page: pages, ctsIn, ctsOut, rows: r.rows.length, rspCd: r.rspCd, stop });
+        if (stop) break;
+        cts = ctsOut;
+      }
       notes.push(`exgubun=${exgubun} pages=${pages} rows=${rowsForGubun}`);
     } catch (e) {
       ok = false;

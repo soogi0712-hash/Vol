@@ -58,6 +58,38 @@ describe('P0-23 US 유니버스 eligibility 필터', () => {
     expect(u.eligiblePerExchange.NYSE_AMEX).toBe(1);
   });
 
+  it('P0-23 anti-hang: cts_value 안 바뀌면 무한루프 아니라 CTS_UNCHANGED 로 종료', async () => {
+    let call = 0; const stops: (string | null)[] = [];
+    const stuck = async (_c: any, _t: string, p: { exgubun: string; ctsValue?: string }) => {
+      call++;
+      return { rspCd: '00000', rspMsg: '', diag: {} as any, recCount: 2, ctsValue: 'SAME', rows: [row({ keysymbol: '82A' + call, symbol: 'A' + call }), row({ keysymbol: '82B' + call, symbol: 'B' + call })] };
+    };
+    const u = await loadUSUniverse({} as any, 'T', ['2'], stuck as any, { readcnt: 2, onPage: (i) => stops.push(i.stop) });
+    expect(call).toBe(2);                     // ★ page1(cts='')→page2(cts='SAME')→ 같은 cts 반복 감지 종료
+    expect(stops[1]).toBe('CTS_UNCHANGED');   // 무한루프 아님
+    expect(u.ok).toBe(true);
+  });
+  it('P0-23 anti-hang: rows<readcnt → LAST_PAGE 로 종료(1페이지)', async () => {
+    let call = 0;
+    const last = async () => { call++; return { rspCd: '00000', rspMsg: '', diag: {} as any, recCount: 1, ctsValue: 'X', rows: [row({ keysymbol: '82AAPL', symbol: 'AAPL' })] }; };
+    const u = await loadUSUniverse({} as any, 'T', ['2'], last as any, { readcnt: 500 });
+    expect(call).toBe(1);
+    expect(u.eligible.length).toBe(1);
+  });
+  it('P0-23 anti-hang: maxPages 상한 도달 시 종료(무한 아님)', async () => {
+    let call = 0;
+    const infinite = async () => { call++; return { rspCd: '00000', rspMsg: '', diag: {} as any, recCount: 2, ctsValue: 'C' + call, rows: [row({ keysymbol: '82S' + call, symbol: 'S' + call }), row({ keysymbol: '82T' + call, symbol: 'T' + call })] }; };
+    const u = await loadUSUniverse({} as any, 'T', ['2'], infinite as any, { readcnt: 2, maxPages: 5 });
+    expect(call).toBe(5);   // ★ cts 매번 달라도 maxPages 에서 종료
+    expect(u.ok).toBe(true);
+  });
+  it('P0-23 anti-hang: 요청 실패(타임아웃 등) → ok=false + 조회실패 note (무한대기 아님)', async () => {
+    const boom = async () => { throw new Error('타임아웃(10000ms 초과)'); };
+    const u = await loadUSUniverse({} as any, 'T', ['2'], boom as any, {});
+    expect(u.ok).toBe(false);
+    expect(u.note).toMatch(/조회실패/);
+  });
+
   it('loadUSUniverse — cts_value 페이징 + keysymbol dedup', async () => {
     let call = 0;
     const fakePage = async (_c: any, _t: string, p: { exgubun: string; ctsValue?: string }) => {
@@ -65,8 +97,8 @@ describe('P0-23 US 유니버스 eligibility 필터', () => {
       if (p.ctsValue === '' || p.ctsValue == null) return { rspCd: '00000', rspMsg: '', diag: {} as any, recCount: 2, ctsValue: 'PAGE2', rows: [row({ keysymbol: '82AAPL', symbol: 'AAPL' }), row({ keysymbol: '82MSFT', symbol: 'MSFT' })] };
       return { rspCd: '00000', rspMsg: '', diag: {} as any, recCount: 1, ctsValue: '0000', rows: [row({ keysymbol: '82MSFT', symbol: 'MSFT' }), row({ keysymbol: '81BA', symbol: 'BA', exchcd: '81', market: 'NYSE_AMEX' })] };
     };
-    const u = await loadUSUniverse({} as any, 'T', ['2'], fakePage as any, {});
-    expect(call).toBe(2);                 // page1(cts='') → page2(cts=PAGE2) → cts=0000 종료
+    const u = await loadUSUniverse({} as any, 'T', ['2'], fakePage as any, { readcnt: 2 });
+    expect(call).toBe(2);                 // page1(cts='',2행)→page2(cts=PAGE2,2행)→cts=0000 종료
     expect(u.total).toBe(3);              // AAPL, MSFT(dedup), BA
     expect(u.eligible.length).toBe(3);
   });
