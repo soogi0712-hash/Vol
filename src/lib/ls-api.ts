@@ -723,12 +723,20 @@ export function isUSOrderSuccess(rspCd: string, ordNo: string | null | undefined
   return (ordNo != null && ordNo !== '' && ordNo !== '(unknown)') || US_ORDER_SUCCESS_CODES.has(rspCd);
 }
 
-export async function placeLSUSBuyOrder(
-  cfg: LSConfig, token: string, p: { exchcd: string; symbol: string; qty: number; price: number },
+// COSAT00301 OrdPtnCode: '02'=매수(공식 확인). 매도코드는 아래 참조.
+export const LS_US_ORDPTN_BUY = '02';
+// ⚠️ P0-30B: 미국 매도 OrdPtnCode 는 공식 카탈로그/실계정에서 아직 확인되지 않았다(추측 금지). 후보='01'.
+//   BUY 는 '02' 로 실거래 검증됐지만 SELL 코드는 미검증 → 실계정에서 실제 매도 1건으로 코드/체결을 확인하기 전까지
+//   실주문(POST)을 하드 차단한다(cancelLSUSOrder 와 동일한 봉인 원칙). 확인 후 LS_US_SELL_TR_CONFIRMED=true 전환.
+export const LS_US_SELL_ORDPTN_CANDIDATE = '01';
+export const LS_US_SELL_TR_CONFIRMED = false;
+
+async function placeLSUSOrderRaw(
+  token: string, p: { exchcd: string; symbol: string; qty: number; price: number; ordPtnCode: string },
 ): Promise<LSOrderResult> {
   const inb = {
     COSAT00301InBlock1: {
-      RecCnt: 1, OrdPtnCode: '02', OrdMktCode: p.exchcd, IsuNo: p.symbol,
+      RecCnt: 1, OrdPtnCode: p.ordPtnCode, OrdMktCode: p.exchcd, IsuNo: p.symbol,
       OrdQty: p.qty, OvrsOrdPrc: p.price, OrdprcPtnCode: '00', BrkTpCode: '',
     },
   };
@@ -738,6 +746,24 @@ export async function placeLSUSBuyOrder(
   const ob = data.COSAT00301OutBlock1 || data.COSAT00301OutBlock2 || {};
   const ordNo = ob.OrdNo != null ? String(ob.OrdNo) : null;
   return { rspCd, rspMsg, ordNo, raw: data, diag };
+}
+
+export async function placeLSUSBuyOrder(
+  cfg: LSConfig, token: string, p: { exchcd: string; symbol: string; qty: number; price: number },
+): Promise<LSOrderResult> {
+  return placeLSUSOrderRaw(token, { ...p, ordPtnCode: LS_US_ORDPTN_BUY });
+}
+
+// ── 미국 지정가 매도 주문 (COSAT00301, OrdPtnCode=매도) ──
+// ⚠️ 매도 OrdPtnCode 공식 미확인 → LS_US_SELL_TR_CONFIRMED=false 인 동안 호출 시 예외(실주문 하드차단).
+//   diagnostic 모드는 이 함수를 호출하지 않고 게이트/수량만 계산한다. 확인 후 상수 전환 시에만 실제 전송.
+export async function placeLSUSSellOrder(
+  cfg: LSConfig, token: string, p: { exchcd: string; symbol: string; qty: number; price: number },
+): Promise<LSOrderResult> {
+  if (!LS_US_SELL_TR_CONFIRMED) {
+    throw new LSApiError('INVALID_RESPONSE', 'COSAT00301 매도 OrdPtnCode 공식 미확인 — SELL POST 보류(추측 금지). 실계정 매도 1건으로 코드/체결 확인 후 LS_US_SELL_TR_CONFIRMED=true 전환 필요.');
+  }
+  return placeLSUSOrderRaw(token, { ...p, ordPtnCode: LS_US_SELL_ORDPTN_CANDIDATE });
 }
 
 // ── 계좌 주문체결내역 조회 (COSAQ00102, /overseas-stock/accno) — 체결/미체결 확인 ──

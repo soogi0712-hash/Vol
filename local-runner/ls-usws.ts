@@ -8,8 +8,8 @@ import { loadConfig, getTokenCached, resolveUSQuote, type LocalLSConfig } from '
 import { loadUSSymbols } from './universe';
 import { makeScrubber } from './mask';
 import {
-  getLSUS15MinPaged, getLSUS15MinOlderThan, getLSUSTicksPaged, getLSUSDeposit, getLSUSStockMasterPage,
-  placeLSUSBuyOrder, queryLSUSOrderExec, cancelLSUSOrder, LSApiError, LS_US_ORDEREXEC_EMPTY_CODES,
+  getLSUS15MinPaged, getLSUS15MinOlderThan, getLSUSTicksPaged, getLSUSDeposit, getLSUSStockMasterPage, getLSUSHoldings,
+  placeLSUSBuyOrder, placeLSUSSellOrder, queryLSUSOrderExec, cancelLSUSOrder, LSApiError, LS_US_ORDEREXEC_EMPTY_CODES, LS_US_SELL_TR_CONFIRMED,
   decideUSCashPayment, usCashOnlyUsdCap, usOrderableQty, formatCashOrderableLine,
   computeUSOrderQty, formatUSSize, computeUSDailyBuyGate, formatUSDailyGuard,
   evaluateCrossWon, formatCrossWonCheck, formatCrossWonLiveCand, formatUSLiveGate, LS_US_CROSS_WON_TR_CONFIRMED, type LSUSDeposit,
@@ -27,6 +27,11 @@ import { OrderStore } from './order-store';
 import { parseAccountEvent, applyOrderEvent } from './order-events';
 import { evaluateTradeGate, canExecuteLive, etDateStr, isUSRegularSession, type GateState } from './trade-gate';
 import { executeBuyOrder, reconcilePending, linkTrackedToOrders, type TraderDeps } from './trader';
+import { executeSellOrder, type SellDeps } from './us-seller';
+import {
+  PositionStore, mergePositions, computeUSSellGate, computeRealizedPnL, positionPnlPct,
+  formatUSPosition, formatUSSellSignal, formatUSSellGate, formatUSSellOrder, formatUSSellFill, type USPosition,
+} from './us-position';
 import { loadLiveConfig, type LiveConfig } from './live-config';
 import { computeUSP0Checklist, formatUSP0Checklist } from './us-live-checklist';
 import { calcBB, calcRSI, getBBSignal, validateCandleData } from '../src/lib/bollinger';
@@ -255,6 +260,16 @@ async function main() {
   try { liveCfg = loadLiveConfig(); } catch (e) { log.error(String(e)); process.exit(1); return; }
   const armedMode = liveCfg.armed;
 
+  // ── P0-30B: SELL/청산 엔진 ── 기본 diagnostic 모드(보유→신호→게이트까지만, 실주문 없음).
+  //   실제 SELL POST 는 (1) 코드상수 LS_US_SELL_TR_CONFIRMED(매도 OrdPtnCode 실계정 확인) AND
+  //   (2) env LS_US_SELL_LIVE=true 둘 다여야 켜진다. 하나라도 아니면 diagnostic(주문 없음).
+  const sellLiveEnv = process.env.LS_US_SELL_LIVE === 'true';
+  const sellLive = sellLiveEnv && LS_US_SELL_TR_CONFIRMED && liveCfg.liveTrading;
+  // 일일 목표수익/손실한도 — env 구조만(금액 미지정 시 null=미설정, 하드코딩 금지, 사용자 결정 대기).
+  const dailyTargetUsd = (() => { const v = process.env.LS_US_DAILY_TARGET_USD; if (v == null || v.trim() === '') return null; const n = Number(v); return Number.isFinite(n) ? n : null; })();
+  const dailyLossLimitUsd = (() => { const v = process.env.LS_US_DAILY_LOSS_LIMIT_USD; if (v == null || v.trim() === '') return null; const n = Number(v); return Number.isFinite(n) ? n : null; })();
+  log.info(`[US-SELL-CFG] mode=${sellLive ? 'LIVE(실매도)' : 'DIAGNOSTIC(주문없음)'} · LS_US_SELL_LIVE=${sellLiveEnv} 매도TR확인(코드)=${LS_US_SELL_TR_CONFIRMED} · 일일목표=${dailyTargetUsd == null ? '미설정' : dailyTargetUsd} 손실한도=${dailyLossLimitUsd == null ? '미설정' : dailyLossLimitUsd}`);
+
   // ── WebSocket 계좌이벤트(AS0~AS4) 등록 토글 — 원인 격리용(req 3) ──
   //   LS_US_WS_ACCOUNT_EVENTS=false → GSC/GSH 만 등록(AS 미등록)으로 close 원인 분리.
   //   LS_US_WS_DEFER_ACCOUNT=false → AS 를 open 즉시 등록(기본은 첫 데이터 수신 후 지연 등록).
@@ -459,6 +474,34 @@ async function main() {
     now: () => Date.now(),
     log: (m) => log.info(scrub(m)),
   };
+
+  // ── P0-30B: SELL executor deps(주입) + 포지션/실현손익 원장 ──
+  const sellDeps: SellDeps = {
+    place: (pp) => placeLSUSSellOrder(cfg, token, pp),   // 매도TR 미확인 동안 예외(하드차단)
+    query: (pp) => queryLSUSOrderExec(cfg, token, pp, { emptyCodes: ordExecEmptyCodes }),
+    now: () => Date.now(),
+    log: (m) => log.info(scrub(m)),
+  };
+  const posStore = new PositionStore();
+  posStore.load();
+  if (posStore.corrupt) log.error('[US-POSITION] 포지션 원장 파일 손상 → avgPrice/실현손익 복원 실패(새로 시작)');
+
+  // ── P0-30B: 실계좌 미국 보유내역 복원(재시작 후에도 실제 계좌 보유분 복원) ──
+  //   holdings(수량/매도가능)=진실원본, avgPrice 는 우리 BUY 체결기록(posStore)에서. 프로그램이 산 것만 보유로 보지 않는다.
+  let positions: USPosition[] = [];
+  async function refreshHoldings(): Promise<void> {
+    try {
+      const h = await getLSUSHoldings(cfg, token, etDateStr(Date.now()));
+      positions = mergePositions(h.holdings, posStore.knownMap(), (sym) => ctxs.get(sym)?.exchcd ?? liveCfg.liveExchcd);
+      if (!posStore.corrupt) { for (const p of positions) posStore.syncQty(p.symbol, p.qty, p.sellableQty); posStore.flush(); }
+      log.info(`[US-HOLDINGS] 복원 rsp_cd=${h.rspCd} 종목수=${positions.length}${positions.length ? ' · ' + positions.map(p => `${p.symbol}(${p.qty})`).join(',') : ''}`);
+      for (const p of positions) {
+        const cur = ctxs.get(p.symbol)?.bestAsk || ctxs.get(p.symbol)?.lastPrice || 0;
+        log.info(formatUSPosition({ symbol: p.symbol, qty: p.qty, avgPrice: p.avgPrice, currentPrice: cur, pnlPct: positionPnlPct(p.avgPrice, cur) }));
+      }
+    } catch (e) { log.error(`[US-HOLDINGS] 보유내역 조회 실패(복원 보류): ${scrub(String(e))}`); }
+  }
+  await refreshHoldings();
 
   // ── P0-27a req1: 시작 시 COSAQ00102 실계정 조회를 "주문 전송 없이" 1회 실행 → 오늘 주문 0건 상태의 실제 응답 계측 ──
   //   실제 rsp_cd/rsp_msg/OutBlock 존재/rows 수/classification 을 [US-RECON-DIAG] 로 남긴다(추측 금지·실측 확보용).
@@ -682,7 +725,11 @@ async function main() {
       qty: orderQty, price: buyPrice, etDate, dailyMaxBuys: PER_SYMBOL_MAX_BUYS_PER_DAY,
     });
     log.info(`[ORDER-RESULT ${ctx.symbol}] status=${outcome.status} ordNo=${outcome.ordNo ?? '-'}${outcome.abortCode ? ` abortCode=${outcome.abortCode}` : ''} ${outcome.reason}`);
-    if (outcome.status === 'placed-filled' || outcome.status === 'placed-pending') return 'ORDERED';
+    if (outcome.status === 'placed-filled' || outcome.status === 'placed-pending') {
+      // P0-30B: 매수 체결분을 포지션 원장에 반영(avgPrice 근사=지정가). AS1 avgExecPrc 로 후속 정밀화 가능.
+      if (!posStore.corrupt) { posStore.applyBuyFill(ctx.symbol, ctx.exchcd, orderQty, buyPrice); posStore.flush(); }
+      return 'ORDERED';
+    }
     // 실제 사유별 분류(P0-27 req8): reconciliation 실패를 CASH_GATE 로 오분류하지 않는다.
     switch (outcome.abortCode) {
       case 'RECONCILIATION_FAILED': case 'UNRECORDED_ORDER': return 'RECONCILIATION_FAILED';
@@ -705,6 +752,45 @@ async function main() {
     return { eligible: cashPathOk && qtyDec.eligibleForLiveSelection, qtyDec };
   }
 
+  // ── P0-30B: 보유 포지션 SELL 평가(전략=기존 BB, 임의추가 없음). diagnostic: 보유→신호→게이트까지만, 실주문 없음 ──
+  //   BB SELL 조건(코드): 상단선 돌파 이력(aboveUpper) 후 하락 시 전량매도. 손절/시간청산은 전략에 없음(추가 안 함).
+  async function evaluateSell(ctx: SymCtx, pos: USPosition, now: number): Promise<void> {
+    const etDate = etDateStr(now);
+    const priceNow = ctx.bestAsk || ctx.lastPrice || 0;
+    log.info(formatUSPosition({ symbol: ctx.symbol, qty: pos.qty, avgPrice: pos.avgPrice, currentPrice: priceNow, pnlPct: positionPnlPct(pos.avgPrice, priceNow) }));
+    if (ctx.builder.confirmedCount < MIN_RT_CANDLES) { log.info(formatUSSellSignal({ symbol: ctx.symbol, signal: 'NONE', reason: `confirmed<${MIN_RT_CANDLES}(데이터 부족)`, qty: 0 })); return; }
+    const confirmed = ctx.builder.confirmedCandles();
+    const closes = confirmed.map(c => c.close); const dts = confirmed.map(c => c.datetime);
+    const bands = calcBB(closes, dts, 20, 2); const rsi = calcRSI(closes, 14);
+    const stored = posStore.getPosition(ctx.symbol);
+    const aboveUpper = stored?.aboveUpper ?? pos.aboveUpper;
+    const sig = getBBSignal(bands, true, aboveUpper, rsi);   // hasPosition=true → SELL/HOLD 판정
+    // 상단돌파 이력 플래그 갱신(재시작 복원용)
+    if (!posStore.corrupt && sig.above_upper !== aboveUpper) { posStore.setAboveUpper(ctx.symbol, ctx.exchcd, sig.above_upper); posStore.flush(); }
+    const candle = dts[dts.length - 1];
+    const isSell = sig.action === 'SELL';
+    const gate = computeUSSellGate({
+      signalSell: isSell, holdingQty: pos.qty, sellableQty: pos.sellableQty,
+      pendingSell: ctx.orders.pending.some(o => o.side === 'sell'),
+      hasOrderedSellCandle: ctx.orders.hasOrderedCandle(candle, 'sell'),
+    });
+    log.info(formatUSSellSignal({ symbol: ctx.symbol, signal: sig.action, reason: sig.reason, qty: gate.sellQty }));
+    if (!isSell) return;
+    log.info(formatUSSellGate(ctx.symbol, gate));
+    if (!gate.postAllowed) return;
+    if (!sellLive) { log.info(`[US-SELL-DIAG ${ctx.symbol}] DIAGNOSTIC — sellQty=${gate.sellQty} POST 생략(LS_US_SELL_LIVE=${sellLiveEnv}, 매도TR확인=${LS_US_SELL_TR_CONFIRMED}). 실매도 켜기 전 결과확인 단계.`); return; }
+    // ── LIVE 매도(매도TR 확인 + env 둘 다일 때만 도달) — BUY와 동일한 안전장치(lock/대사/pending/AS) ──
+    const sellPrice = ctx.bestBid || ctx.lastPrice || priceNow;   // 매도 지정가 ≈ bid
+    const outcome = await executeSellOrder(sellDeps, { orders: ctx.orders, exchcd: ctx.exchcd, symbol: ctx.symbol, candleDatetime: candle, qty: gate.sellQty, price: sellPrice, etDate });
+    log.info(formatUSSellOrder({ symbol: ctx.symbol, qty: gate.sellQty, ordNo: outcome.ordNo, status: outcome.status + (outcome.abortCode ? `(${outcome.abortCode})` : '') }));
+    if (outcome.status === 'placed-filled' || outcome.status === 'placed-partial') {
+      const filledQty = outcome.execQty || gate.sellQty;
+      const pnl = computeRealizedPnL({ sellQty: filledQty, sellPrice: outcome.fillPrice || sellPrice, avgBuyPrice: pos.avgPrice });
+      if (!posStore.corrupt) { posStore.applySellFill(ctx.symbol, filledQty, pnl.gross, etDate); posStore.flush(); }
+      log.info(formatUSSellFill({ symbol: ctx.symbol, qty: filledQty, price: outcome.fillPrice || sellPrice, realizedPnL: pnl.gross }));
+    }
+  }
+
   // ── 10초마다 전 구독종목 스캔 → BUY 후보 랭킹 → 랭킹 1위부터 LIVE 게이트 (P0-23, AAPL 하드코딩 제거) ──
   let ticking = false;
   let scanCycle = 0;
@@ -712,7 +798,9 @@ async function main() {
   let accountBuyDate = etDateStr(Date.now());
   let accountBuyCount = dailyLedger.corrupt ? 0 : dailyLedger.buyCountToday(accountBuyDate);
   const dailyGate0 = computeUSDailyBuyGate({ buyCount: accountBuyCount, buyLimit: liveCfg.dailyMaxBuys });
-  log.info(`[US-DAILY] 재시작 복원 · ${formatUSDailyGuard({ buyCount: accountBuyCount, buyLimit: liveCfg.dailyMaxBuys, sellCount: 0, realizedPnL: null, dailyTarget: null, dailyLossLimit: null, canNewBuy: dailyGate0.canNewBuy, reason: dailyGate0.reason })}`);
+  const rz0 = posStore.corrupt ? { gross: 0, sellCount: 0 } : posStore.realizedToday(accountBuyDate);
+  log.info(`[US-DAILY] 재시작 복원 · ${formatUSDailyGuard({ buyCount: accountBuyCount, buyLimit: liveCfg.dailyMaxBuys, sellCount: rz0.sellCount, realizedPnL: posStore.corrupt ? null : rz0.gross, dailyTarget: dailyTargetUsd, dailyLossLimit: dailyLossLimitUsd, canNewBuy: dailyGate0.canNewBuy, reason: dailyGate0.reason })}`);
+  let lastHoldingsAt = Date.now();   // P0-30B: 실계좌 보유 최신화 throttle(60s)
   const iv = setInterval(async () => {
     if (ticking) return;
     ticking = true;
@@ -757,6 +845,22 @@ async function main() {
 
       log.info(`[US-SCAN] cycle=${scanCycle} processed=${processed} remaining=0 ready=${readyCount} warmup=${warmupCount} session=${inSession} wsReady=${wsReady}`);
 
+      // ── P0-30B: 보유 포지션 SELL 평가(diagnostic 기본, 실주문은 sellLive 일 때만) ──
+      if (now - lastHoldingsAt > 60_000) { lastHoldingsAt = now; await refreshHoldings(); }   // 60s 마다 실계좌 보유 최신화
+      if (inSession && wsReady) {
+        for (const pos of positions) {
+          const pctx = ctxs.get(pos.symbol);
+          if (!pctx) continue;   // 미구독(로테이션 밖) → 이번 배치 시세 없음. 구독 시 평가.
+          try { await evaluateSell(pctx, pos, now); } catch (e) { log.warn(`[US-SELL ${pos.symbol}] 평가 예외: ${scrub(String(e))}`); }
+        }
+        // SELL 체결로 보유가 바뀌면 원장 기준 최신화(다음 틱 반영)
+        positions = positions.map(p => { const sp = posStore.getPosition(p.symbol); return sp ? { ...p, qty: sp.qty, avgPrice: sp.avgPrice, aboveUpper: sp.aboveUpper } : { ...p, qty: 0 }; }).filter(p => p.qty > 0);
+      }
+      // 일일 실현손익(gross) 원장 → [US-DAILY-GUARD] 연결(목표/손실한도는 env 미설정 시 null)
+      { const rz = posStore.corrupt ? { gross: 0, sellCount: 0 } : posStore.realizedToday(etDate);
+        const dg = computeUSDailyBuyGate({ buyCount: accountBuyCount, buyLimit: liveCfg.dailyMaxBuys });
+        log.info(formatUSDailyGuard({ buyCount: accountBuyCount, buyLimit: liveCfg.dailyMaxBuys, sellCount: rz.sellCount, realizedPnL: posStore.corrupt ? null : rz.gross, dailyTarget: dailyTargetUsd, dailyLossLimit: dailyLossLimitUsd, canNewBuy: dg.canNewBuy, reason: dg.reason })); }
+
       // ── P0-26 백필 진행/READY 풀 상태(요구 8·12) — 현 배치 ready/warming + 로테이션 대기 ──
       const poolQueued = Math.max(0, fullPool.length - ctxs.size);
       log.info(`[US-READY-POOL] ready=${readyCount} warming=${warmupCount} queued=${poolQueued}(로테이션 대기) · 풀=${fullPool.length}${quote.delaygb ? '' : ' (백필 비활성: delaygb 미설정)'}`);
@@ -788,8 +892,8 @@ async function main() {
           return !!cx && cx.builder.confirmedCount >= MIN_RT_CANDLES && !cx.orders.hasPending() && budgetEligibleFor(cx).eligible;
         }).length;
         // P0-30A: 계정 일일 매수 운영상한 판정(하루 1회 고정 아님). 상한 도달 시에만 신규 BUY 차단.
+        //   ([US-DAILY-GUARD] 는 매 틱 SELL 평가 뒤 실현손익 포함해 출력됨 — 여기선 판정값만 사용)
         const dailyGate = computeUSDailyBuyGate({ buyCount: accountBuyCount, buyLimit: liveCfg.dailyMaxBuys });
-        log.info(formatUSDailyGuard({ buyCount: accountBuyCount, buyLimit: liveCfg.dailyMaxBuys, sellCount: 0, realizedPnL: null, dailyTarget: null, dailyLossLimit: null, canNewBuy: dailyGate.canNewBuy, reason: dailyGate.reason }));
         const sel = selectUSLiveCandidate(rankedUS, (sym) => {
           const cx = ctxs.get(sym);
           return { warmedUp: !!cx && cx.builder.confirmedCount >= MIN_RT_CANDLES, hasPending: !!cx && cx.orders.hasPending(), dailyExhausted: !dailyGate.canNewBuy, budgetEligible: !!cx && budgetEligibleFor(cx).eligible };
@@ -808,7 +912,8 @@ async function main() {
             accountBuyCount++; accountBuyDate = etDate;
             if (!dailyLedger.corrupt) { dailyLedger.recordDailyBuy(etDate); dailyLedger.flush(); }
             const g2 = computeUSDailyBuyGate({ buyCount: accountBuyCount, buyLimit: liveCfg.dailyMaxBuys });
-            log.info(formatUSDailyGuard({ buyCount: accountBuyCount, buyLimit: liveCfg.dailyMaxBuys, sellCount: 0, realizedPnL: null, dailyTarget: null, dailyLossLimit: null, canNewBuy: g2.canNewBuy, reason: g2.reason }));
+            const rz2 = posStore.corrupt ? { gross: 0, sellCount: 0 } : posStore.realizedToday(etDate);
+            log.info(formatUSDailyGuard({ buyCount: accountBuyCount, buyLimit: liveCfg.dailyMaxBuys, sellCount: rz2.sellCount, realizedPnL: posStore.corrupt ? null : rz2.gross, dailyTarget: dailyTargetUsd, dailyLossLimit: dailyLossLimitUsd, canNewBuy: g2.canNewBuy, reason: g2.reason }));
           }
         } else tickReason = 'NOT_ARMED';
       }

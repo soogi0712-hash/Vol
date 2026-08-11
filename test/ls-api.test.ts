@@ -7,6 +7,7 @@ import {
   decideUSCashPayment, usCashOnlyUsdCap, usOrderableQty, formatCashOrderableLine,
   computeUSOrderQty, formatUSSize, isCashOnly, crossWonAdoptedUsdCap,
   computeUSDailyBuyGate, formatUSDailyGuard,
+  placeLSUSSellOrder, LS_US_SELL_TR_CONFIRMED,
   evaluateCrossWon, formatCrossWonCheck, formatCrossWonLiveCand, formatUSLiveGate, maskLSResponse, CROSS_WON_ADOPTED_FIELD, LS_US_CROSS_WON_TR_CONFIRMED, type LSUSDeposit,
   placeLSKRBuyOrder, queryLSKROrderExec, cancelLSKRBuyOrder, krIsuNo, isKROrderSuccess, getLSKRStockMaster,
   getLSUSStockMasterPage,
@@ -810,6 +811,15 @@ describe('해외 주문/체결/예수금 (공식 필드)', () => {
       expect(s).toContain('buyCount=3'); expect(s).toContain('buyLimit=10'); expect(s).toContain('sellCount=2');
       expect(s).toContain('realizedPnL=n/a(미구현)'); expect(s).toContain('dailyTarget=n/a(미구현)'); expect(s).toContain('dailyLossLimit=n/a(미구현)');
       expect(s).toContain('canNewBuy=true');
+    });
+  });
+
+  // ── P0-30B: 매도 OrdPtnCode 공식 미확인 → SELL POST 하드차단(추측 금지) ──
+  describe('P0-30B placeLSUSSellOrder — 매도TR 미확인 봉인', () => {
+    it('LS_US_SELL_TR_CONFIRMED=false → 호출 시 예외(실전송 차단)', async () => {
+      expect(LS_US_SELL_TR_CONFIRMED).toBe(false);   // 실계정 확인 전 봉인 유지
+      await expect(placeLSUSSellOrder({} as any, 'tok', { exchcd: '82', symbol: 'AAPL', qty: 1, price: 100 }))
+        .rejects.toThrow(/미확인|보류/);
     });
   });
 
