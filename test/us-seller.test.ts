@@ -139,6 +139,20 @@ describe('executeSellOrder — 전송/체결/안전장치', () => {
     expect(r.status).toBe('placed-filled'); expect(r.execQty).toBe(2);
   });
 
+  it('실매도 직전 재조회 sellableNow=1 → 최대 1주 SELL(부분보유 청산)', async () => {
+    const orders = new OrderStore('AAPL', dir);
+    let placedQty = 0; let placed = false;
+    const d: SellDeps = {
+      place: async (p) => { placedQty = p.qty; placed = true; return { rspCd: '00000', rspMsg: '', ordNo: '900', raw: {}, diag: {} as any }; },
+      query: async () => placed ? execRes([srow({ ordQty: 1, execQty: 1, unfilledQty: 0 })]) : execRes([]),
+      sellableQty: async () => ({ ok: true, qty: 1 }),
+      now: () => clock, log: () => {},
+    };
+    const r = await executeSellOrder(d, params(orders, { qty: 4 }));   // 전략 4 → min(4,1)=1
+    expect(placedQty).toBe(1);
+    expect(r.status).toBe('placed-filled'); expect(r.execQty).toBe(1);
+  });
+
   it('실매도 직전 재조회 sellableNow=0 → NO_QTY(전송 금지)', async () => {
     const orders = new OrderStore('AAPL', dir);
     let placeCalls = 0;

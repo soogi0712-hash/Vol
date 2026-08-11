@@ -82,11 +82,14 @@ function lsHeaders(token: string, trCd: string, trCont = 'N', trContKey = ''): R
  * TR별 "정상 처리" rsp_cd 허용목록. rsp_cd 는 메시지 문자열이 아니라 이 목록으로 판정한다.
  * 여기에 없는 코드만 실패로 간주해 throw 한다.
  *   CSPAQ12200: 00000 정상 / 00136 "조회가 완료되었습니다."
- *   COSOQ00201: 00000 정상 / 02679 "조회내역이 없습니다."(빈 잔고 = 정상)
+ *   COSOQ00201: 00000 정상 / 00001 "조회가 완료되었습니다."(실계정 실측, 잔고 있음/없음 무관 정상완료)
+ *               / 02679 "조회내역이 없습니다."(빈 잔고 = 정상)
+ *   ⚠️ 이 코드들은 TR별 목록으로만 성공처리(전역 금지) + envelope/OutBlock 정상 파싱 시에만 성공(호출측 재검증).
  */
 export const LS_SUCCESS_CODES: Record<string, string[]> = {
   CSPAQ12200: ['00000', '00136'],
-  COSOQ00201: ['00000', '02679'],
+  // P0-30E: 실계정 COSOQ00201 이 rsp_cd=00001 "조회가 완료되었습니다" 를 반환(보유 정상 조회) — TR별 성공코드로 등록.
+  COSOQ00201: ['00000', '00001', '02679'],
   COSOQ02701: ['00000', '00136'],   // 해외 예수금 — 00136 "조회가 완료되었습니다."(실계정 확인) = 정상
 
   CSPAT00601: ['00000', '00040'],   // 현물주문 — 00040 "매수 주문이 완료되었습니다."(실계정 확인) = 정상
@@ -1212,16 +1215,27 @@ export async function cancelLSUSOrder(_cfg: LSConfig, _token: string, _p: { exch
 
 // ── 해외 보유수량 조회 (COSOQ00201 OutBlock4) — 매도 전 실제 보유/매도가능수량 확인 ──
 // OutBlock4(공식 resExample): ShtnIsuNo(단축종목=심볼)/AstkBalQty(잔고수량)/AstkSellAbleQty(매도가능수량).
+// P0-30E fail-closed: rsp_cd 가 TR별 성공코드(00000/00001/02679) 이고 envelope(rsp_cd 또는 OutBlock 존재)가 정상일 때만
+//   ok=true. network/timeout/HTTP/JSON오류/unknown 업무코드는 lsPost 가 throw(비-soft) → 호출측 catch=실패.
+//   rsp_cd 결측(빈 envelope) 이나 OutBlock4 가 배열 아님 → ok=false(malformed, 잘못된 '보유 0' 오인 방지).
 export interface LSUSHolding { symbol: string; balQty: number; sellableQty: number; }
-export async function getLSUSHoldings(cfg: LSConfig, token: string, baseDateYYYYMMDD: string): Promise<{ rspCd: string; rspMsg: string; holdings: LSUSHolding[]; diag: LSHttpDiag }> {
+export interface LSUSHoldingsResult { ok: boolean; rspCd: string; rspMsg: string; hasEnvelope: boolean; holdings: LSUSHolding[]; rawRows: number; diag: LSHttpDiag; }
+export async function getLSUSHoldings(cfg: LSConfig, token: string, baseDateYYYYMMDD: string): Promise<LSUSHoldingsResult> {
   const { data, rspCd, rspMsg, diag } = await lsPost(token, '/overseas-stock/accno', 'COSOQ00201', {
     COSOQ00201InBlock1: { RecCnt: 1, BaseDt: baseDateYYYYMMDD, CrcyCode: 'ALL', AstkBalTpCode: '00' },
   });
-  const rows: any[] = data.COSOQ00201OutBlock4 || [];
-  const holdings = rows.map(r => ({
+  const ob4 = data?.COSOQ00201OutBlock4;
+  // envelope 정상: rsp_cd 존재 또는 어떤 OutBlock 이라도 존재. OutBlock4 는 있으면 배열이어야 정상.
+  const anyBlock = data && (data.COSOQ00201OutBlock1 !== undefined || data.COSOQ00201OutBlock2 !== undefined || data.COSOQ00201OutBlock3 !== undefined || ob4 !== undefined);
+  const ob4Valid = ob4 === undefined || Array.isArray(ob4);   // 없으면(빈 보유) 정상, 있으면 배열이어야
+  const hasEnvelope = (rspCd !== '' || anyBlock) && ob4Valid;
+  const success = (LS_SUCCESS_CODES['COSOQ00201'] ?? ['00000']).includes(rspCd);   // 00000/00001/02679 (TR별)
+  const ok = success && hasEnvelope;
+  const rows: any[] = Array.isArray(ob4) ? ob4 : [];
+  const holdings = ok ? rows.map(r => ({
     symbol: String(r.ShtnIsuNo ?? ''), balQty: toNum(r.AstkBalQty), sellableQty: toNum(r.AstkSellAbleQty),
-  })).filter(h => h.symbol);
-  return { rspCd, rspMsg, holdings, diag };
+  })).filter(h => h.symbol && h.balQty > 0) : [];
+  return { ok, rspCd, rspMsg, hasEnvelope, holdings, rawRows: rows.length, diag };
 }
 
 // ══════════════════════════════════════════════════════════════════

@@ -482,9 +482,14 @@ async function main() {
   const sellDeps: SellDeps = {
     place: (pp) => placeLSUSSellOrder(cfg, token, pp),   // 매도TR 미확인 동안 예외(하드차단)
     query: (pp) => queryLSUSOrderExec(cfg, token, pp, { emptyCodes: ordExecEmptyCodes }),
-    // P0-30C req5: 실 SELL 직전 실계좌 매도가능수량 재조회(신선값) — 과매도 방지.
+    // P0-30C/E req5: 실 SELL 직전 실계좌 매도가능수량 재조회(신선값) — 과매도 방지. 조회 비정상(ok=false)=차단.
     sellableQty: async (pp) => {
-      try { const h = await getLSUSHoldings(cfg, token, etDateStr(Date.now())); const row = h.holdings.find(x => x.symbol === pp.symbol); return { ok: true, qty: row ? row.sellableQty : 0 }; }
+      try {
+        const h = await getLSUSHoldings(cfg, token, etDateStr(Date.now()));
+        if (!h.ok) { log.warn(`[US-SELL ${pp.symbol}] 매도가능수량 재조회 비정상 rsp_cd=${h.rspCd} hasEnvelope=${h.hasEnvelope} → 차단`); return { ok: false, qty: 0 }; }
+        const row = h.holdings.find(x => x.symbol === pp.symbol);
+        return { ok: true, qty: row ? row.sellableQty : 0 };
+      }
       catch (e) { log.warn(`[US-SELL ${pp.symbol}] 매도가능수량 재조회 실패: ${scrub(String(e))}`); return { ok: false, qty: 0 }; }
     },
     now: () => Date.now(),
@@ -497,17 +502,23 @@ async function main() {
   // ── P0-30B: 실계좌 미국 보유내역 복원(재시작 후에도 실제 계좌 보유분 복원) ──
   //   holdings(수량/매도가능)=진실원본, avgPrice 는 우리 BUY 체결기록(posStore)에서. 프로그램이 산 것만 보유로 보지 않는다.
   let positions: USPosition[] = [];
-  async function refreshHoldings(): Promise<void> {
+  let holdingsOk = false;   // P0-30E: 최근 보유조회 성공 여부(SELL fail-closed 근거)
+  async function refreshHoldings(): Promise<boolean> {
     try {
       const h = await getLSUSHoldings(cfg, token, etDateStr(Date.now()));
+      // req1 진단: rsp_cd/rsp_msg/envelope/rawRows 를 문자열 메시지 아닌 구조로 판정·출력.
+      log.info(`[US-HOLDINGS] rsp_cd=${h.rspCd} rsp_msg=${scrub(h.rspMsg)} ok=${h.ok} hasEnvelope=${h.hasEnvelope} OutBlock4rows=${h.rawRows} 유효보유=${h.holdings.length}`);
+      if (!h.ok) { holdingsOk = false; log.error(`[US-HOLDINGS] 조회 비정상(ok=false) → 복원 보류·SELL 차단(fail-closed). rsp_cd=${h.rspCd}`); return false; }
+      holdingsOk = true;
       positions = mergePositions(h.holdings, posStore.knownMap(), (sym) => ctxs.get(sym)?.exchcd ?? liveCfg.liveExchcd);
       if (!posStore.corrupt) { for (const p of positions) posStore.syncQty(p.symbol, p.qty, p.sellableQty); posStore.flush(); }
-      log.info(`[US-HOLDINGS] 복원 rsp_cd=${h.rspCd} 종목수=${positions.length}${positions.length ? ' · ' + positions.map(p => `${p.symbol}(${p.qty})`).join(',') : ''}`);
+      log.info(`[US-HOLDINGS] 복원완료 종목수=${positions.length}${positions.length ? ' · ' + positions.map(p => `${p.symbol}(bal=${p.qty},sellable=${p.sellableQty})`).join(',') : ' (보유 없음)'}`);
       for (const p of positions) {
         const cur = ctxs.get(p.symbol)?.bestAsk || ctxs.get(p.symbol)?.lastPrice || 0;
-        log.info(formatUSPosition({ symbol: p.symbol, qty: p.qty, avgPrice: p.avgPrice, currentPrice: cur, pnlPct: positionPnlPct(p.avgPrice, cur) }));
+        log.info(formatUSPosition({ symbol: p.symbol, qty: p.qty, avgPrice: p.avgPrice, currentPrice: cur, pnlPct: positionPnlPct(p.avgPrice, cur) }) + ` sellableQty=${p.sellableQty}`);
       }
-    } catch (e) { log.error(`[US-HOLDINGS] 보유내역 조회 실패(복원 보류): ${scrub(String(e))}`); }
+      return true;
+    } catch (e) { holdingsOk = false; log.error(`[US-HOLDINGS] 보유내역 조회 실패(복원 보류·SELL 차단): ${scrub(String(e))}`); return false; }
   }
   await refreshHoldings();
 

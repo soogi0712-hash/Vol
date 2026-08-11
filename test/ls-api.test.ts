@@ -1060,9 +1060,44 @@ describe('해외 주문/체결/예수금 (공식 필드)', () => {
       ] } };
     });
     const r = await getLSUSHoldings(cfg, 'T', '20260806');
+    expect(r.ok).toBe(true);
     const aapl = r.holdings.find(h => h.symbol === 'AAPL');
     expect(aapl?.balQty).toBe(1);
     expect(aapl?.sellableQty).toBe(1);
+  });
+
+  // ── P0-30E: COSOQ00201 rsp_cd=00001 "조회가 완료되었습니다" 오차단 수정 ──
+  it('P0-30E: 00001 + 정상 envelope + rows>0 → 성공(ok=true), 실제 AAL qty/sellable 파싱', async () => {
+    stubFetch(() => ({ json: { rsp_cd: '00001', rsp_msg: '조회가 완료되었습니다', COSOQ00201OutBlock4: [
+      { ShtnIsuNo: 'AAL', AstkBalQty: '1.000000', AstkSellAbleQty: '1.000000' },
+    ] } }));
+    const r = await getLSUSHoldings(cfg, 'T', '20260806');
+    expect(r.ok).toBe(true); expect(r.rspCd).toBe('00001');
+    const aal = r.holdings.find(h => h.symbol === 'AAL');
+    expect(aal).toMatchObject({ balQty: 1, sellableQty: 1 });
+  });
+  it('P0-30E: 00001 + 빈 보유(OutBlock4 없음) → 성공(ok=true), holdings=0', async () => {
+    stubFetch(() => ({ json: { rsp_cd: '00001', rsp_msg: '조회가 완료되었습니다', COSOQ00201OutBlock1: { AcntNo: '****' } } }));
+    const r = await getLSUSHoldings(cfg, 'T', '20260806');
+    expect(r.ok).toBe(true); expect(r.holdings).toHaveLength(0);
+  });
+  it('P0-30E: 00001 + malformed(OutBlock4 배열 아님) → 실패(ok=false, 잘못된 보유0 오인 방지)', async () => {
+    stubFetch(() => ({ json: { rsp_cd: '00001', COSOQ00201OutBlock4: { bad: 'notArray' } } }));
+    const r = await getLSUSHoldings(cfg, 'T', '20260806');
+    expect(r.ok).toBe(false); expect(r.hasEnvelope).toBe(false);
+  });
+  it('P0-30E: 빈 envelope(rsp_cd 결측 + OutBlock 없음) → 실패(ok=false)', async () => {
+    stubFetch(() => ({ json: {} }));
+    const r = await getLSUSHoldings(cfg, 'T', '20260806');
+    expect(r.ok).toBe(false);
+  });
+  it('P0-30E: unknown 업무 rsp_cd → throw(fail-closed, soft 아님)', async () => {
+    stubFetch(() => ({ json: { rsp_cd: 'IZAA999', rsp_msg: '권한 오류' } }));
+    await expect(getLSUSHoldings(cfg, 'T', '20260806')).rejects.toThrow(/IZAA999|rsp_cd/);
+  });
+  it('P0-30E: network/timeout → throw(fail-closed)', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('ECONNRESET'); }));
+    await expect(getLSUSHoldings(cfg, 'T', '20260806')).rejects.toThrow();
   });
 });
 
