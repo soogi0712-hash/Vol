@@ -2,8 +2,10 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { writeFileSync } from 'node:fs';
 import {
   mergePositions, computeUSSellGate, computeRealizedPnL, positionPnlPct, PositionStore, sellRealOrderEnabled,
+  programInvestedUSD, scanPendingBuyUSD, computeUSCapitalGuard,
 } from '../local-runner/us-position';
 
 let dir: string;
@@ -37,6 +39,67 @@ describe('P0-30B computeUSSellGate — 청산 게이트(일일 횟수제한 없�
     // 동일 입력이면 항상 동일 허용 — 횟수 상태가 아예 인자에 없음
     expect(computeUSSellGate(base).postAllowed).toBe(true);
     expect(computeUSSellGate(base).postAllowed).toBe(true);
+  });
+});
+
+describe('P0-31 총 운용자금(원화) 한도 — 다종목 분산매수', () => {
+  const rate = 1400;   // LS 기준환율(고정 아님, 테스트용 값)
+  it('programInvestedUSD — 프로그램관리(avgPrice!=null)만 원금집계, 수동보유(null) 제외', () => {
+    const inv = programInvestedUSD([
+      { qty: 1, avgPrice: 300 },     // 프로그램: 300
+      { qty: 2, avgPrice: 15 },      // 프로그램: 30
+      { qty: 5, avgPrice: null },    // 수동보유 → 제외
+    ]);
+    expect(inv).toBe(330);
+  });
+  it('scanPendingBuyUSD — us-orders-*.json 의 side=buy pending 합(계정레저 __ 제외)', () => {
+    const dir2 = mkdtempSync(join(tmpdir(), 'us-pend-'));
+    writeFileSync(join(dir2, 'us-orders-AAL.json'), JSON.stringify({ pending: [{ side: 'buy', qty: 1, price: 15 }] }));
+    writeFileSync(join(dir2, 'us-orders-TSLA.json'), JSON.stringify({ pending: [{ side: 'buy', qty: 2, price: 20 }, { side: 'sell', qty: 1, price: 300 }] }));
+    writeFileSync(join(dir2, 'us-orders-__account_events__.json'), JSON.stringify({ pending: [{ side: 'buy', qty: 99, price: 99 }] }));
+    const r = scanPendingBuyUSD(dir2);
+    expect(r.totalUSD).toBe(15 + 40);   // AAL 15 + TSLA 40 (sell 제외, __ 제외)
+    expect(r.count).toBe(2);
+    rmSync(dir2, { recursive: true, force: true });
+  });
+  it('한도 내 → 예산수량 그대로(OK)', () => {
+    // limit 1,000,000 / rate 1400 → 714.3 USD 여유. invested 0, pending 0. 후보 $60×4주=240 < 714 → 4주 OK
+    const g = computeUSCapitalGuard({ limitKRW: 1_000_000, investedUSD: 0, pendingUSD: 0, candidateQty: 4, bestAsk: 15, baseXchRate: rate });
+    expect(g).toMatchObject({ finalQty: 4, canNewBuy: true, reason: 'OK' });
+  });
+  it('한도 근접 → 남은자금으로 수량 축소(REDUCED_TO_FIT_CAPITAL)', () => {
+    // invested $650 → 910,000원. 남은 90,000원 = 64.3 USD. bestAsk 15 → 최대 4주. 후보 10주 → 4주로 축소
+    const g = computeUSCapitalGuard({ limitKRW: 1_000_000, investedUSD: 650, pendingUSD: 0, candidateQty: 10, bestAsk: 15, baseXchRate: rate });
+    expect(g.finalQty).toBe(4); expect(g.canNewBuy).toBe(true); expect(g.reason).toBe('REDUCED_TO_FIT_CAPITAL');
+  });
+  it('pending BUY 도 committed 에 포함 → 남은자금 차감', () => {
+    // invested $600 + pending $60 = 660 → 924,000. 남은 76,000 = 54.3USD. bestAsk 15 → 3주
+    const g = computeUSCapitalGuard({ limitKRW: 1_000_000, investedUSD: 600, pendingUSD: 60, candidateQty: 10, bestAsk: 15, baseXchRate: rate });
+    expect(g.pendingKRW).toBe(84_000);
+    expect(g.finalQty).toBe(3);
+  });
+  it('한도 소진(remaining<=0) → 신규 BUY 금지(CAPITAL_EXHAUSTED)', () => {
+    const g = computeUSCapitalGuard({ limitKRW: 1_000_000, investedUSD: 720, pendingUSD: 0, candidateQty: 4, bestAsk: 15, baseXchRate: rate });
+    expect(g.remainingKRW).toBeLessThanOrEqual(0);
+    expect(g.canNewBuy).toBe(false); expect(g.reason).toBe('CAPITAL_EXHAUSTED');
+  });
+  it('1주도 못 사면 차단(CAPITAL_INSUFFICIENT_FOR_1SHARE)', () => {
+    // 남은 10,000원=7.1USD, bestAsk 300 → 0주
+    const g = computeUSCapitalGuard({ limitKRW: 1_000_000, investedUSD: 707, pendingUSD: 0, candidateQty: 1, bestAsk: 300, baseXchRate: rate });
+    expect(g.canNewBuy).toBe(false); expect(g.reason).toBe('CAPITAL_INSUFFICIENT_FOR_1SHARE');
+  });
+  it('한도 미설정(null) → guard off(기존 동작, 수량 그대로)', () => {
+    const g = computeUSCapitalGuard({ limitKRW: null, investedUSD: 999, pendingUSD: 0, candidateQty: 4, bestAsk: 15, baseXchRate: rate });
+    expect(g.finalQty).toBe(4); expect(g.canNewBuy).toBe(true); expect(g.reason).toContain('UNSET');
+  });
+  it('환율 미확보(rate<=0) → 계산불가 차단(NO_XCHRATE)', () => {
+    const g = computeUSCapitalGuard({ limitKRW: 1_000_000, investedUSD: 0, pendingUSD: 0, candidateQty: 4, bestAsk: 15, baseXchRate: 0 });
+    expect(g.canNewBuy).toBe(false); expect(g.reason).toBe('NO_XCHRATE');
+  });
+  it('SELL 회수 후 원금 감소 → 운용가능금액 자동 회복(투자원금이 낮아지면 remaining 증가)', () => {
+    const before = computeUSCapitalGuard({ limitKRW: 1_000_000, investedUSD: 700, pendingUSD: 0, candidateQty: 4, bestAsk: 15, baseXchRate: rate });
+    const after = computeUSCapitalGuard({ limitKRW: 1_000_000, investedUSD: 300, pendingUSD: 0, candidateQty: 4, bestAsk: 15, baseXchRate: rate });
+    expect(after.remainingKRW).toBeGreaterThan(before.remainingKRW);   // 원금 회수 → 여유 증가
   });
 });
 

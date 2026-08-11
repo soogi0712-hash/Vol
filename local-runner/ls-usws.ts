@@ -30,6 +30,7 @@ import { executeBuyOrder, reconcilePending, linkTrackedToOrders, type TraderDeps
 import { executeSellOrder, type SellDeps } from './us-seller';
 import {
   PositionStore, mergePositions, computeUSSellGate, computeRealizedPnL, positionPnlPct, sellRealOrderEnabled,
+  programInvestedUSD, scanPendingBuyUSD, computeUSCapitalGuard, formatUSCapitalGuard,
   formatUSPosition, formatUSSellSignal, formatUSSellGate, formatUSSellOrder, formatUSSellFill, type USPosition,
 } from './us-position';
 import { loadLiveConfig, type LiveConfig } from './live-config';
@@ -271,6 +272,9 @@ async function main() {
   // 일일 목표수익/손실한도 — env 구조만(금액 미지정 시 null=미설정, 하드코딩 금지, 사용자 결정 대기).
   const dailyTargetUsd = (() => { const v = process.env.LS_US_DAILY_TARGET_USD; if (v == null || v.trim() === '') return null; const n = Number(v); return Number.isFinite(n) ? n : null; })();
   const dailyLossLimitUsd = (() => { const v = process.env.LS_US_DAILY_LOSS_LIMIT_USD; if (v == null || v.trim() === '') return null; const n = Number(v); return Number.isFinite(n) ? n : null; })();
+  // P0-31: 미국 자동매매 전체 운용자금 상한(원화). 미설정=null → 한도 미적용. 설정 시 투자원금+pending+신규 <= 한도.
+  const totalCapitalKrw = (() => { const v = process.env.LS_US_TOTAL_CAPITAL_KRW; if (v == null || v.trim() === '') return null; const n = Number(v); return Number.isFinite(n) && n > 0 ? n : null; })();
+  log.info(`[US-CAPITAL-CFG] 총운용자금한도=${totalCapitalKrw == null ? '미설정(한도없음)' : `${totalCapitalKrw}KRW`} · 종목당예산(P0-29)=${liveCfg.perTradeBudgetUsd == null ? '미설정' : `${liveCfg.perTradeBudgetUsd}USD`} · 환율=LS기준환율(실시간)`);
   log.info(`[US-SELL-CFG] SELL_REAL_ORDER_ENABLED=${SELL_REAL_ORDER_ENABLED} mode=${sellLive ? 'LIVE(실매도)' : 'DIAGNOSTIC(주문없음)'} · 매도TR확인(코드)=${LS_US_SELL_TR_CONFIRMED} LS_US_SELL_LIVE=${sellLiveEnv} LS_LIVE_TRADING=${liveCfg.liveTrading} · 일일목표=${dailyTargetUsd == null ? '미설정' : dailyTargetUsd} 손실한도=${dailyLossLimitUsd == null ? '미설정' : dailyLossLimitUsd}`);
 
   // ── WebSocket 계좌이벤트(AS0~AS4) 등록 토글 — 원인 격리용(req 3) ──
@@ -706,8 +710,15 @@ async function main() {
       const qtyDec = computeUSOrderQty({ perTradeBudgetUsd: liveCfg.perTradeBudgetUsd, orderableQty, bestAsk: buyPrice, maxQty: liveCfg.maxQty });
       log.info(formatUSSize(ctx.symbol, qtyDec, { perTradeBudgetUsd: liveCfg.perTradeBudgetUsd, bestAsk: buyPrice }));
       orderQty = qtyDec.finalQty;
-      // 최종 게이트: 현금경로 허용 AND 예산기반 수량 산정 성공(전량매수 금지·예산 미설정 fail-closed).
-      orderableQtyOk = cashPathOk && qtyDec.allowed;
+      // P0-31: 총 운용자금(원화) 한도 게이트 — 투자원금(실보유×평단, 프로그램관리만)+pending BUY+신규가 한도 초과 금지.
+      //   남은자금으로 수량 축소(REDUCED_TO_FIT_CAPITAL), 1주도 못 사면 canNewBuy=false(다음 후보/중단).
+      const investedUSD = programInvestedUSD(positions);
+      const pendUSD = scanPendingBuyUSD().totalUSD;
+      const capGuard = computeUSCapitalGuard({ limitKRW: totalCapitalKrw, investedUSD, pendingUSD: pendUSD, candidateQty: orderQty, bestAsk: buyPrice, baseXchRate: depFull?.baseXchRate ?? 0 });
+      log.info(formatUSCapitalGuard(capGuard));
+      orderQty = capGuard.finalQty;
+      // 최종 게이트: 현금경로 허용 AND 예산기반 수량 산정 AND 총자금 한도 통과(셋 다).
+      orderableQtyOk = cashPathOk && qtyDec.allowed && capGuard.canNewBuy;
       logUSCashDiag('BUY-US-CASH', buyPrice);              // BUY 직전 상세 진단(P0-16)
       logCrossWon('BUY-CROSS-WON', buyPrice);              // BUY 직전 통합증거금 실측대조(P0-18)
       if (crossWon) log.info(formatUSLiveGate(ctx.symbol, { liveTrading: liveCfg.liveTrading, usLiveReady: computeUSP0Checklist(liveCfg).US_LIVE_READY, crossWonVerified: liveCfg.crossWonVerified, e: crossWon }));   // [US-LIVE-GATE] BUY 직전 최종(P0-20 #13)
@@ -933,6 +944,8 @@ async function main() {
             const g2 = computeUSDailyBuyGate({ buyCount: accountBuyCount, buyLimit: liveCfg.dailyMaxBuys });
             const rz2 = posStore.corrupt ? { gross: 0, sellCount: 0 } : posStore.realizedToday(etDate);
             log.info(formatUSDailyGuard({ buyCount: accountBuyCount, buyLimit: liveCfg.dailyMaxBuys, sellCount: rz2.sellCount, realizedPnL: posStore.corrupt ? null : rz2.gross, dailyTarget: dailyTargetUsd, dailyLossLimit: dailyLossLimitUsd, canNewBuy: g2.canNewBuy, reason: g2.reason }));
+            // P0-31: 매수 직후 실계좌 보유 재조회 → 투자원금(committed) 최신화(다음 후보 자금판정 정확도).
+            lastHoldingsAt = Date.now(); await refreshHoldings();
           }
         } else tickReason = 'NOT_ARMED';
       }

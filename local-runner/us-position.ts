@@ -2,7 +2,7 @@
 //  · BUY 와 완전히 분리된 SELL 경로. 전략은 기존 BB(getBBSignal)만 사용(임의 전략 추가 없음).
 //  · SELL 은 일일 횟수로 막지 않는다. 중복은 보유수량/pending SELL/동일 candle lock/체결상태로만 방지.
 //  · 실현손익은 gross(수수료·세금 미반영) — LS 응답에 수수료/세금 필드가 없어 net 은 산출 불가(추측 금지).
-import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync, readdirSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 
 const DEFAULT_DIR = resolve(process.cwd(), 'local-runner', 'data');
@@ -40,6 +40,65 @@ export function mergePositions(
         aboveUpper: k?.aboveUpper ?? false,
       };
     });
+}
+
+// ── P0-31: 미국장 총 운용자금(원화) 한도 + 다종목 분산매수 ──
+// committed = 프로그램 관리 투자원금(실보유×평단) + pending BUY. 신규 주문이 한도 초과 시 수량 축소/차단.
+//   · 프로그램 관리 = avgPrice!=null(우리 BUY 체결기록). 수동보유(avgPrice=null)는 원금집계에서 제외.
+//   · 환율은 LS 기준환율(baseXchRate) — 임의 고정 금지. rate<=0 이면 계산 불가(차단).
+
+// 프로그램 관리 투자원금(USD) = Σ(avgPrice!=null) qty×avgPrice. 실보유 기준 → 수동청산 자동 반영.
+export function programInvestedUSD(positions: { qty: number; avgPrice: number | null }[]): number {
+  let s = 0;
+  for (const p of positions) if (p.avgPrice != null && p.avgPrice > 0 && p.qty > 0) s += p.qty * p.avgPrice;
+  return s;
+}
+// pending BUY 총액(USD) — 모든 us-orders-*.json 의 side='buy' pending 합. 재시작/로테이션 무관 복원.
+export function scanPendingBuyUSD(dataDir = DEFAULT_DIR): { totalUSD: number; count: number } {
+  if (!existsSync(dataDir)) return { totalUSD: 0, count: 0 };
+  let totalUSD = 0; let count = 0;
+  for (const f of readdirSync(dataDir)) {
+    const m = /^us-orders-(.+)\.json$/.exec(f);
+    if (!m || m[1].startsWith('__')) continue;   // 계정 이벤트/레저(__account_events__ 등) 제외
+    try {
+      const body = JSON.parse(readFileSync(join(dataDir, f), 'utf8'));
+      for (const po of (body.pending ?? [])) if (po && po.side === 'buy') { totalUSD += (Number(po.qty) || 0) * (Number(po.price) || 0); count++; }
+    } catch { /* 손상 파일 skip */ }
+  }
+  return { totalUSD, count };
+}
+
+// 총 운용자금 게이트 — 신규 BUY 허용/수량축소. committed+신규 <= limit 이어야 허용.
+//   limitKRW=null(미설정) → 한도 미적용(pass-through). rate<=0 → 계산불가(차단). remaining<1주 → 차단.
+export interface USCapitalGuard {
+  limitKRW: number; investedKRW: number; pendingKRW: number; remainingKRW: number;
+  candidateKRW: number; finalQty: number; canNewBuy: boolean; reason: string;
+}
+export function computeUSCapitalGuard(p: {
+  limitKRW: number | null; investedUSD: number; pendingUSD: number;
+  candidateQty: number; bestAsk: number; baseXchRate: number;
+}): USCapitalGuard {
+  const rate = p.baseXchRate > 0 ? p.baseXchRate : 0;
+  const investedKRW = Math.max(0, p.investedUSD) * rate;
+  const pendingKRW = Math.max(0, p.pendingUSD) * rate;
+  const candQty = Math.max(0, Math.floor(p.candidateQty));
+  // 한도 미설정 → guard off(기존 동작). 수량 그대로, 1주 이상이면 허용.
+  if (p.limitKRW == null || !(p.limitKRW > 0)) {
+    return { limitKRW: 0, investedKRW, pendingKRW, remainingKRW: 0, candidateKRW: rate > 0 ? candQty * p.bestAsk * rate : 0, finalQty: candQty, canNewBuy: candQty >= 1, reason: 'CAPITAL_LIMIT_UNSET(off)' };
+  }
+  if (!(rate > 0)) return { limitKRW: p.limitKRW, investedKRW, pendingKRW, remainingKRW: 0, candidateKRW: 0, finalQty: 0, canNewBuy: false, reason: 'NO_XCHRATE' };
+  const remainingKRW = p.limitKRW - investedKRW - pendingKRW;
+  if (!(p.bestAsk > 0)) return { limitKRW: p.limitKRW, investedKRW, pendingKRW, remainingKRW, candidateKRW: 0, finalQty: 0, canNewBuy: false, reason: 'PRICE_UNAVAILABLE' };
+  if (remainingKRW <= 0) return { limitKRW: p.limitKRW, investedKRW, pendingKRW, remainingKRW, candidateKRW: 0, finalQty: 0, canNewBuy: false, reason: 'CAPITAL_EXHAUSTED' };
+  const maxQty = Math.max(0, Math.floor((remainingKRW / rate) / p.bestAsk));   // 남은자금으로 살 수 있는 최대 주수
+  const finalQty = Math.min(candQty, maxQty);
+  if (finalQty < 1) return { limitKRW: p.limitKRW, investedKRW, pendingKRW, remainingKRW, candidateKRW: 0, finalQty: 0, canNewBuy: false, reason: 'CAPITAL_INSUFFICIENT_FOR_1SHARE' };
+  const candidateKRW = finalQty * p.bestAsk * rate;
+  return { limitKRW: p.limitKRW, investedKRW, pendingKRW, remainingKRW, candidateKRW, finalQty, canNewBuy: true, reason: finalQty < candQty ? 'REDUCED_TO_FIT_CAPITAL' : 'OK' };
+}
+export function formatUSCapitalGuard(g: USCapitalGuard): string {
+  return `[US-CAPITAL-GUARD] limitKRW=${Math.round(g.limitKRW)} investedKRW=${Math.round(g.investedKRW)} pendingKRW=${Math.round(g.pendingKRW)}`
+    + ` remainingKRW=${Math.round(g.remainingKRW)} candidateKRW=${Math.round(g.candidateKRW)} finalQty=${g.finalQty} canNewBuy=${g.canNewBuy} reason=${g.reason}`;
 }
 
 // P0-30D: 실 SELL POST 최종 허용 여부 — 셋 다여야 실매도(코드상수 매도TR확인 AND env kill-switch AND 라이브).
