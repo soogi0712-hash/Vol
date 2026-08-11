@@ -26,6 +26,26 @@ describe('일일 매수 한도 + 동일봉 중복주문 방지', () => {
   });
 });
 
+describe('P0-30A: 계정 일일 매수 레저(recordDailyBuy) — 재시작 복원', () => {
+  it('recordDailyBuy 는 pending/candle 오염 없이 buyCount 만 증가', () => {
+    const s = new OrderStore('__us_account_ledger__', dir);
+    s.recordDailyBuy('20260811');
+    s.recordDailyBuy('20260811');
+    s.recordDailyBuy('20260811');
+    expect(s.buyCountToday('20260811')).toBe(3);
+    expect(s.hasPending()).toBe(false);                          // 레저 전용 — pending 미기록
+    expect(s.hasOrderedCandle('20260811', 'buy')).toBe(false);   // candle 미기록
+  });
+  it('flush 후 재시작 load 시 오늘 계정 buyCount 복원(일일상한 초과 방지)', () => {
+    const l1 = new OrderStore('__us_account_ledger__', dir);
+    l1.recordDailyBuy('20260811'); l1.recordDailyBuy('20260811'); l1.flush();
+    const l2 = new OrderStore('__us_account_ledger__', dir);
+    l2.load();
+    expect(l2.buyCountToday('20260811')).toBe(2);   // 재시작해도 오늘 2회 복원
+    expect(l2.buyCountToday('20260812')).toBe(0);   // 다음날은 0
+  });
+});
+
 describe('미체결 추적 + 재시작 중복주문 방지', () => {
   it('pending 추가/해소', () => {
     const s = new OrderStore('AAPL', dir);

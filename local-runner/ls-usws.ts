@@ -11,7 +11,7 @@ import {
   getLSUS15MinPaged, getLSUS15MinOlderThan, getLSUSTicksPaged, getLSUSDeposit, getLSUSStockMasterPage,
   placeLSUSBuyOrder, queryLSUSOrderExec, cancelLSUSOrder, LSApiError, LS_US_ORDEREXEC_EMPTY_CODES,
   decideUSCashPayment, usCashOnlyUsdCap, usOrderableQty, formatCashOrderableLine,
-  computeUSOrderQty, formatUSSize,
+  computeUSOrderQty, formatUSSize, computeUSDailyBuyGate, formatUSDailyGuard,
   evaluateCrossWon, formatCrossWonCheck, formatCrossWonLiveCand, formatUSLiveGate, LS_US_CROSS_WON_TR_CONFIRMED, type LSUSDeposit,
 } from '../src/lib/ls-api';
 import { loadUSUniverse, selectUSLiveCandidate, probeUSMasterExgubun, exgubunWithNyseAmex } from './us-universe';
@@ -37,6 +37,10 @@ function kstYmd(offsetDays = 0): string {
 }
 
 const toStored = (c: RTCandle): StoredCandle => ({ datetime: c.datetime, open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume });
+
+// P0-30A: 종목 단위 재진입 금지 상한(=1). 계정 일일 매수 운영상한(liveCfg.dailyMaxBuys)과 분리한다.
+//   · 계정 상한(N/일) 은 여러 '다른' 종목 매수를 허용하되, 같은 종목은 하루 1회만(재진입 금지).
+const PER_SYMBOL_MAX_BUYS_PER_DAY = 1;
 
 interface SymCtx {
   symbol: string;
@@ -360,7 +364,7 @@ async function main() {
   if (!liveCfg.crossWonVerified) log.warn(`[P0-20] CROSS_WON_VERIFIED=false(kill-switch 또는 코드상수 미확정) → 통합증거금 경로 비활성 → US BUY 차단.`);
 
   log.info(`[P0] US_LIVE_READY=${p0.US_LIVE_READY} · CROSS_WON_VERIFIED=${liveCfg.crossWonVerified} · 시작현금조회=${startupCashOk} · LS_LIVE_TRADING=${liveCfg.liveTrading} → 오늘 미국장 ${liveCapable ? '실주문 가능(paymentMode=CROSS_WON)' : `실주문 차단${liveCfg.liveTrading ? '' : '(LS_LIVE_TRADING=false)'}`}`);
-  log.info(`[LIVE-CFG] 대상=${liveCfg.liveExchange}:${liveCfg.liveSymbol}(exchcd=${liveCfg.liveExchcd}) 1회거래예산=${liveCfg.perTradeBudgetUsd == null ? '미설정(fail-closed)' : `${liveCfg.perTradeBudgetUsd}USD`} maxQty상한=${liveCfg.maxQty ?? '없음(예산결정)'} 하루매수=${liveCfg.dailyMaxBuys} 하루매도=${liveCfg.dailyMaxSells} 미체결타임아웃=${liveCfg.pendingTimeoutSec}s`);
+  log.info(`[LIVE-CFG] 대상=${liveCfg.liveExchange}:${liveCfg.liveSymbol}(exchcd=${liveCfg.liveExchcd}) 1회거래예산=${liveCfg.perTradeBudgetUsd == null ? '미설정(fail-closed)' : `${liveCfg.perTradeBudgetUsd}USD`} maxQty상한=${liveCfg.maxQty ?? '없음(예산결정)'} 계정일일매수상한=${liveCfg.dailyMaxBuys}(종목당 재진입금지=1) 매도횟수제한=없음(보유/pending/체결기준) 미체결타임아웃=${liveCfg.pendingTimeoutSec}s`);
   log.info(`ARMED=${armedMode} · LS_LIVE_TRADING=${liveCfg.liveTrading} · US_LIVE_READY=${p0.US_LIVE_READY} · CROSS_WON_VERIFIED=${liveCfg.crossWonVerified} · 취소TR확인(env)=${liveCfg.cancelConfirmed}/(코드)=false → 실주문 ${liveCapable ? '가능' : '차단'}`);
   // 시작 시점 US-LIVE-GATE(가격 미확보면 PROGRAM_QTY=0 — GSH 수신 후 재출력)
   if (depFull) log.info(formatUSLiveGate(liveCfg.liveSymbol, { liveTrading: liveCfg.liveTrading, usLiveReady: p0.US_LIVE_READY, crossWonVerified: liveCfg.crossWonVerified, e: evaluateCrossWon(depFull, startupPrice, liveCfg.htsOrderableQty) }));
@@ -371,6 +375,11 @@ async function main() {
   const tracker = evStore.trackedMap();
   if (evStore.corrupt) log.error('[ACCT] 주문이벤트 저장 파일 손상 → 상태추적 복원 실패, 새로 시작');
   else if (tracker.size) log.info(`[ACCT] 주문상태 ${tracker.size}건 복원(원주문번호 기준)`);
+
+  // ── P0-30A: 계정 단위 일일 매수 레저(운영상한 판정용). 재시작 시 오늘 buyCount 복원 → 상한 초과 방지 ──
+  const dailyLedger = new OrderStore('__us_account_ledger__');
+  dailyLedger.load();
+  if (dailyLedger.corrupt) log.error('[US-DAILY] 일일 레저 파일 손상 → 오늘 매수횟수 복원 실패(0 으로 시작)');
 
   // ── WebSocket 연결 (시세 GSC/GSH + 계좌 AS0~AS4) ──
   let crossWonLiveGlobalDone = false;   // 최초 bestAsk 수신 시 계정 단위 CROSS-WON 1회 재계산(P0-23)
@@ -610,8 +619,8 @@ async function main() {
     const etDate = etDateStr(now);
     const gscAgeSec = ctx.lastGSCat == null ? null : Math.round((now - ctx.lastGSCat) / 1000);
     const gshAgeSec = ctx.lastGSHat == null ? null : Math.round((now - ctx.lastGSHat) / 1000);
-    // 동일 확정봉 중복/일일한도/손상 → 중복주문으로 간주(cond9), 미체결(cond10)
-    const dup = ctx.orders.corrupt || ctx.orders.hasOrderedCandle(sig.candleDatetime, 'buy') || !ctx.orders.canBuyToday(etDate, liveCfg.dailyMaxBuys);
+    // 동일 확정봉 중복/동일종목 재진입 금지(P0-30A: 종목당 하루1회)/손상 → 중복주문 간주(cond9), 미체결(cond10)
+    const dup = ctx.orders.corrupt || ctx.orders.hasOrderedCandle(sig.candleDatetime, 'buy') || !ctx.orders.canBuyToday(etDate, PER_SYMBOL_MAX_BUYS_PER_DAY);
     const pending = ctx.orders.hasPending();
     const buyPrice = ctx.bestAsk;   // 매수 지정가 = GSH ask
 
@@ -656,7 +665,7 @@ async function main() {
     if (!g.armed) {
       // 거래 0건 사유 분류(req 9): 우선순위 pending > dailyLimit > duplicate > cash > no-signal
       if (pending) return 'PENDING';
-      if (!ctx.orders.canBuyToday(etDate, liveCfg.dailyMaxBuys)) return 'DAILY_LIMIT';
+      if (!ctx.orders.canBuyToday(etDate, PER_SYMBOL_MAX_BUYS_PER_DAY)) return 'DAILY_LIMIT';   // 종목 재진입 금지(하루1회)
       if (ctx.orders.hasOrderedCandle(sig.candleDatetime, 'buy')) return 'DUPLICATE_CANDLE';
       if (sig.action !== 'BUY') return 'NO_BUY_SIGNAL';
       if (!orderableQtyOk) return 'CASH_GATE';
@@ -667,10 +676,10 @@ async function main() {
     if (!live.execute) { log.info(`[ARMED-READY ${ctx.symbol}] 전 10개 조건 충족 · 매수지정가=${buyPrice}(ask) · 주문 없음 — ${live.reason}`); return 'LIVE_OFF'; }
     // P0-29A 방어: 예산기반 최종수량이 1주 미만이면 주문 금지(전량매수/예산 미설정 fail-closed 이중 확인).
     if (!(orderQty >= 1)) { log.warn(`[US-ORDER-QTY-BLOCK ${ctx.symbol}] finalQty=${orderQty} (예산 미설정/현금 부족) → 주문 차단`); return 'CASH_GATE'; }
-    // 도달 시 trader 가 한도/중복/미체결/현금 재검증.
+    // 도달 시 trader 가 종목 재진입/중복/미체결/현금 재검증(P0-30A: 종목당 하루1회=재진입 금지).
     const outcome = await executeBuyOrder(traderDeps, {
       orders: ctx.orders, exchcd: ctx.exchcd, symbol: ctx.symbol, candleDatetime: sig.candleDatetime,
-      qty: orderQty, price: buyPrice, etDate, dailyMaxBuys: liveCfg.dailyMaxBuys,
+      qty: orderQty, price: buyPrice, etDate, dailyMaxBuys: PER_SYMBOL_MAX_BUYS_PER_DAY,
     });
     log.info(`[ORDER-RESULT ${ctx.symbol}] status=${outcome.status} ordNo=${outcome.ordNo ?? '-'}${outcome.abortCode ? ` abortCode=${outcome.abortCode}` : ''} ${outcome.reason}`);
     if (outcome.status === 'placed-filled' || outcome.status === 'placed-pending') return 'ORDERED';
@@ -699,14 +708,18 @@ async function main() {
   // ── 10초마다 전 구독종목 스캔 → BUY 후보 랭킹 → 랭킹 1위부터 LIVE 게이트 (P0-23, AAPL 하드코딩 제거) ──
   let ticking = false;
   let scanCycle = 0;
-  let accountBoughtDate: string | null = null;   // 하루 BUY 1회는 '계정 전체' 기준(요구 11)
+  // P0-30A: 계정 전체 '오늘 매수 횟수' — 레저에서 복원(재시작 안전). 운영상한(liveCfg.dailyMaxBuys) 미만이어야 신규 BUY.
+  let accountBuyDate = etDateStr(Date.now());
+  let accountBuyCount = dailyLedger.corrupt ? 0 : dailyLedger.buyCountToday(accountBuyDate);
+  const dailyGate0 = computeUSDailyBuyGate({ buyCount: accountBuyCount, buyLimit: liveCfg.dailyMaxBuys });
+  log.info(`[US-DAILY] 재시작 복원 · ${formatUSDailyGuard({ buyCount: accountBuyCount, buyLimit: liveCfg.dailyMaxBuys, sellCount: 0, realizedPnL: null, dailyTarget: null, dailyLossLimit: null, canNewBuy: dailyGate0.canNewBuy, reason: dailyGate0.reason })}`);
   const iv = setInterval(async () => {
     if (ticking) return;
     ticking = true;
     try {
       const now = Date.now();
       const etDate = etDateStr(now);
-      if (accountBoughtDate && accountBoughtDate !== etDate) accountBoughtDate = null;   // 날짜 변경 → 리셋
+      if (accountBuyDate !== etDate) { accountBuyDate = etDate; accountBuyCount = dailyLedger.corrupt ? 0 : dailyLedger.buyCountToday(etDate); }   // 날짜 변경 → 오늘자 복원(신규일=0)
       const wsReady = client.connected && client.dataReady;
       const inSession = isUSRegularSession(now);
       scanCycle++;
@@ -774,12 +787,15 @@ async function main() {
           const cx = ctxs.get(c.symbol);
           return !!cx && cx.builder.confirmedCount >= MIN_RT_CANDLES && !cx.orders.hasPending() && budgetEligibleFor(cx).eligible;
         }).length;
+        // P0-30A: 계정 일일 매수 운영상한 판정(하루 1회 고정 아님). 상한 도달 시에만 신규 BUY 차단.
+        const dailyGate = computeUSDailyBuyGate({ buyCount: accountBuyCount, buyLimit: liveCfg.dailyMaxBuys });
+        log.info(formatUSDailyGuard({ buyCount: accountBuyCount, buyLimit: liveCfg.dailyMaxBuys, sellCount: 0, realizedPnL: null, dailyTarget: null, dailyLossLimit: null, canNewBuy: dailyGate.canNewBuy, reason: dailyGate.reason }));
         const sel = selectUSLiveCandidate(rankedUS, (sym) => {
           const cx = ctxs.get(sym);
-          return { warmedUp: !!cx && cx.builder.confirmedCount >= MIN_RT_CANDLES, hasPending: !!cx && cx.orders.hasPending(), dailyExhausted: accountBoughtDate === etDate, budgetEligible: !!cx && budgetEligibleFor(cx).eligible };
+          return { warmedUp: !!cx && cx.builder.confirmedCount >= MIN_RT_CANDLES, hasPending: !!cx && cx.orders.hasPending(), dailyExhausted: !dailyGate.canNewBuy, budgetEligible: !!cx && budgetEligibleFor(cx).eligible };
         });
-        log.info(`[US-LIVE-SELECT] BUY후보=${rankedUS.length} budgetEligible=${budgetEligibleCount} 선택=${sel ? `${sel.symbol}(exchcd=${sel.exchcd},rank=${sel.rank})` : '없음(예산으로 최소1주 가능한 후보 없음/한도소진)'} — AAPL 하드코딩 아님`);
-        if (accountBoughtDate === etDate) tickReason = 'DAILY_LIMIT';
+        log.info(`[US-LIVE-SELECT] BUY후보=${rankedUS.length} budgetEligible=${budgetEligibleCount} 계정매수=${accountBuyCount}/${liveCfg.dailyMaxBuys} 선택=${sel ? `${sel.symbol}(exchcd=${sel.exchcd},rank=${sel.rank})` : '없음(예산부적격/일일상한/한도)'} — AAPL 하드코딩 아님`);
+        if (!dailyGate.canNewBuy) tickReason = 'DAILY_LIMIT';
         else if (!sel) tickReason = 'NO_ELIGIBLE_CANDIDATE';
         else if (armedMode) {
           const selCtx = ctxs.get(sel.symbol)!; const selCand = buyCands.find(c => c.symbol === sel.symbol)!;
@@ -787,7 +803,13 @@ async function main() {
           pauseBackfill = true;
           try { tickReason = await evaluateArmed(selCtx, { action: 'BUY', candleDatetime: selCand.candleDatetime }, Date.now()); }
           finally { pauseBackfill = false; }
-          if (tickReason === 'ORDERED') accountBoughtDate = etDate;
+          if (tickReason === 'ORDERED') {
+            // 계정 일일 매수 카운트 증가 + 레저 영구기록(재시작 복원). 종목 재진입 금지는 종목 store 가 별도 보장.
+            accountBuyCount++; accountBuyDate = etDate;
+            if (!dailyLedger.corrupt) { dailyLedger.recordDailyBuy(etDate); dailyLedger.flush(); }
+            const g2 = computeUSDailyBuyGate({ buyCount: accountBuyCount, buyLimit: liveCfg.dailyMaxBuys });
+            log.info(formatUSDailyGuard({ buyCount: accountBuyCount, buyLimit: liveCfg.dailyMaxBuys, sellCount: 0, realizedPnL: null, dailyTarget: null, dailyLossLimit: null, canNewBuy: g2.canNewBuy, reason: g2.reason }));
+          }
         } else tickReason = 'NOT_ARMED';
       }
       if (Object.prototype.hasOwnProperty.call(noTradeCounts, tickReason)) bumpNoTrade(tickReason as keyof typeof noTradeCounts);

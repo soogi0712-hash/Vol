@@ -7,9 +7,9 @@ beforeEach(() => { saved = {}; for (const k of KEYS) { saved[k] = process.env[k]
 afterEach(() => { for (const k of KEYS) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]; } });
 
 describe('loadLiveConfig — 오늘 실전 제한 강제', () => {
-  it('기본값: NASDAQ:AAPL, maxQty=null(하드1 제거), 예산=null(미설정), 하루 1/1, armed/live/cancel=false', () => {
+  it('기본값: NASDAQ:AAPL, maxQty=null(하드1 제거), 예산=null(미설정), 일일매수상한=10, armed/live/cancel=false', () => {
     const c = loadLiveConfig();
-    expect(c).toMatchObject({ liveSymbol: 'AAPL', liveExchange: 'NASDAQ', liveExchcd: '82', maxQty: null, perTradeBudgetUsd: null, dailyMaxBuys: 1, dailyMaxSells: 1, armed: false, liveTrading: false, cancelConfirmed: false });
+    expect(c).toMatchObject({ liveSymbol: 'AAPL', liveExchange: 'NASDAQ', liveExchcd: '82', maxQty: null, perTradeBudgetUsd: null, dailyMaxBuys: 10, armed: false, liveTrading: false, cancelConfirmed: false });
   });
   it('LS_US_LIVE_SYMBOL 파싱(NYSE:BA → exchcd 81)', () => {
     process.env.LS_US_LIVE_SYMBOL = 'NYSE:BA';
@@ -36,11 +36,17 @@ describe('loadLiveConfig — 오늘 실전 제한 강제', () => {
     process.env.LS_US_PER_TRADE_BUDGET_USD = '   ';
     expect(loadLiveConfig().perTradeBudgetUsd).toBeNull();
   });
-  it('일일 매수/매도 상한 1로 강제', () => {
+  it('P0-30A: 일일 매수 운영상한 env 반영(하루1 고정 해제) — 5 요청 시 5, 0 이면 0, 100 초과는 100 클램프', () => {
     process.env.LS_US_DAILY_MAX_BUYS = '5';
+    expect(loadLiveConfig().dailyMaxBuys).toBe(5);
+    process.env.LS_US_DAILY_MAX_BUYS = '0';
+    expect(loadLiveConfig().dailyMaxBuys).toBe(0);        // 0 = 매수 비활성(운영선택)
+    process.env.LS_US_DAILY_MAX_BUYS = '9999';
+    expect(loadLiveConfig().dailyMaxBuys).toBe(100);      // 난사방지 상한
+  });
+  it('P0-30A: dailyMaxSells 는 게이트 미사용(청산 보장) — env 그대로 반영(정보값)', () => {
     process.env.LS_US_DAILY_MAX_SELLS = '9';
-    const c = loadLiveConfig();
-    expect(c.dailyMaxBuys).toBe(1); expect(c.dailyMaxSells).toBe(1);
+    expect(loadLiveConfig().dailyMaxSells).toBe(9);
   });
   it('armed/live/cancel env 반영', () => {
     process.env.LS_TRADING_ARMED = 'true';

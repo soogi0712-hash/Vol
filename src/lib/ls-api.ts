@@ -996,6 +996,33 @@ export function formatUSSize(symbol: string, d: USQtyDecision, p: { perTradeBudg
     + ` eligibleForLiveSelection=${d.eligibleForLiveSelection} reason=${d.reason}`;
 }
 
+// ── P0-30A: 미국장 실전용 일일 BUY 가드 (하루 1회 테스트 제한 해제 → 운영상한 기반) ──
+// 계정 단위 '오늘 매수 횟수(buyCount)' 가 운영상한(buyLimit) 미만이어야 신규 BUY 허용.
+//   · buyLimit 은 LS_US_DAILY_MAX_BUYS(운영상한). 코드가 ===1 을 필수조건으로 요구하지 않는다(무제한 난사만 금지).
+//   · 실제 신규매수 총 가드는 이것 외에도 1회예산(P0-29)/통합증거금 수량/동일종목 재진입 금지/동일 candle 중복 POST 금지/
+//     pending 중복 금지가 각각 독립적으로 작동한다(여기서는 '일일 계정 매수횟수'만 판정).
+//   · SELL(보유청산/손절/익절)은 이 가드와 무관 — 절대 횟수로 막지 않는다(별도: 보유수량/pending SELL/체결상태).
+export interface USDailyBuyGate { buyCount: number; buyLimit: number; canNewBuy: boolean; reason: string; }
+export function computeUSDailyBuyGate(p: { buyCount: number; buyLimit: number }): USDailyBuyGate {
+  const buyCount = Math.max(0, Math.floor(p.buyCount));
+  const buyLimit = Math.floor(p.buyLimit);
+  if (!(buyLimit > 0)) return { buyCount, buyLimit, canNewBuy: false, reason: 'BUY_DISABLED(limit<=0)' };
+  if (buyCount >= buyLimit) return { buyCount, buyLimit, canNewBuy: false, reason: 'DAILY_BUY_LIMIT_REACHED' };
+  return { buyCount, buyLimit, canNewBuy: true, reason: 'OK' };
+}
+// [US-DAILY-GUARD] — 신규 BUY 허용/차단 근거를 한 줄로. realizedPnL/dailyTarget/dailyLossLimit 은 현재 미구현(n/a).
+//   (일일 목표수익/손실한도 로직은 미국 LS 러너에 존재하지 않음 — 임의구현 금지, 값 있으면 그대로 표시)
+export function formatUSDailyGuard(o: {
+  buyCount: number; buyLimit: number; sellCount: number;
+  realizedPnL: number | null; dailyTarget: number | null; dailyLossLimit: number | null;
+  canNewBuy: boolean; reason: string;
+}): string {
+  const na = (v: number | null) => v == null ? 'n/a(미구현)' : String(v);
+  return `[US-DAILY-GUARD] buyCount=${o.buyCount} buyLimit=${o.buyLimit} sellCount=${o.sellCount}`
+    + ` realizedPnL=${na(o.realizedPnL)} dailyTarget=${na(o.dailyTarget)} dailyLossLimit=${na(o.dailyLossLimit)}`
+    + ` canNewBuy=${o.canNewBuy} reason=${o.reason}`;
+}
+
 // ── ARMED cashOrderable 한 줄 로그 (P0-17) — 항상 캐시 기준. "미조회" 는 절대 출력하지 않는다 ──
 // 성공(ok): `cashOrderable=<금액> USD (rsp_cd=...)`. 실패: `cashOrderable=조회실패 rsp_cd=... rsp_msg=...`.
 // rspMsg 는 호출측에서 마스킹(scrub) 후 넘긴다.

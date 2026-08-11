@@ -11,7 +11,7 @@ export interface USP0Checklist {
   US_RESTART_RECONCILIATION: boolean;     // 주문 전 거래소 대사(구현됨)
   US_AS_EVENT_LINKED: boolean;            // AS0/AS1/AS3/AS4 ↔ 주문번호 pending 연결(구현됨)
   US_SINGLE_POST_PER_CANDLE: boolean;     // 같은 candle 1회 POST(idempotent 와 동일 보장)
-  US_DAILY_BUY_LIMIT: boolean;            // 하루 BUY 1회 제한(설정 확인). P0-29A: 수량은 예산기반이라 qty1 강제 제거.
+  US_DAILY_BUY_LIMIT: boolean;            // P0-30A: 일일 매수 운영상한이 설정됨(>=1). ===1 필수조건 아님(하루 1회 고정 해제).
   US_PER_TRADE_BUDGET_SET: boolean;       // P0-29A: 1회 거래예산(LS_US_PER_TRADE_BUDGET_USD) 설정 확인. 미설정이면 fail-closed.
   US_CROSS_WON_VERIFIED: boolean;         // 타통화+원화(통합증거금/선환전) 공식 필드 실측확인(P0-16). 미확인이면 BUY 하드차단.
   US_LIVE_READY: boolean;                 // 위 전부 충족(+수동취소 모드) → 실전 가능
@@ -19,8 +19,9 @@ export interface USP0Checklist {
 
 // 구현된 안전장치 플래그(코드로 보장). 설정 의존 플래그는 cfg 로 판정.
 export function computeUSP0Checklist(cfg: LiveConfig): USP0Checklist {
-  // P0-23: 종목 하드코딩(AAPL) 제거. P0-29A: 수량은 예산기반 정수주 → qty1 강제 제거, 하루 BUY 1회만 유지.
-  const dailyOk = cfg.dailyMaxBuys === 1;
+  // P0-23: 종목 하드코딩(AAPL) 제거. P0-29A: 수량 예산기반. P0-30A: 하루 1회 고정 해제 →
+  //   일일 매수 운영상한이 설정(>=1)되어 있으면 통과. dailyMaxBuys===1 을 US_LIVE_READY 필수조건으로 쓰지 않는다.
+  const dailyOk = cfg.dailyMaxBuys >= 1;
   // P0-29A: 1회 거래예산 미설정이면 config 레벨에서 fail-closed(US_LIVE_READY=false → 실주문 차단).
   const budgetSet = cfg.perTradeBudgetUsd != null && cfg.perTradeBudgetUsd > 0;
   const base = {

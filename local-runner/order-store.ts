@@ -94,6 +94,17 @@ export class OrderStore {
     if (!this.body.orderedCandles.includes(k)) this.body.orderedCandles.push(k);
     this.body.pending.push({ ordNo: order.ordNo, symbol: order.symbol, qty: order.qty, price: order.price, candleKey: k, etDate, side, placedAtMs: order.placedAtMs });
   }
+  /**
+   * P0-30A: 계정 단위 일일 매수 카운트 증가(레저 전용 — pending/candle 미기록).
+   * 종목 store 가 아니라 '__us_account_ledger__' 같은 계정 레저 store 에서 계정 전체 일일 매수횟수를 영구 집계한다.
+   * 재시작 시 load()+buyCountToday(etDate) 로 오늘 누적을 복원(계정 일일 상한 초과 방지). flush 필요.
+   */
+  recordDailyBuy(etDate: string): void {
+    const day = this.body.days[etDate] ?? { buy: 0, sell: 0 };
+    day.buy += 1;
+    this.body.days[etDate] = day;
+  }
+
   /** 미체결 해소(체결완료/취소완료) — pending 에서 제거. flush 필요. */
   resolvePending(ordNo: string): void { this.body.pending = this.body.pending.filter(p => p.ordNo !== ordNo); }
 

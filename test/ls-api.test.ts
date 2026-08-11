@@ -6,6 +6,7 @@ import {
   placeLSUSBuyOrder, queryLSUSOrderExec, classifyOrderExec, LS_US_ORDEREXEC_EMPTY_CODES, getLSUSDeposit, getLSUSHoldings, cancelLSUSOrder, LS_CANCEL_TR_CONFIRMED, isUSOrderSuccess,
   decideUSCashPayment, usCashOnlyUsdCap, usOrderableQty, formatCashOrderableLine,
   computeUSOrderQty, formatUSSize, isCashOnly, crossWonAdoptedUsdCap,
+  computeUSDailyBuyGate, formatUSDailyGuard,
   evaluateCrossWon, formatCrossWonCheck, formatCrossWonLiveCand, formatUSLiveGate, maskLSResponse, CROSS_WON_ADOPTED_FIELD, LS_US_CROSS_WON_TR_CONFIRMED, type LSUSDeposit,
   placeLSKRBuyOrder, queryLSKROrderExec, cancelLSKRBuyOrder, krIsuNo, isKROrderSuccess, getLSKRStockMaster,
   getLSUSStockMasterPage,
@@ -785,6 +786,30 @@ describe('해외 주문/체결/예수금 (공식 필드)', () => {
       expect(s).toContain('budgetQty=4');
       expect(s).toContain('finalQty=4');
       expect(s).toContain('eligibleForLiveSelection=true');
+    });
+  });
+
+  // ── P0-30A: 미국장 일일 매수 운영상한 가드(하루 1회 고정 해제) ──
+  describe('P0-30A computeUSDailyBuyGate — 계정 일일 매수 운영상한', () => {
+    it('buyCount=0, limit=10 → 신규 BUY 허용', () => {
+      expect(computeUSDailyBuyGate({ buyCount: 0, buyLimit: 10 })).toMatchObject({ canNewBuy: true, reason: 'OK' });
+    });
+    it('buyCount=9, limit=10 → 신규 BUY 허용', () => {
+      expect(computeUSDailyBuyGate({ buyCount: 9, buyLimit: 10 })).toMatchObject({ canNewBuy: true, reason: 'OK' });
+    });
+    it('buyCount=10, limit=10 → 신규 BUY 차단(DAILY_BUY_LIMIT_REACHED)', () => {
+      expect(computeUSDailyBuyGate({ buyCount: 10, buyLimit: 10 })).toMatchObject({ canNewBuy: false, reason: 'DAILY_BUY_LIMIT_REACHED' });
+    });
+    it('limit=0(매수 비활성) → 차단', () => {
+      expect(computeUSDailyBuyGate({ buyCount: 0, buyLimit: 0 })).toMatchObject({ canNewBuy: false, reason: 'BUY_DISABLED(limit<=0)' });
+    });
+    it('formatUSDailyGuard — 모든 필드 노출, 미구현(수익목표/손실한도)은 n/a', () => {
+      const g = computeUSDailyBuyGate({ buyCount: 3, buyLimit: 10 });
+      const s = formatUSDailyGuard({ buyCount: 3, buyLimit: 10, sellCount: 2, realizedPnL: null, dailyTarget: null, dailyLossLimit: null, canNewBuy: g.canNewBuy, reason: g.reason });
+      expect(s).toContain('[US-DAILY-GUARD]');
+      expect(s).toContain('buyCount=3'); expect(s).toContain('buyLimit=10'); expect(s).toContain('sellCount=2');
+      expect(s).toContain('realizedPnL=n/a(미구현)'); expect(s).toContain('dailyTarget=n/a(미구현)'); expect(s).toContain('dailyLossLimit=n/a(미구현)');
+      expect(s).toContain('canNewBuy=true');
     });
   });
 

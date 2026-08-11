@@ -1,6 +1,6 @@
-// Phase 3A 실전 설정 — 환경변수에서 읽는다. 오늘 실전 제한을 코드로 강제한다.
-//   지정가만, 하루 매수/매도 각 1회. 주문수량은 P0-29A 로 1회 거래예산(LS_US_PER_TRADE_BUDGET_USD)
-//   기반 정수주 계산으로 전환(테스트 maxQty=1 하드제한 해제). 예산 미설정 시 fail-closed(주문 금지).
+// Phase 3A 실전 설정 — 환경변수에서 읽는다. 실전 운용 파라미터를 코드로 강제한다.
+//   지정가만. 주문수량은 P0-29A 로 1회 거래예산(LS_US_PER_TRADE_BUDGET_USD) 기반 정수주(maxQty=1 하드제한 해제, 예산 미설정 fail-closed).
+//   P0-30A: 하루 매수 1회 테스트 제한 해제 → LS_US_DAILY_MAX_BUYS 는 '운영상한'(===1 필수조건 아님). SELL 은 횟수로 막지 않는다.
 // ⚠️ 자동취소 REST(COSAT00311)는 공식 필드 미확인 → AUTO_CANCEL_MODE 불가.
 //    대신 MANUAL_CANCEL_MODE(수동취소)로 운영: 미체결 시 사용자 수동취소 요구, AS3 수신 시에만 다음 BUY.
 import { toLSOverseasExchcd, LS_CANCEL_TR_CONFIRMED, LS_US_CROSS_WON_TR_CONFIRMED, CROSS_WON_ADOPTED_FIELD } from '../src/lib/ls-api';
@@ -11,8 +11,8 @@ export interface LiveConfig {
   liveExchcd: string;          // '82'
   maxQty: number | null;       // 선택적 안전 상한(주수). 미설정=null → 예산이 상한을 결정(P0-29A, 하드1 제거)
   perTradeBudgetUsd: number | null;  // LS_US_PER_TRADE_BUDGET_USD — 1회 거래예산(USD). 미설정=null → fail-closed
-  dailyMaxBuys: number;        // 1
-  dailyMaxSells: number;       // 1
+  dailyMaxBuys: number;        // P0-30A: 계정 일일 매수 '운영상한'(하루 1회 고정 아님). 무제한 난사만 방지.
+  dailyMaxSells: number;       // P0-30A: 정보값(운영참고). SELL 은 횟수로 막지 않는다 — 보유수량/pending/체결상태로 보장.
   armed: boolean;              // LS_TRADING_ARMED
   liveTrading: boolean;        // LS_LIVE_TRADING
   cancelConfirmed: boolean;    // LS_CANCEL_TR_CONFIRMED (env)
@@ -44,8 +44,10 @@ export function loadLiveConfig(): LiveConfig {
     maxQty: (() => { const v = process.env.LS_US_MAX_QTY; if (v == null || v.trim() === '') return null; const n = parseInt(v, 10); return Number.isFinite(n) && n > 0 ? n : null; })(),
     // 1회 거래예산(USD). 미설정/비정상(<=0) → null → 주문 fail-closed(전량매수 방지의 핵심).
     perTradeBudgetUsd: (() => { const v = process.env.LS_US_PER_TRADE_BUDGET_USD; if (v == null || v.trim() === '') return null; const n = Number(v); return Number.isFinite(n) && n > 0 ? n : null; })(),
-    dailyMaxBuys: intEnv('LS_US_DAILY_MAX_BUYS', 1, 0, 1),  // 오늘은 최대 1(하루 BUY 1회 유지)
-    dailyMaxSells: intEnv('LS_US_DAILY_MAX_SELLS', 1, 0, 1),
+    // P0-30A: 계정 일일 매수 운영상한(하루 1회 고정 해제). 기본 10, 상한 100(오타/난사 방지). 0 이면 매수 비활성.
+    dailyMaxBuys: intEnv('LS_US_DAILY_MAX_BUYS', 10, 0, 100),
+    // P0-30A: SELL 은 횟수제한으로 막지 않는다(청산/손절 보장). 이 값은 정보/미래확장용 참고값일 뿐 게이트에 미사용.
+    dailyMaxSells: intEnv('LS_US_DAILY_MAX_SELLS', 100, 0, 1000),
     armed: process.env.LS_TRADING_ARMED === 'true',
     liveTrading: process.env.LS_LIVE_TRADING === 'true',
     cancelConfirmed: process.env.LS_CANCEL_TR_CONFIRMED === 'true',

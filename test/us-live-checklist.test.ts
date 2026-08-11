@@ -60,10 +60,16 @@ describe('P0-10 최종 체크리스트', () => {
     expect(c.US_DAILY_BUY_LIMIT).toBe(true);   // 종목 무관, 하루 BUY 1회만 확인
     expect(c.US_LIVE_READY).toBe(true);
   });
-  it('일일제한 위반(dailyMaxBuys=0 이면 차단)', () => {
+  it('일일제한: dailyMaxBuys=0(매수 비활성) → US_DAILY_BUY_LIMIT=false, US_LIVE_READY=false', () => {
     process.env.LS_US_DAILY_MAX_BUYS = '0';
     const c = computeUSP0Checklist(loadLiveConfig());
     expect(c.US_DAILY_BUY_LIMIT).toBe(false);
     expect(c.US_LIVE_READY).toBe(false);
+  });
+  it('P0-30A: dailyMaxBuys=10(하루 1회 고정 해제) → US_DAILY_BUY_LIMIT=true, US_LIVE_READY=true (===1 필수조건 제거)', () => {
+    process.env.LS_US_DAILY_MAX_BUYS = '10';
+    const c = computeUSP0Checklist(loadLiveConfig());
+    expect(c.US_DAILY_BUY_LIMIT).toBe(true);   // >=1 이면 통과 (예전 ===1 요구였으면 false 였음)
+    expect(c.US_LIVE_READY).toBe(true);
   });
 });
