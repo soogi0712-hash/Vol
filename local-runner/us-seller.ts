@@ -2,9 +2,10 @@
 //  흐름: 방어재검증(보유/pending SELL/동일candle) → 거래소 대사 → candle lock → SELL POST → 체결확인.
 //  안전장치(BUY와 동일): POST 직전 idempotency lock, 응답 timeout/오류에도 재전송 금지(candle 잠금 유지),
 //    실제 체결은 대사/AS 이벤트로 확인, pending SELL 존재 시 동일종목 재매도 금지.
-//  ⚠️ 매도 OrdPtnCode 공식 미확인(LS_US_SELL_TR_CONFIRMED=false) 동안 place 는 예외를 던져 실전송을 하드 차단한다.
+//  P0-30D: 매도 OrdPtnCode='01' 공식 확정 → 봉인 해제. 실전송 허용은 러너 SELL_REAL_ORDER_ENABLED(코드상수 AND
+//    env kill-switch AND LS_LIVE_TRADING)로 통제. (POST_UNCONFIRMED 예외처리는 방어적으로 유지)
 import type { OrderStore } from './order-store';
-import { isUSOrderSuccess, LS_US_SELL_ORDPTN_CANDIDATE, type LSOrderResult, type LSOrderExecResult } from '../src/lib/ls-api';
+import { isUSOrderSuccess, LS_US_SELL_ORDPTN, type LSOrderResult, type LSOrderExecResult } from '../src/lib/ls-api';
 
 export interface SellDeps {
   place: (p: { exchcd: string; symbol: string; qty: number; price: number }) => Promise<LSOrderResult>;
@@ -40,7 +41,7 @@ export async function executeSellOrder(deps: SellDeps, p: SellParams): Promise<S
   }
   p.orders.recordResponse({ atMs: deps.now(), tr: 'COSAQ00102', rspCd: chk.rspCd, rspMsg: chk.rspMsg, ordNo: null, note: `SELL 주문전 대사 class=${chk.classification}` });
   const postAllowedByQuery = chk.classification === 'SUCCESS' || chk.classification === 'EMPTY';
-  const sellRows = chk.rows.filter(r => r.symbol === p.symbol && r.ordPtnCode === LS_US_SELL_ORDPTN_CANDIDATE);
+  const sellRows = chk.rows.filter(r => r.symbol === p.symbol && r.ordPtnCode === LS_US_SELL_ORDPTN);
   const localSells = p.orders.sellCountToday(p.etDate);
   deps.log(`[US-SELL-RECON ${p.symbol}] rsp_cd=${chk.rspCd} queryOk=${chk.queryOk} class=${chk.classification} sellRows=${sellRows.length} localSells=${localSells} → ${postAllowedByQuery ? 'POST_ALLOWED' : `RECONCILIATION_FAILED(${chk.classification})`}`);
   if (!postAllowedByQuery) { p.orders.flush(); return abort(`매도 대사 ${chk.classification}(rsp_cd=${chk.rspCd}) → 안전차단(전송 금지)`, 'RECONCILIATION_FAILED'); }
@@ -81,7 +82,7 @@ export async function executeSellOrder(deps: SellDeps, p: SellParams): Promise<S
   p.orders.recordResponse({ atMs: deps.now(), tr: 'COSAQ00102', rspCd: exec.rspCd, rspMsg: exec.rspMsg, ordNo: res.ordNo, note: 'SELL 체결확인' });
   let ordNo = res.ordNo;
   const mine = ordNo ? exec.rows.find(r => r.ordNo === ordNo) ?? null
-    : exec.rows.find(r => r.symbol === p.symbol && r.ordPtnCode === LS_US_SELL_ORDPTN_CANDIDATE && r.ordQty === sellQty) ?? null;
+    : exec.rows.find(r => r.symbol === p.symbol && r.ordPtnCode === LS_US_SELL_ORDPTN && r.ordQty === sellQty) ?? null;
   if (!ordNo && mine) ordNo = mine.ordNo;
   p.orders.recordPlaced('sell', p.candleDatetime, p.etDate, { ordNo: ordNo ?? '(unknown)', symbol: p.symbol, qty: sellQty, price: p.price, placedAtMs: deps.now() });
   p.orders.flush();

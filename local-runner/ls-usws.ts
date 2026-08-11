@@ -29,7 +29,7 @@ import { evaluateTradeGate, canExecuteLive, etDateStr, isUSRegularSession, type 
 import { executeBuyOrder, reconcilePending, linkTrackedToOrders, type TraderDeps } from './trader';
 import { executeSellOrder, type SellDeps } from './us-seller';
 import {
-  PositionStore, mergePositions, computeUSSellGate, computeRealizedPnL, positionPnlPct,
+  PositionStore, mergePositions, computeUSSellGate, computeRealizedPnL, positionPnlPct, sellRealOrderEnabled,
   formatUSPosition, formatUSSellSignal, formatUSSellGate, formatUSSellOrder, formatUSSellFill, type USPosition,
 } from './us-position';
 import { loadLiveConfig, type LiveConfig } from './live-config';
@@ -264,9 +264,9 @@ async function main() {
   //   실제 SELL POST 는 (1) 코드상수 LS_US_SELL_TR_CONFIRMED(매도 OrdPtnCode 실계정 확인) AND
   //   (2) env LS_US_SELL_LIVE=true 둘 다여야 켜진다. 하나라도 아니면 diagnostic(주문 없음).
   const sellLiveEnv = process.env.LS_US_SELL_LIVE === 'true';
-  // P0-30C: 실 SELL POST 는 (코드상수 매도TR확인) AND (env kill-switch) AND (LS_LIVE_TRADING) 셋 다여야 허용.
-  //   매도 OrdPtnCode 공식 미확인 → LS_US_SELL_TR_CONFIRMED=false 유지 → 아래는 항상 false(diagnostic).
-  const SELL_REAL_ORDER_ENABLED = LS_US_SELL_TR_CONFIRMED && sellLiveEnv && liveCfg.liveTrading;
+  // P0-30D: 매도 OrdPtnCode='01' 공식 확정(LS_US_SELL_TR_CONFIRMED=true). 실 SELL POST 는 이제
+  //   (env kill-switch LS_US_SELL_LIVE) AND (LS_LIVE_TRADING) 둘 다여야 켜진다(코드상수는 확정).
+  const SELL_REAL_ORDER_ENABLED = sellRealOrderEnabled({ confirmed: LS_US_SELL_TR_CONFIRMED, sellLiveEnv, liveTrading: liveCfg.liveTrading });
   const sellLive = SELL_REAL_ORDER_ENABLED;
   // 일일 목표수익/손실한도 — env 구조만(금액 미지정 시 null=미설정, 하드코딩 금지, 사용자 결정 대기).
   const dailyTargetUsd = (() => { const v = process.env.LS_US_DAILY_TARGET_USD; if (v == null || v.trim() === '') return null; const n = Number(v); return Number.isFinite(n) ? n : null; })();

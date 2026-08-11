@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  mergePositions, computeUSSellGate, computeRealizedPnL, positionPnlPct, PositionStore,
+  mergePositions, computeUSSellGate, computeRealizedPnL, positionPnlPct, PositionStore, sellRealOrderEnabled,
 } from '../local-runner/us-position';
 
 let dir: string;
@@ -37,6 +37,21 @@ describe('P0-30B computeUSSellGate — 청산 게이트(일일 횟수제한 없�
     // 동일 입력이면 항상 동일 허용 — 횟수 상태가 아예 인자에 없음
     expect(computeUSSellGate(base).postAllowed).toBe(true);
     expect(computeUSSellGate(base).postAllowed).toBe(true);
+  });
+});
+
+describe('P0-30D sellRealOrderEnabled — 실 SELL POST 게이트(코드상수 AND env AND 라이브)', () => {
+  it('confirmed=true + sellLiveEnv=true + liveTrading=true → 허용', () => {
+    expect(sellRealOrderEnabled({ confirmed: true, sellLiveEnv: true, liveTrading: true })).toBe(true);
+  });
+  it('LS_US_SELL_LIVE=false → 금지', () => {
+    expect(sellRealOrderEnabled({ confirmed: true, sellLiveEnv: false, liveTrading: true })).toBe(false);
+  });
+  it('LS_LIVE_TRADING=false → 금지', () => {
+    expect(sellRealOrderEnabled({ confirmed: true, sellLiveEnv: true, liveTrading: false })).toBe(false);
+  });
+  it('매도TR 미확인(confirmed=false) → 금지', () => {
+    expect(sellRealOrderEnabled({ confirmed: false, sellLiveEnv: true, liveTrading: true })).toBe(false);
   });
 });
 

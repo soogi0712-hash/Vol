@@ -42,6 +42,12 @@ export function mergePositions(
     });
 }
 
+// P0-30D: 실 SELL POST 최종 허용 여부 — 셋 다여야 실매도(코드상수 매도TR확인 AND env kill-switch AND 라이브).
+//   SELL 은 일일 횟수제한과 무관(청산/손절 항상 가능). 이 게이트는 '실주문 전송 자체'의 on/off 만 결정한다.
+export function sellRealOrderEnabled(p: { confirmed: boolean; sellLiveEnv: boolean; liveTrading: boolean }): boolean {
+  return !!(p.confirmed && p.sellLiveEnv && p.liveTrading);
+}
+
 // SELL 게이트 — 신규 매도 POST 허용/차단 + 매도수량 결정. (일일 횟수제한 없음: 청산/손절 항상 가능)
 //   전량청산 전략 → sellQty = min(보유수량, 매도가능수량). 중복은 pending/candle/보유로만 차단.
 export interface USSellGate {

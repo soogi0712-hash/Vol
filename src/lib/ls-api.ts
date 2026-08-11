@@ -723,17 +723,19 @@ export function isUSOrderSuccess(rspCd: string, ordNo: string | null | undefined
   return (ordNo != null && ordNo !== '' && ordNo !== '(unknown)') || US_ORDER_SUCCESS_CODES.has(rspCd);
 }
 
-// COSAT00301 OrdPtnCode: '02'=매수. 출처: 공식 reqExample(매수 예시 OrdPtnCode='02') + COSAQ00102 OutBlock3
-//   실계정 관측(OrdPtnCode '02'→'매수'). BUY 는 이 값으로 실거래 검증 완료.
-export const LS_US_ORDPTN_BUY = '02';
-// ⚠️ P0-30B/30C: 미국 매도 OrdPtnCode 는 여전히 공식 미확인(추측 금지). 후보='01'.
-//   P0-30C 재조사: 프로젝트 내 LS 공식 자료는 README 뿐이고 별도 catalog/blocks 파일이 없다. '02'=매수 확정 근거는
-//   '매수' reqExample + 매수만 담긴 COSAQ00102 OutBlock3 관측이며, '01'=매도 를 명시한 공식 출처는 저장소에 없다.
-//   (KR BnsTpCode 1=매도 는 다른 TR·다른 필드라 US OrdPtnCode 확정 근거로 쓸 수 없음.)
-//   → 공식 확정 불가 → 봉인 유지(LS_US_SELL_TR_CONFIRMED=false). 실 매도체결로 OutBlock3 매도 row 의 OrdPtnCode 를
-//   실측 확인한 뒤에만 상수를 전환한다. 확인 전까지 placeLSUSSellOrder 는 예외로 실주문 하드차단.
-export const LS_US_SELL_ORDPTN_CANDIDATE = '01';
-export const LS_US_SELL_TR_CONFIRMED = false;
+// ── COSAT00301 InBlock1 OrdPtnCode(주문유형코드) — LS 공식 Open API 문서 확정(P0-30D) ──
+//   01 = 매도주문, 02 = 매수주문, 08 = 취소주문.
+// ── COSAT00301 InBlock1 OrdprcPtnCode(호가유형) — 공식: 00=지정가 / (매도확대) 03=시장가, M3=MOO, M4=MOC ──
+export const LS_US_ORDPTN_BUY = '02';    // 매수(공식)
+export const LS_US_ORDPTN_SELL = '01';   // 매도(공식, P0-30D 확정)
+export const LS_US_ORDPTN_CANCEL = '08'; // 취소(공식)
+export const LS_US_ORDPRC_PTN_LIMIT = '00';    // 지정가(공식)
+export const LS_US_ORDPRC_PTN_MARKET = '03';   // 시장가(공식, 매도)
+// P0-30D: 매도 OrdPtnCode='01' 공식 문서로 확정 → 봉인 해제. 실 SELL POST 는 이 코드상수 AND env kill-switch
+//   AND LS_LIVE_TRADING 셋 다일 때만(러너 SELL_REAL_ORDER_ENABLED). 호가유형은 지정가('00') 유지(시장가 OvrsOrdPrc
+//   규약 미확정 — 아래 placeLSUSSellOrder 주석 참조, 추측 금지).
+export const LS_US_SELL_ORDPTN = LS_US_ORDPTN_SELL;
+export const LS_US_SELL_TR_CONFIRMED = true;
 
 async function placeLSUSOrderRaw(
   token: string, p: { exchcd: string; symbol: string; qty: number; price: number; ordPtnCode: string },
@@ -758,16 +760,14 @@ export async function placeLSUSBuyOrder(
   return placeLSUSOrderRaw(token, { ...p, ordPtnCode: LS_US_ORDPTN_BUY });
 }
 
-// ── 미국 지정가 매도 주문 (COSAT00301, OrdPtnCode=매도) ──
-// ⚠️ 매도 OrdPtnCode 공식 미확인 → LS_US_SELL_TR_CONFIRMED=false 인 동안 호출 시 예외(실주문 하드차단).
-//   diagnostic 모드는 이 함수를 호출하지 않고 게이트/수량만 계산한다. 확인 후 상수 전환 시에만 실제 전송.
+// ── 미국 지정가 매도 주문 (COSAT00301, OrdPtnCode='01'=매도, 공식 확정 P0-30D) ──
+// 호가유형은 지정가('00') 유지. ⚠️ 시장가 매도('03')는 공식적으로 정의돼 있으나 OvrsOrdPrc 에 넣을 값(0 등) 규약이
+//   공식 문서/기존 코드에서 확인되지 않음(추측 금지) → 시장가는 미구현. 전량청산은 지정가(=bid)로 안전 전송.
 export async function placeLSUSSellOrder(
   cfg: LSConfig, token: string, p: { exchcd: string; symbol: string; qty: number; price: number },
 ): Promise<LSOrderResult> {
-  if (!LS_US_SELL_TR_CONFIRMED) {
-    throw new LSApiError('INVALID_RESPONSE', 'COSAT00301 매도 OrdPtnCode 공식 미확인 — SELL POST 보류(추측 금지). 실계정 매도 1건으로 코드/체결 확인 후 LS_US_SELL_TR_CONFIRMED=true 전환 필요.');
-  }
-  return placeLSUSOrderRaw(token, { ...p, ordPtnCode: LS_US_SELL_ORDPTN_CANDIDATE });
+  // OrdprcPtnCode 는 placeLSUSOrderRaw 내부 '00'(지정가) 고정. 매도유형 OrdPtnCode='01'.
+  return placeLSUSOrderRaw(token, { ...p, ordPtnCode: LS_US_SELL_ORDPTN });
 }
 
 // ── 계좌 주문체결내역 조회 (COSAQ00102, /overseas-stock/accno) — 체결/미체결 확인 ──

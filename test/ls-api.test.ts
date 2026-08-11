@@ -7,7 +7,7 @@ import {
   decideUSCashPayment, usCashOnlyUsdCap, usOrderableQty, formatCashOrderableLine,
   computeUSOrderQty, formatUSSize, isCashOnly, crossWonAdoptedUsdCap,
   computeUSDailyBuyGate, formatUSDailyGuard,
-  placeLSUSSellOrder, LS_US_SELL_TR_CONFIRMED,
+  placeLSUSSellOrder, LS_US_SELL_TR_CONFIRMED, LS_US_SELL_ORDPTN, LS_US_ORDPTN_BUY,
   evaluateCrossWon, formatCrossWonCheck, formatCrossWonLiveCand, formatUSLiveGate, maskLSResponse, CROSS_WON_ADOPTED_FIELD, LS_US_CROSS_WON_TR_CONFIRMED, type LSUSDeposit,
   placeLSKRBuyOrder, queryLSKROrderExec, cancelLSKRBuyOrder, krIsuNo, isKROrderSuccess, getLSKRStockMaster,
   getLSUSStockMasterPage,
@@ -814,12 +814,26 @@ describe('해외 주문/체결/예수금 (공식 필드)', () => {
     });
   });
 
-  // ── P0-30B: 매도 OrdPtnCode 공식 미확인 → SELL POST 하드차단(추측 금지) ──
-  describe('P0-30B placeLSUSSellOrder — 매도TR 미확인 봉인', () => {
-    it('LS_US_SELL_TR_CONFIRMED=false → 호출 시 예외(실전송 차단)', async () => {
-      expect(LS_US_SELL_TR_CONFIRMED).toBe(false);   // 실계정 확인 전 봉인 유지
-      await expect(placeLSUSSellOrder({} as any, 'tok', { exchcd: '82', symbol: 'AAPL', qty: 1, price: 100 }))
-        .rejects.toThrow(/미확인|보류/);
+  // ── P0-30D: 매도 OrdPtnCode='01' 공식 확정(01=매도/02=매수/08=취소) → 봉인 해제, 전송 확인 ──
+  describe('P0-30D COSAT00301 OrdPtnCode 공식 확정', () => {
+    it('LS_US_SELL_TR_CONFIRMED=true, 매도코드=01 / 매수코드=02', () => {
+      expect(LS_US_SELL_TR_CONFIRMED).toBe(true);
+      expect(LS_US_SELL_ORDPTN).toBe('01');
+      expect(LS_US_ORDPTN_BUY).toBe('02');
+    });
+    it('placeLSUSSellOrder → COSAT00301 InBlock1 OrdPtnCode=01(매도), 지정가(00) 전송', async () => {
+      stubFetch(() => ({ json: { rsp_cd: '00000', rsp_msg: 'ok', COSAT00301OutBlock2: { OrdNo: '900' } } }));
+      const r = await placeLSUSSellOrder(cfg as any, 'tok', { exchcd: '82', symbol: 'AAPL', qty: 3, price: 300 });
+      expect(r.ordNo).toBe('900');
+      const inb = JSON.parse(calls.at(-1)!.init.body).COSAT00301InBlock1;
+      expect(inb.OrdPtnCode).toBe('01');       // 매도(공식)
+      expect(inb.OrdprcPtnCode).toBe('00');    // 지정가
+      expect(inb.OrdQty).toBe(3); expect(inb.OvrsOrdPrc).toBe(300); expect(inb.IsuNo).toBe('AAPL');
+    });
+    it('placeLSUSBuyOrder → OrdPtnCode=02(매수) 유지(회귀 없음)', async () => {
+      stubFetch(() => ({ json: { rsp_cd: '00000', rsp_msg: 'ok', COSAT00301OutBlock2: { OrdNo: '141' } } }));
+      await placeLSUSBuyOrder(cfg as any, 'tok', { exchcd: '82', symbol: 'AAPL', qty: 1, price: 100 });
+      expect(JSON.parse(calls.at(-1)!.init.body).COSAT00301InBlock1.OrdPtnCode).toBe('02');
     });
   });
 
