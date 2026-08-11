@@ -723,11 +723,15 @@ export function isUSOrderSuccess(rspCd: string, ordNo: string | null | undefined
   return (ordNo != null && ordNo !== '' && ordNo !== '(unknown)') || US_ORDER_SUCCESS_CODES.has(rspCd);
 }
 
-// COSAT00301 OrdPtnCode: '02'=매수(공식 확인). 매도코드는 아래 참조.
+// COSAT00301 OrdPtnCode: '02'=매수. 출처: 공식 reqExample(매수 예시 OrdPtnCode='02') + COSAQ00102 OutBlock3
+//   실계정 관측(OrdPtnCode '02'→'매수'). BUY 는 이 값으로 실거래 검증 완료.
 export const LS_US_ORDPTN_BUY = '02';
-// ⚠️ P0-30B: 미국 매도 OrdPtnCode 는 공식 카탈로그/실계정에서 아직 확인되지 않았다(추측 금지). 후보='01'.
-//   BUY 는 '02' 로 실거래 검증됐지만 SELL 코드는 미검증 → 실계정에서 실제 매도 1건으로 코드/체결을 확인하기 전까지
-//   실주문(POST)을 하드 차단한다(cancelLSUSOrder 와 동일한 봉인 원칙). 확인 후 LS_US_SELL_TR_CONFIRMED=true 전환.
+// ⚠️ P0-30B/30C: 미국 매도 OrdPtnCode 는 여전히 공식 미확인(추측 금지). 후보='01'.
+//   P0-30C 재조사: 프로젝트 내 LS 공식 자료는 README 뿐이고 별도 catalog/blocks 파일이 없다. '02'=매수 확정 근거는
+//   '매수' reqExample + 매수만 담긴 COSAQ00102 OutBlock3 관측이며, '01'=매도 를 명시한 공식 출처는 저장소에 없다.
+//   (KR BnsTpCode 1=매도 는 다른 TR·다른 필드라 US OrdPtnCode 확정 근거로 쓸 수 없음.)
+//   → 공식 확정 불가 → 봉인 유지(LS_US_SELL_TR_CONFIRMED=false). 실 매도체결로 OutBlock3 매도 row 의 OrdPtnCode 를
+//   실측 확인한 뒤에만 상수를 전환한다. 확인 전까지 placeLSUSSellOrder 는 예외로 실주문 하드차단.
 export const LS_US_SELL_ORDPTN_CANDIDATE = '01';
 export const LS_US_SELL_TR_CONFIRMED = false;
 

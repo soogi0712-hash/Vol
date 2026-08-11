@@ -123,4 +123,41 @@ describe('executeSellOrder — 전송/체결/안전장치', () => {
     const r = await executeSellOrder(sellHarness({ placeThrows: new Error('COSAT00301 매도 OrdPtnCode 공식 미확인 — SELL POST 보류') }), params(orders));
     expect(r.status).toBe('aborted'); expect(r.abortCode).toBe('POST_UNCONFIRMED');
   });
+
+  // ── P0-30C req5·6: 실 SELL 직전 실계좌 매도가능수량 재조회 + sellQty=min(전략,실제) ──
+  it('실매도 직전 재조회 sellableNow < 전략수량 → sellQty 축소(과매도 방지), 축소수량으로 전송', async () => {
+    const orders = new OrderStore('AAPL', dir);
+    let placedQty = 0; let placed = false;
+    const d: SellDeps = {
+      place: async (p) => { placedQty = p.qty; placed = true; return { rspCd: '00000', rspMsg: '', ordNo: '900', raw: {}, diag: {} as any }; },
+      query: async () => placed ? execRes([srow({ ordQty: 2, execQty: 2, unfilledQty: 0 })]) : execRes([]),   // 전송 후에만 체결 row
+      sellableQty: async () => ({ ok: true, qty: 2 }),   // 실제 매도가능 2주(전략 4 요청)
+      now: () => clock, log: () => {},
+    };
+    const r = await executeSellOrder(d, params(orders, { qty: 4 }));   // 전략 4 → min(4,2)=2
+    expect(placedQty).toBe(2);
+    expect(r.status).toBe('placed-filled'); expect(r.execQty).toBe(2);
+  });
+
+  it('실매도 직전 재조회 sellableNow=0 → NO_QTY(전송 금지)', async () => {
+    const orders = new OrderStore('AAPL', dir);
+    let placeCalls = 0;
+    const d: SellDeps = {
+      place: async () => { placeCalls++; return { rspCd: '00000', rspMsg: '', ordNo: '900', raw: {}, diag: {} as any }; },
+      query: async () => execRes([]), sellableQty: async () => ({ ok: true, qty: 0 }), now: () => clock, log: () => {},
+    };
+    const r = await executeSellOrder(d, params(orders, { qty: 4 }));
+    expect(r.status).toBe('aborted'); expect(r.abortCode).toBe('NO_QTY');
+    expect(placeCalls).toBe(0);
+  });
+
+  it('실매도 직전 재조회 실패 → RECONCILIATION_FAILED(안전차단)', async () => {
+    const orders = new OrderStore('AAPL', dir);
+    const d: SellDeps = {
+      place: async () => ({ rspCd: '00000', rspMsg: '', ordNo: '900', raw: {}, diag: {} as any }),
+      query: async () => execRes([]), sellableQty: async () => ({ ok: false, qty: 0 }), now: () => clock, log: () => {},
+    };
+    const r = await executeSellOrder(d, params(orders, { qty: 4 }));
+    expect(r.status).toBe('aborted'); expect(r.abortCode).toBe('RECONCILIATION_FAILED');
+  });
 });

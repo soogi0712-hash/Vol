@@ -264,11 +264,14 @@ async function main() {
   //   실제 SELL POST 는 (1) 코드상수 LS_US_SELL_TR_CONFIRMED(매도 OrdPtnCode 실계정 확인) AND
   //   (2) env LS_US_SELL_LIVE=true 둘 다여야 켜진다. 하나라도 아니면 diagnostic(주문 없음).
   const sellLiveEnv = process.env.LS_US_SELL_LIVE === 'true';
-  const sellLive = sellLiveEnv && LS_US_SELL_TR_CONFIRMED && liveCfg.liveTrading;
+  // P0-30C: 실 SELL POST 는 (코드상수 매도TR확인) AND (env kill-switch) AND (LS_LIVE_TRADING) 셋 다여야 허용.
+  //   매도 OrdPtnCode 공식 미확인 → LS_US_SELL_TR_CONFIRMED=false 유지 → 아래는 항상 false(diagnostic).
+  const SELL_REAL_ORDER_ENABLED = LS_US_SELL_TR_CONFIRMED && sellLiveEnv && liveCfg.liveTrading;
+  const sellLive = SELL_REAL_ORDER_ENABLED;
   // 일일 목표수익/손실한도 — env 구조만(금액 미지정 시 null=미설정, 하드코딩 금지, 사용자 결정 대기).
   const dailyTargetUsd = (() => { const v = process.env.LS_US_DAILY_TARGET_USD; if (v == null || v.trim() === '') return null; const n = Number(v); return Number.isFinite(n) ? n : null; })();
   const dailyLossLimitUsd = (() => { const v = process.env.LS_US_DAILY_LOSS_LIMIT_USD; if (v == null || v.trim() === '') return null; const n = Number(v); return Number.isFinite(n) ? n : null; })();
-  log.info(`[US-SELL-CFG] mode=${sellLive ? 'LIVE(실매도)' : 'DIAGNOSTIC(주문없음)'} · LS_US_SELL_LIVE=${sellLiveEnv} 매도TR확인(코드)=${LS_US_SELL_TR_CONFIRMED} · 일일목표=${dailyTargetUsd == null ? '미설정' : dailyTargetUsd} 손실한도=${dailyLossLimitUsd == null ? '미설정' : dailyLossLimitUsd}`);
+  log.info(`[US-SELL-CFG] SELL_REAL_ORDER_ENABLED=${SELL_REAL_ORDER_ENABLED} mode=${sellLive ? 'LIVE(실매도)' : 'DIAGNOSTIC(주문없음)'} · 매도TR확인(코드)=${LS_US_SELL_TR_CONFIRMED} LS_US_SELL_LIVE=${sellLiveEnv} LS_LIVE_TRADING=${liveCfg.liveTrading} · 일일목표=${dailyTargetUsd == null ? '미설정' : dailyTargetUsd} 손실한도=${dailyLossLimitUsd == null ? '미설정' : dailyLossLimitUsd}`);
 
   // ── WebSocket 계좌이벤트(AS0~AS4) 등록 토글 — 원인 격리용(req 3) ──
   //   LS_US_WS_ACCOUNT_EVENTS=false → GSC/GSH 만 등록(AS 미등록)으로 close 원인 분리.
@@ -479,6 +482,11 @@ async function main() {
   const sellDeps: SellDeps = {
     place: (pp) => placeLSUSSellOrder(cfg, token, pp),   // 매도TR 미확인 동안 예외(하드차단)
     query: (pp) => queryLSUSOrderExec(cfg, token, pp, { emptyCodes: ordExecEmptyCodes }),
+    // P0-30C req5: 실 SELL 직전 실계좌 매도가능수량 재조회(신선값) — 과매도 방지.
+    sellableQty: async (pp) => {
+      try { const h = await getLSUSHoldings(cfg, token, etDateStr(Date.now())); const row = h.holdings.find(x => x.symbol === pp.symbol); return { ok: true, qty: row ? row.sellableQty : 0 }; }
+      catch (e) { log.warn(`[US-SELL ${pp.symbol}] 매도가능수량 재조회 실패: ${scrub(String(e))}`); return { ok: false, qty: 0 }; }
+    },
     now: () => Date.now(),
     log: (m) => log.info(scrub(m)),
   };

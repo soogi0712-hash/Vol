@@ -9,6 +9,8 @@ import { isUSOrderSuccess, LS_US_SELL_ORDPTN_CANDIDATE, type LSOrderResult, type
 export interface SellDeps {
   place: (p: { exchcd: string; symbol: string; qty: number; price: number }) => Promise<LSOrderResult>;
   query: (p: { exchcd: string; symbol?: string; ordDate: string }) => Promise<LSOrderExecResult>;
+  // P0-30C req5: 실 SELL 직전 실계좌 매도가능수량 재조회(신선값). 미주입 시 params.qty 그대로 사용(테스트/진단).
+  sellableQty?: (p: { exchcd: string; symbol: string }) => Promise<{ ok: boolean; qty: number }>;
   now: () => number;
   log: (m: string) => void;
 }
@@ -44,13 +46,26 @@ export async function executeSellOrder(deps: SellDeps, p: SellParams): Promise<S
   if (!postAllowedByQuery) { p.orders.flush(); return abort(`매도 대사 ${chk.classification}(rsp_cd=${chk.rspCd}) → 안전차단(전송 금지)`, 'RECONCILIATION_FAILED'); }
   if (sellRows.length > localSells) { p.orders.flush(); return abort(`거래소 매도주문 ${sellRows.length} > 로컬 ${localSells} → 미기록 매도 감지, 전송 금지(대사)`, 'UNRECORDED_ORDER'); }
 
-  // ③ candle lock — 전송 직전 영구잠금 + flush. 이후 timeout/500/parse 오류가 나도 재전송 금지.
+  // ③ P0-30C req5·6: 실 SELL 직전 실계좌 매도가능수량 재조회 → sellQty=min(전략수량, 실제매도가능).
+  //   과매도(보유초과 매도) 방지. 재조회 실패는 안전차단(전송 금지).
+  let sellQty = Math.floor(p.qty);
+  if (deps.sellableQty) {
+    let s: { ok: boolean; qty: number };
+    try { s = await deps.sellableQty({ exchcd: p.exchcd, symbol: p.symbol }); }
+    catch (e) { p.orders.flush(); return abort(`매도가능수량 재조회 예외(${e instanceof Error ? e.message : String(e)}) → 전송 금지`, 'RECONCILIATION_FAILED'); }
+    if (!s.ok) { p.orders.flush(); return abort('매도가능수량 재조회 실패 → 전송 금지(안전차단)', 'RECONCILIATION_FAILED'); }
+    sellQty = Math.max(0, Math.min(sellQty, Math.floor(s.qty)));
+    deps.log(`[US-SELL-GATE ${p.symbol}] 실매도전 재조회 sellableNow=${s.qty} 전략수량=${p.qty} → sellQty=${sellQty}`);
+    if (sellQty < 1) { p.orders.flush(); return abort(`실계좌 매도가능수량 ${s.qty} → 전송 금지`, 'NO_QTY'); }
+  }
+
+  // ④ candle lock — 전송 직전 영구잠금 + flush. 이후 timeout/500/parse 오류가 나도 재전송 금지.
   p.orders.lockCandle(p.candleDatetime, 'sell');
   p.orders.flush();
 
-  // ④ SELL 전송(COSAT00301 매도). 매도코드 미확인 상태면 place 가 예외 → candle 잠금 유지(재전송 없음).
+  // ⑤ SELL 전송(COSAT00301 매도). 매도코드 미확인 상태면 place 가 예외 → candle 잠금 유지(재전송 없음).
   let res: LSOrderResult;
-  try { res = await deps.place({ exchcd: p.exchcd, symbol: p.symbol, qty: p.qty, price: p.price }); }
+  try { res = await deps.place({ exchcd: p.exchcd, symbol: p.symbol, qty: sellQty, price: p.price }); }
   catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     const unconfirmed = /미확인|보류|OrdPtnCode/.test(msg);
@@ -61,22 +76,22 @@ export async function executeSellOrder(deps: SellDeps, p: SellParams): Promise<S
   p.orders.recordResponse({ atMs: deps.now(), tr: 'COSAT00301', rspCd: res.rspCd, rspMsg: res.rspMsg, ordNo: res.ordNo, note: '매도전송' });
   if (!isUSOrderSuccess(res.rspCd, res.ordNo)) { p.orders.flush(); return { status: 'aborted', ordNo: res.ordNo ?? null, execQty: 0, fillPrice: 0, reason: `매도 거부 rsp_cd=${res.rspCd} ${res.rspMsg} (candle 잠금 유지)`, abortCode: 'ORDER_REJECTED' }; }
 
-  // ⑤ 주문번호 확보 + pending SELL 저장(체결은 AS1/대사로 확인)
+  // ⑥ 주문번호 확보 + pending SELL 저장(체결은 AS1/대사로 확인)
   const exec = await deps.query({ exchcd: p.exchcd, symbol: p.symbol, ordDate: p.etDate });
   p.orders.recordResponse({ atMs: deps.now(), tr: 'COSAQ00102', rspCd: exec.rspCd, rspMsg: exec.rspMsg, ordNo: res.ordNo, note: 'SELL 체결확인' });
   let ordNo = res.ordNo;
   const mine = ordNo ? exec.rows.find(r => r.ordNo === ordNo) ?? null
-    : exec.rows.find(r => r.symbol === p.symbol && r.ordPtnCode === LS_US_SELL_ORDPTN_CANDIDATE && r.ordQty === p.qty) ?? null;
+    : exec.rows.find(r => r.symbol === p.symbol && r.ordPtnCode === LS_US_SELL_ORDPTN_CANDIDATE && r.ordQty === sellQty) ?? null;
   if (!ordNo && mine) ordNo = mine.ordNo;
-  p.orders.recordPlaced('sell', p.candleDatetime, p.etDate, { ordNo: ordNo ?? '(unknown)', symbol: p.symbol, qty: p.qty, price: p.price, placedAtMs: deps.now() });
+  p.orders.recordPlaced('sell', p.candleDatetime, p.etDate, { ordNo: ordNo ?? '(unknown)', symbol: p.symbol, qty: sellQty, price: p.price, placedAtMs: deps.now() });
   p.orders.flush();
-  deps.log(`[US-SELL-ORDER ${p.symbol}] 매도 전송 성공 rsp_cd=${res.rspCd} ordNo=${ordNo ?? '(미확인)'} qty=${p.qty} price=${p.price}`);
+  deps.log(`[US-SELL-ORDER ${p.symbol}] 매도 전송 성공 rsp_cd=${res.rspCd} ordNo=${ordNo ?? '(미확인)'} qty=${sellQty} price=${p.price}`);
 
-  // ⑥ 체결 판정 — 전량/부분/미체결. fillPrice 는 대사 ordPrc(참고), 정확한 체결가는 AS1 avgExecPrc 로 러너가 갱신.
-  if (mine && mine.execQty >= p.qty) {
+  // ⑦ 체결 판정 — 전량/부분/미체결. fillPrice 는 대사 ordPrc(참고), 정확한 체결가는 AS1 avgExecPrc 로 러너가 갱신.
+  if (mine && mine.execQty >= sellQty) {
     if (ordNo) { p.orders.resolvePending(ordNo); p.orders.flush(); }
     return { status: 'placed-filled', ordNo, execQty: mine.execQty, fillPrice: mine.ordPrc || p.price, reason: '전량 체결' };
   }
-  if (mine && mine.execQty > 0) return { status: 'placed-partial', ordNo, execQty: mine.execQty, fillPrice: mine.ordPrc || p.price, reason: `부분체결 ${mine.execQty}/${p.qty} → pending 유지` };
+  if (mine && mine.execQty > 0) return { status: 'placed-partial', ordNo, execQty: mine.execQty, fillPrice: mine.ordPrc || p.price, reason: `부분체결 ${mine.execQty}/${sellQty} → pending 유지` };
   return { status: 'placed-pending', ordNo, execQty: 0, fillPrice: 0, reason: '미체결 → pending 유지(재매도 금지)' };
 }
