@@ -20,31 +20,33 @@ export interface KRTraderDeps {
 const isKRCancelAccepted = (rspCd: string) => rspCd === '00000' || rspCd === '00156';
 export interface KRBuyParams { orders: OrderStore; shcode: string; candleDatetime: string; qty: number; price: number; krDate: string; mbrNo?: string; dailyMaxBuys: number; }
 export type KRBuyStatus = 'placed-filled' | 'placed-partial' | 'placed-pending' | 'aborted';
-export interface KRBuyOutcome { status: KRBuyStatus; ordNo: string | null; execQty: number; reason: string; }
+// KR P0 진단: 거래 0건 사유 분류용(추측 금지 — 실제 abort 지점을 코드로 태깅).
+export type KRAbortCode = 'CORRUPT' | 'DAILY_LIMIT' | 'DUPLICATE_CANDLE' | 'PENDING' | 'RECONCILIATION_FAILED' | 'CASH_GATE' | 'ORDER_REJECTED' | 'SEND_EXCEPTION';
+export interface KRBuyOutcome { status: KRBuyStatus; ordNo: string | null; execQty: number; reason: string; abortCode?: KRAbortCode; }
 
 export async function executeKRBuyOrder(deps: KRTraderDeps, p: KRBuyParams): Promise<KRBuyOutcome> {
-  const abort = (reason: string): KRBuyOutcome => ({ status: 'aborted', ordNo: null, execQty: 0, reason });
+  const abort = (reason: string, abortCode: KRAbortCode): KRBuyOutcome => ({ status: 'aborted', ordNo: null, execQty: 0, reason, abortCode });
   // 방어적 재검증 (손상/한도/중복잠금/미체결 차단)
-  if (p.orders.corrupt) return abort('주문상태 파일 손상');
-  if (!p.orders.canBuyToday(p.krDate, p.dailyMaxBuys)) return abort('하루 매수 한도 초과(로컬)');
-  if (p.orders.hasOrderedCandle(p.candleDatetime, 'buy')) return abort('동일 확정봉 이미 주문(잠금됨)');
-  if (p.orders.hasPending()) return abort('미체결 주문 존재');
+  if (p.orders.corrupt) return abort('주문상태 파일 손상', 'CORRUPT');
+  if (!p.orders.canBuyToday(p.krDate, p.dailyMaxBuys)) return abort('하루 매수 한도 초과(로컬)', 'DAILY_LIMIT');
+  if (p.orders.hasOrderedCandle(p.candleDatetime, 'buy')) return abort('동일 확정봉 이미 주문(잠금됨)', 'DUPLICATE_CANDLE');
+  if (p.orders.hasPending()) return abort('미체결 주문 존재', 'PENDING');
 
   // ① 거래소 실제 주문내역 대사(reconciliation, req4) — 로컬이 놓친 주문 방지(이번 SK하이닉스 버그).
   //    거래소 당일 매수주문 수량이 로컬 기록(예상)보다 많으면 = 로컬이 못 잡은 주문 있음 → 전송 금지.
   const chk = await deps.queryExec({ shcode: p.shcode, ordDate: p.krDate, bnsTpCode: '2' });
   p.orders.recordResponse({ atMs: deps.now(), tr: 'CSPAQ13700', rspCd: chk.rspCd, rspMsg: chk.ok ? `대사 buyOrd=${chk.buyOrdQty} buyExec=${chk.buyExecQty}` : chk.rspMsg, ordNo: null, note: '주문전 대사' });
-  if (!chk.ok) { p.orders.flush(); return abort(`주문내역 대사 실패(${chk.rspCd}) → 안전차단(전송 금지)`); }
+  if (!chk.ok) { p.orders.flush(); return abort(`주문내역 대사 실패(${chk.rspCd}) → 안전차단(전송 금지)`, 'RECONCILIATION_FAILED'); }
   const localBuyQty = p.orders.buyCountToday(p.krDate) * p.qty;
-  if (chk.buyOrdQty > localBuyQty) { p.orders.flush(); return abort(`거래소 당일 매수주문 ${chk.buyOrdQty} > 로컬 ${localBuyQty} → 미기록 주문 감지, 전송 금지(대사)`); }
-  if (chk.buyOrdQty >= p.dailyMaxBuys * p.qty && p.dailyMaxBuys > 0) { p.orders.flush(); return abort(`거래소 당일 매수주문 ${chk.buyOrdQty}(≥한도) → 전송 금지`); }
+  if (chk.buyOrdQty > localBuyQty) { p.orders.flush(); return abort(`거래소 당일 매수주문 ${chk.buyOrdQty} > 로컬 ${localBuyQty} → 미기록 주문 감지, 전송 금지(대사)`, 'RECONCILIATION_FAILED'); }
+  if (chk.buyOrdQty >= p.dailyMaxBuys * p.qty && p.dailyMaxBuys > 0) { p.orders.flush(); return abort(`거래소 당일 매수주문 ${chk.buyOrdQty}(≥한도) → 전송 금지`, 'DAILY_LIMIT'); }
 
   // ② 현금 주문가능금액(MnyOrdAbleAmt, 신용/증거금 제외) 확인 — 부족하면 절대 CSPAT00601 호출 금지(req5·6).
   const cash = await deps.cashOrderable();
   p.orders.recordResponse({ atMs: deps.now(), tr: 'CSPAQ12200', rspCd: cash.ok ? '00000' : 'ERR', rspMsg: `현금주문가능=${cash.cash}`, ordNo: null, note: '주문가능현금' });
-  if (!cash.ok) { p.orders.flush(); return abort('현금 주문가능금액 조회 실패 → 전송 금지'); }
+  if (!cash.ok) { p.orders.flush(); return abort('현금 주문가능금액 조회 실패 → 전송 금지', 'CASH_GATE'); }
   const need = p.price * p.qty;
-  if (need > cash.cash) { p.orders.flush(); return abort(`주문가능현금 부족(필요 ${need} > 가능 ${cash.cash}) → 전송 금지`); }
+  if (need > cash.cash) { p.orders.flush(); return abort(`주문가능현금 부족(필요 ${need} > 가능 ${cash.cash}) → 전송 금지`, 'CASH_GATE'); }
 
   // ③ candle lock — 전송 "직전"(응답 해석 전) 영구 잠금 + 즉시 flush. 이후 어떤 오류가 나도 재주문 금지(req2·7).
   p.orders.lockCandle(p.candleDatetime, 'buy');
@@ -57,14 +59,14 @@ export async function executeKRBuyOrder(deps: KRTraderDeps, p: KRBuyParams): Pro
   } catch (e) {
     p.orders.recordResponse({ atMs: deps.now(), tr: 'CSPAT00601', rspCd: 'EXCEPTION', rspMsg: e instanceof Error ? e.message : String(e), ordNo: null, note: '전송 예외(candle 잠금 유지)' });
     p.orders.flush();
-    return { status: 'aborted', ordNo: null, execQty: 0, reason: `전송 예외 → candle 잠금 유지(재주문 없음). 실제 접수 여부는 다음 틱 대사로 확인` };
+    return { status: 'aborted', ordNo: null, execQty: 0, reason: `전송 예외 → candle 잠금 유지(재주문 없음). 실제 접수 여부는 다음 틱 대사로 확인`, abortCode: 'SEND_EXCEPTION' };
   }
   p.orders.recordResponse({ atMs: deps.now(), tr: 'CSPAT00601', rspCd: res.rspCd, rspMsg: res.rspMsg, ordNo: res.ordNo, note: '현물매수전송' });
 
   // ⑤ 성공 판정 — OrdNo 존재 OR 성공코드(00000/00040). (00040 "매수 주문 완료"를 실패로 오판하지 않음, req1·3)
   if (!isKROrderSuccess(res.rspCd, res.ordNo)) {
     p.orders.flush();
-    return { status: 'aborted', ordNo: res.ordNo ?? null, execQty: 0, reason: `주문 거부 rsp_cd=${res.rspCd} ${res.rspMsg} (candle 잠금 유지 · 재주문 없음)` };
+    return { status: 'aborted', ordNo: res.ordNo ?? null, execQty: 0, reason: `주문 거부 rsp_cd=${res.rspCd} ${res.rspMsg} (candle 잠금 유지 · 재주문 없음)`, abortCode: 'ORDER_REJECTED' };
   }
   const ordNo = res.ordNo;
 

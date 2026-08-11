@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { RoundRobinScanner, ConfirmedCandleCache, passesPrefilter, rankBuyCandidates, bbBreakStrength, rsiReboundStrength, krConfirmedBucket } from '../local-runner/kr-scanner';
+import { RoundRobinScanner, ConfirmedCandleCache, passesPrefilter, rankBuyCandidates, bbBreakStrength, rsiReboundStrength, krConfirmedBucket, newKRNoTradeCounts, formatKRNoTradeCounts } from '../local-runner/kr-scanner';
 import { RateLimiter, computeScanCapacity } from '../local-runner/kr-rate-limiter';
 
 describe('P0-22 라운드로빈 스캐너', () => {
@@ -134,5 +134,37 @@ describe('P0-22 KST 확정봉 버킷', () => {
     const b = krConfirmedBucket(Date.UTC(2026, 7, 7, 1, 44, 0));   // 10:44 KST
     expect(a).toBe(b);   // 둘 다 확정봉 10:15
     expect(a).toBe('202608071015');
+  });
+});
+
+describe('KR P0 거래 0건 진단 카운터([KR-NO-TRADE-COUNTS])', () => {
+  it('newKRNoTradeCounts — 12개 필드 전부 0 으로 초기화', () => {
+    const c = newKRNoTradeCounts();
+    expect(c).toEqual({
+      SCANNED: 0, HISTORY_OK: 0, WARMUP: 0, NO_BUY_SIGNAL: 0, BUY_SIGNAL: 0,
+      CASH_GATE: 0, PENDING: 0, DAILY_LIMIT: 0, DUPLICATE_CANDLE: 0,
+      POST_ATTEMPT: 0, POST_SUCCESS: 0, FILLED: 0,
+    });
+  });
+  it('formatKRNoTradeCounts — 요구 순서/필드 전부 노출', () => {
+    const c = newKRNoTradeCounts();
+    c.SCANNED = 900; c.HISTORY_OK = 850; c.WARMUP = 30; c.NO_BUY_SIGNAL = 815; c.BUY_SIGNAL = 5;
+    c.PENDING = 0; c.CASH_GATE = 2; c.POST_ATTEMPT = 3; c.POST_SUCCESS = 1; c.FILLED = 1;
+    const s = formatKRNoTradeCounts(c, 'mode=LIVE');
+    expect(s.startsWith('[KR-NO-TRADE-COUNTS]')).toBe(true);
+    for (const f of ['SCANNED=900', 'HISTORY_OK=850', 'WARMUP=30', 'NO_BUY_SIGNAL=815', 'BUY_SIGNAL=5',
+      'CASH_GATE=2', 'PENDING=0', 'DAILY_LIMIT=0', 'DUPLICATE_CANDLE=0', 'POST_ATTEMPT=3', 'POST_SUCCESS=1', 'FILLED=1']) {
+      expect(s).toContain(f);
+    }
+    expect(s).toContain('· mode=LIVE');
+  });
+  it('DRY-RUN 재현: BUY_SIGNAL>0 이지만 POST_ATTEMPT=0 → 실거래 0건은 관측(관찰모드) 이 직접 원인', () => {
+    const c = newKRNoTradeCounts();
+    c.SCANNED = 2577; c.HISTORY_OK = 2500; c.BUY_SIGNAL = 8; c.NO_BUY_SIGNAL = 2400; c.WARMUP = 92;
+    c.POST_ATTEMPT = 0; c.POST_SUCCESS = 0; c.FILLED = 0;
+    const s = formatKRNoTradeCounts(c);
+    expect(s).toContain('BUY_SIGNAL=8');
+    expect(s).toContain('POST_ATTEMPT=0');
+    expect(s).toContain('FILLED=0');
   });
 });

@@ -108,6 +108,7 @@ describe('SK하이닉스 3중 체결 버그 재현·방지', () => {
     const r = await executeKRBuyOrder(d, params(orders, { shcode: '000660' }));
     expect(r.status).toBe('aborted');
     expect(r.reason).toMatch(/대사|거래소/);
+    expect(r.abortCode).toBe('RECONCILIATION_FAILED');
     expect(placed).toBe(false);
   });
 });
@@ -121,6 +122,7 @@ describe('현금 주문가능금액(MnyOrdAbleAmt) 가드', () => {
     const r = await executeKRBuyOrder(h, params(orders, { price: 70000, qty: 1 }));
     expect(r.status).toBe('aborted');
     expect(r.reason).toMatch(/현금/);
+    expect(r.abortCode).toBe('CASH_GATE');   // KR P0 진단: 사유 태깅
     expect(placed).toBe(false);
     expect(h.placeCalls).toBe(0);
   });
@@ -141,18 +143,21 @@ describe('executeKRBuyOrder — 방어적 abort', () => {
     const h = buyHarness({});
     const r = await executeKRBuyOrder(h, params(orders));
     expect(r.status).toBe('aborted'); expect(h.placeCalls).toBe(0);
+    expect(r.abortCode).toBe('DAILY_LIMIT');
   });
   it('미체결 존재 → aborted', async () => {
     const orders = new OrderStore('KR_005930', dir);
     orders.recordPlaced('buy', '202608061500', '20260806', { ordNo: '9', symbol: '005930', qty: 1, price: 70000, placedAtMs: 1 });
     const r = await executeKRBuyOrder(buyHarness({}), params(orders));
     expect(r.status).toBe('aborted'); expect(r.reason).toMatch(/미체결/);
+    expect(r.abortCode).toBe('PENDING');
   });
   it('주문 거부(성공코드 아님 + OrdNo 없음) → aborted, candle 잠금 유지, 재주문 없음', async () => {
     const orders = new OrderStore('KR_005930', dir);
     const h = buyHarness({ placeRes: { rspCd: '08085', rspMsg: '주문거부', ordNo: null, raw: {}, diag: {} as any } });
     const r = await executeKRBuyOrder(h, params(orders));
     expect(r.status).toBe('aborted');
+    expect(r.abortCode).toBe('ORDER_REJECTED');
     expect(orders.responses.some(a => a.rspCd === '08085')).toBe(true);
     expect(orders.hasPending()).toBe(false);
     expect(orders.hasOrderedCandle('202608071500', 'buy')).toBe(true);   // 잠금 유지 → 재주문 없음

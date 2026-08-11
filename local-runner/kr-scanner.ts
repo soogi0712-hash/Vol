@@ -87,6 +87,36 @@ export function rankBuyCandidates(cands: BuyCandidate[]): RankedCandidate[] {
   return sorted.map((c, i) => ({ ...c, rank: i + 1, score: c.tradingValue }));
 }
 
+// ── KR P0 긴급진단: 거래 0건 원인 단계별 누적 카운터 ([KR-NO-TRADE-COUNTS]) ──
+// 스캔 파이프라인 각 단계에서 몇 종목이 어디서 걸렀는지 누적한다(추측이 아니라 로그로 확정).
+//   SCANNED         : t8412(15분봉) 실제 조회 시도 종목 수
+//   HISTORY_OK      : 조회 성공(classifyChart=OK) 종목 수
+//   WARMUP          : 조회는 됐으나 확정봉<MIN_CONFIRMED/데이터품질 미달로 전략평가 불가(prefilter/validate 실패)
+//   NO_BUY_SIGNAL   : 전략평가 완료 · BUY 아님
+//   BUY_SIGNAL      : 전략평가 완료 · signal=BUY (후보 추가)
+//   CASH_GATE       : 현금조회 실패/부족으로 주문 차단
+//   PENDING         : 미체결 존재로 신규 차단
+//   DAILY_LIMIT     : 하루 매수 한도로 차단
+//   DUPLICATE_CANDLE: 동일 확정봉 재주문 차단
+//   POST_ATTEMPT    : 실주문 함수 호출(러너 게이트 통과, live=true) 수
+//   POST_SUCCESS    : 주문 접수 성공(placed-filled/partial/pending) 수
+//   FILLED          : 전량 체결 수
+export interface KRNoTradeCounts {
+  SCANNED: number; HISTORY_OK: number; WARMUP: number; NO_BUY_SIGNAL: number; BUY_SIGNAL: number;
+  CASH_GATE: number; PENDING: number; DAILY_LIMIT: number; DUPLICATE_CANDLE: number;
+  POST_ATTEMPT: number; POST_SUCCESS: number; FILLED: number;
+}
+export function newKRNoTradeCounts(): KRNoTradeCounts {
+  return { SCANNED: 0, HISTORY_OK: 0, WARMUP: 0, NO_BUY_SIGNAL: 0, BUY_SIGNAL: 0, CASH_GATE: 0, PENDING: 0, DAILY_LIMIT: 0, DUPLICATE_CANDLE: 0, POST_ATTEMPT: 0, POST_SUCCESS: 0, FILLED: 0 };
+}
+// [KR-NO-TRADE-COUNTS] 한 줄 로그(요구 형식). extra 로 유니크 스캔/커버리지/모드 등 컨텍스트 부가.
+export function formatKRNoTradeCounts(c: KRNoTradeCounts, extra = ''): string {
+  return `[KR-NO-TRADE-COUNTS] SCANNED=${c.SCANNED} HISTORY_OK=${c.HISTORY_OK} WARMUP=${c.WARMUP}`
+    + ` NO_BUY_SIGNAL=${c.NO_BUY_SIGNAL} BUY_SIGNAL=${c.BUY_SIGNAL} CASH_GATE=${c.CASH_GATE} PENDING=${c.PENDING}`
+    + ` DAILY_LIMIT=${c.DAILY_LIMIT} DUPLICATE_CANDLE=${c.DUPLICATE_CANDLE} POST_ATTEMPT=${c.POST_ATTEMPT}`
+    + ` POST_SUCCESS=${c.POST_SUCCESS} FILLED=${c.FILLED}${extra ? ` · ${extra}` : ''}`;
+}
+
 // BB 하단 이탈/복귀 강도: (lower - low)/lower 가 클수록 강한 이탈 후 종가 복귀(close>=lower)면 가점.
 export function bbBreakStrength(low: number, close: number, lower: number): number {
   if (!(lower > 0)) return 0;
