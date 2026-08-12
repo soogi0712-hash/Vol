@@ -12,7 +12,7 @@ import { DailyCache, YEOKMAE_DAILY_ROOT, type DailyBar } from './yeokmae-daily-c
 import { computeHistoryCapacity, classifyUSCacheState, needsFetch, type CacheState } from './yeokmae/us-history-pool';
 import { analyzeSymbol, summarize, rankNearMatches, conditionsLine, SIGNAL_TYPES, type SymbolDiscovery } from './yeokmae/discovery';
 import { getLSMinIntervalMs, type LSUSMasterRow } from '../src/lib/ls-api';
-import { marketToday, type Candle } from '../src/lib/yeokmae';
+import { marketToday, buildYeokmaeSnapshot, type Candle, type YeokmaeSnapshot } from '../src/lib/yeokmae';
 import { writeFileSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 
@@ -20,6 +20,7 @@ const INITIAL = { targetBars: 1000, windowDays: 1200, maxPages: 4 };   // 최초
 const INCREMENTAL = { targetBars: 1, windowDays: 40, maxPages: 1 };    // 증분(최근 창 1 call)
 const CANDIDATES_FILE = join(YEOKMAE_DAILY_ROOT, 'US.reverse-candidates.json');
 const SIGNALS_FILE = join(YEOKMAE_DAILY_ROOT, 'US.real-signals.json');
+const SNAPSHOTS_FILE = join(YEOKMAE_DAILY_ROOT, 'US.signal-report.json');
 
 interface CandidateRec { symbol: string; exchange: string; exchcd: string; bars: number; ema112: number; ema224: number; ema448: number; lastConfirmed: string | null }
 interface SignalRec {
@@ -81,6 +82,7 @@ async function main() {
   // 3) 순차 구축(rate limiter 가 직렬화 — 병렬 폭주 금지)
   const candidates: CandidateRec[] = [];
   const signalRecs: SignalRec[] = [];
+  const snapshots: YeokmaeSnapshot[] = [];
   const discoveries: SymbolDiscovery[] = [];
   const nowIso = new Date(nowMs).toISOString();
   let done = 0, fetched = 0, skipped = 0, failed = 0, insufficientAfter = 0;
@@ -124,8 +126,11 @@ async function main() {
         };
         signalRecs.push(rec);
         saveJsonAtomic(SIGNALS_FILE, { generatedAt: nowIso, market: 'US', count: signalRecs.length, signals: signalRecs });
+        // rule 2: 실신호 종목 상세 스냅샷 자동 저장(HTS 대조용).
+        const snap = buildYeokmaeSnapshot(r.symbol, confirmedCandlesOf(cache));
+        if (snap) { snapshots.push(snap); saveJsonAtomic(SNAPSHOTS_FILE, { generatedAt: nowIso, market: 'US', count: snapshots.length, snapshots }); }
         const on = SIGNAL_TYPES.filter(t => d.arrows[t]);
-        log.info(`[YEOKMAE-REAL-SIGNAL] symbol=${r.symbol} exch=${r.market} confirmedDate=${d.lastConfirmed} arrows=[${on.join(',')}] searcherFormula=${d.searcherFormulaPass} verifiedFailed=[${d.verifiedFailed.join(',')}] unverified=[${d.unverifiedExternal.join(',')}]`);
+        log.info(`[YEOKMAE-REAL-SIGNAL] symbol=${r.symbol} exch=${r.market} confirmedDate=${d.lastConfirmed} arrows=[${on.join(',')}] searcherFormula=${d.searcherFormulaPass} verifiedFailed=[${d.verifiedFailed.join(',')}] unverified=[${d.unverifiedExternal.join(',')}] snapshot=saved`);
       }
     }
     done++;
@@ -133,6 +138,7 @@ async function main() {
 
   saveJsonAtomic(CANDIDATES_FILE, { generatedAt: nowIso, market: 'US', count: candidates.length, candidates });
   saveJsonAtomic(SIGNALS_FILE, { generatedAt: nowIso, market: 'US', count: signalRecs.length, signals: signalRecs });
+  saveJsonAtomic(SNAPSHOTS_FILE, { generatedAt: nowIso, market: 'US', count: snapshots.length, snapshots });
 
   const sum = summarize(done, discoveries);
   const near = rankNearMatches(discoveries).slice(0, 10);
