@@ -39,24 +39,39 @@ export const KR_DAILY_TR_ALT: DailyTRConfig = {
   pagination: 'DATE_WINDOW', successCodes: ['00000'], adjustedAvailable: false, maxPerPage: 700,
   buildInBlock: (p) => ({ t8410InBlock: { shcode: p.symbol, gubun: '2', qrycnt: 700, sdate: p.sdate, edate: p.edate, cts_date: p.cursor ?? '', comp_yn: 'N' } }),
 };
-// US 일봉 — 미확정 유지(봉인). P0-32C probe: g3103(gubun=0)/g3204(gubun=0) → rsp_cd=00000 이나 rows=0("해당 자료가 없습니다").
-//   ⚠️ rows=0 만으로 TR 폐기 금지 — parameter 조합 미탐색. `npm run yeokmae:probe-us-daily -- AAPL` 로 조합 실측 후 rows>0 조합에서만 확정.
+// US 일봉 — P0-32D probe 실측 확정. g3204(해외주식 일주월년) primary / gubun='2'(일) / exchcd(예 NASDAQ 82, NYSE 81) / plain symbol.
+//   실측: rsp_cd=00000, rows=500(단일창), OutBlock1 keys: date,open,high,low,close,volume,amount,jongchk,prtt_rate,pricechk,ratevalue,sign
+//   symbol='82AAPL'(prefixed)은 rows=0 → plain symbol 사용. g3103(gubun=2)은 rows=30뿐 → g3204 primary.
+//   ⚠️ amount(거래대금) 통화/단위 공식 미확인 → KRW 변환 금지. rawTurnover 로 보존, turnoverKRW=null.
+//   ⚠️ exchcd/delaygb/keysymbol 은 종목별 런타임 값(러너가 universe/quote 에서 주입). 500봉<600 → us-daily.ts DATE_WINDOW 로 700+ 확보.
 export const US_DAILY_TR: DailyTRConfig = {
-  market: 'US', trCode: null, endpoint: null,
-  fieldMap: { ...EMPTY_DAILY_FIELD_MAP },
-  pagination: 'UNCONFIRMED', successCodes: null, adjustedAvailable: null, maxPerPage: null, buildInBlock: null,
+  market: 'US',
+  trCode: 'g3204',
+  endpoint: '/overseas-stock/chart',
+  fieldMap: { date: 'date', open: 'open', high: 'high', low: 'low', close: 'close', volume: 'volume', turnover: 'amount' },
+  pagination: 'DATE_WINDOW',
+  successCodes: ['00000'],
+  adjustedAvailable: false,        // 수정주가 플래그 미확인 → adjustment=UNKNOWN.
+  maxPerPage: 500,                 // 실측 단일창 500행(하드 상한 주장 아님 — pages probe 로 실측).
+  buildInBlock: (p) => ({ g3204InBlock: { delaygb: p.delaygb ?? 'R', keysymbol: (p.exchcd ?? '') + p.symbol, exchcd: p.exchcd ?? '', symbol: p.symbol, gubun: '2', qrycnt: 500, comp_yn: 'N', sdate: p.sdate, edate: p.edate } }),
 };
 
 export function dailyTRConfig(market: 'KR' | 'US'): DailyTRConfig { return market === 'KR' ? KR_DAILY_TR : US_DAILY_TR; }
 
+// fail-closed 회귀검증용 미확정 sentinel(실사용 아님) — 새 시장 추가 시 확정 전 이 상태여야 함.
+export const EMPTY_DAILY_FIELD_MAP_CONFIG: DailyTRConfig = {
+  market: 'KR', trCode: null, endpoint: null, fieldMap: { ...EMPTY_DAILY_FIELD_MAP },
+  pagination: 'UNCONFIRMED', successCodes: null, adjustedAvailable: null, maxPerPage: null, buildInBlock: null,
+};
+
 // ════════════════════════════════════════════════════════════════════════════
-// POST-PROBE 상태 (P0-32C)
-//   KR ✅ 확정 — t8413 primary(수정주가), field map/pagination/successCodes/buildInBlock 채움.
-//              `npm run yeokmae:fetch-daily -- KR <SYMBOL>` 로 실 캐시 저장 가능.
-//   US ⛔ 봉인 유지 — g3103/g3204(gubun=0) rows=0. 남은 미확정:
-//     · rows>0 을 내는 TR + parameter 조합(symbol 형식/exchcd/gubun enum/date range/qrycnt/keysymbol/continuation)
-//     · rows>0 확인 후에만: trCode/endpoint('/overseas-stock/chart')/fieldMap/pagination/successCodes/buildInBlock 채움.
-//     → `npm run yeokmae:probe-us-daily -- AAPL` 로 조합 실측(주문 없음). 임의 필드 주입 금지 — repo 확인필드만.
+// POST-PROBE 상태 (P0-32D)
+//   KR ✅ 확정 — t8413 primary(수정주가). `npm run yeokmae:fetch-daily -- KR <SYMBOL>`.
+//   US ✅ 확정 — g3204 primary / gubun='2' / exchcd(런타임) / plain symbol. `npm run yeokmae:fetch-daily -- US <SYMBOL>`.
+//   남은 미확정(데이터 확정과 무관, 주문/의미 검증 영역):
+//     · KR value / US amount 거래대금 단위(통화) — 실측 추정만, 공식 확인 전 KRW 변환 금지.
+//     · 수정주가 정확성(KR t8413 sujung / US g3204) — 분할종목 실측 대조 전까지 flag.
+//     · HTS semantics 4종(SHIFT/STDDEV/ICHIMOKU/EMA seed) — 실 HTS 대조 전까지 미검증.
 // ⚠️ 이 파일 외에는 파이프라인 활성화를 위해 수정할 곳이 없다(어댑터/캐시/정규화/무결성/readiness 완성).
 // ⚠️ 실주문 게이트(YEOKMAE_STRATEGY_VALIDATED=false)는 이 작업과 무관하게 그대로 OFF 유지.
 // ════════════════════════════════════════════════════════════════════════════

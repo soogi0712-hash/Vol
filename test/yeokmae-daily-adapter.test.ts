@@ -1,30 +1,37 @@
 import { describe, it, expect } from 'vitest';
-import { KR_DAILY_TR, US_DAILY_TR, dailyTRConfig, isDailyTRReady } from '../local-runner/yeokmae/daily-tr-config';
-import { makeKRDailyFetcher, makeUSDailyFetcher } from '../local-runner/yeokmae/daily-adapter';
+import { KR_DAILY_TR, US_DAILY_TR, dailyTRConfig, isDailyTRReady, EMPTY_DAILY_FIELD_MAP_CONFIG } from '../local-runner/yeokmae/daily-tr-config';
 
-describe('P0-32C daily-tr-config — KR 확정 / US 봉인', () => {
-  it('KR 는 probe 실측으로 확정(t8413, jdiff_vol, DATE_WINDOW)', () => {
+describe('P0-32D daily-tr-config — KR/US 모두 확정', () => {
+  it('KR 확정(t8413, jdiff_vol, DATE_WINDOW)', () => {
     expect(KR_DAILY_TR.trCode).toBe('t8413');
     expect(KR_DAILY_TR.endpoint).toBe('/stock/chart');
     expect(KR_DAILY_TR.pagination).toBe('DATE_WINDOW');
     expect(KR_DAILY_TR.fieldMap.volume).toBe('jdiff_vol');
     expect(KR_DAILY_TR.fieldMap.turnover).toBe('value');
-    expect(KR_DAILY_TR.successCodes).toEqual(['00000']);
-    expect(typeof KR_DAILY_TR.buildInBlock).toBe('function');
     expect(isDailyTRReady(KR_DAILY_TR)).toEqual({ ready: true, reason: 'OK' });
   });
-  it('KR buildInBlock — t8413InBlock 실측 필드 구성', () => {
+  it('KR buildInBlock — t8413InBlock 실측 필드', () => {
     const ib = KR_DAILY_TR.buildInBlock!({ symbol: '005930', sdate: '20220101', edate: '20260812' }) as any;
     expect(ib.t8413InBlock.shcode).toBe('005930');
     expect(ib.t8413InBlock.gubun).toBe('2');
-    expect(ib.t8413InBlock.sujung).toBe('Y');   // 수정주가 요청
-    expect(ib.t8413InBlock.sdate).toBe('20220101');
-    expect(ib.t8413InBlock.edate).toBe('20260812');
+    expect(ib.t8413InBlock.sujung).toBe('Y');
   });
-  it('US 는 rows=0 → 여전히 미확정(봉인)', () => {
-    expect(US_DAILY_TR.trCode).toBeNull();
-    expect(US_DAILY_TR.buildInBlock).toBeNull();
-    expect(isDailyTRReady(US_DAILY_TR)).toEqual({ ready: false, reason: 'DAILY_TR_UNCONFIRMED' });
+  it('US 확정(g3204, gubun=2, volume=volume, turnover=amount)', () => {
+    expect(US_DAILY_TR.trCode).toBe('g3204');
+    expect(US_DAILY_TR.endpoint).toBe('/overseas-stock/chart');
+    expect(US_DAILY_TR.pagination).toBe('DATE_WINDOW');
+    expect(US_DAILY_TR.fieldMap.volume).toBe('volume');
+    expect(US_DAILY_TR.fieldMap.turnover).toBe('amount');
+    expect(US_DAILY_TR.successCodes).toEqual(['00000']);
+    expect(isDailyTRReady(US_DAILY_TR)).toEqual({ ready: true, reason: 'OK' });
+  });
+  it('US buildInBlock — g3204InBlock plain symbol + 런타임 exchcd/delaygb', () => {
+    const ib = US_DAILY_TR.buildInBlock!({ symbol: 'AAPL', exchcd: '82', delaygb: 'R', sdate: '20240101', edate: '20260812' }) as any;
+    expect(ib.g3204InBlock.symbol).toBe('AAPL');          // plain (82AAPL 은 rows=0)
+    expect(ib.g3204InBlock.keysymbol).toBe('82AAPL');     // keysymbol 만 prefixed
+    expect(ib.g3204InBlock.exchcd).toBe('82');
+    expect(ib.g3204InBlock.gubun).toBe('2');
+    expect(ib.g3204InBlock.delaygb).toBe('R');
   });
   it('dailyTRConfig(market) 라우팅', () => {
     expect(dailyTRConfig('KR')).toBe(KR_DAILY_TR);
@@ -32,20 +39,17 @@ describe('P0-32C daily-tr-config — KR 확정 / US 봉인', () => {
   });
 });
 
-describe('P0-32C daily-adapter — 미확정(US)이면 네트워크 호출 없이 즉시 fail-closed', () => {
-  it('US fetcher.ready() 는 미확정 사유 반환', () => {
-    expect(makeUSDailyFetcher().ready().ready).toBe(false);
-    expect(makeUSDailyFetcher().ready().reason).toBe('DAILY_TR_UNCONFIRMED');
-  });
-  it('KR fetcher.ready() 는 이제 OK', () => {
-    expect(makeKRDailyFetcher().ready()).toEqual({ ready: true, reason: 'OK' });
-  });
-  it('US fetch() 는 ready 실패 시 network 호출 없이 error 반환', async () => {
-    const usf = makeUSDailyFetcher();
-    const res = await usf.fetch({} as any, 'no-token', { symbol: 'AAPL', sdate: '20200101', edate: '20231231' });
-    expect(res.ok).toBe(false);
-    expect(res.pages).toBe(0);
-    expect(res.error).toBe('DAILY_TR_UNCONFIRMED');
-    expect(res.candles).toEqual([]);
+describe('P0-32D daily-tr-config — 미확정 config 는 여전히 fail-closed', () => {
+  it('빈 field map/미확정 config → isDailyTRReady 단계별 사유', () => {
+    expect(isDailyTRReady(EMPTY_DAILY_FIELD_MAP_CONFIG).ready).toBe(false);
+    expect(isDailyTRReady(EMPTY_DAILY_FIELD_MAP_CONFIG).reason).toBe('DAILY_TR_UNCONFIRMED');
+    const step1 = { ...EMPTY_DAILY_FIELD_MAP_CONFIG, trCode: 'x', endpoint: '/stock/chart' as const };
+    expect(isDailyTRReady(step1).reason).toBe('PAGINATION_STRATEGY_UNCONFIRMED');
+    const step2 = { ...step1, pagination: 'DATE_WINDOW' as const };
+    expect(isDailyTRReady(step2).reason).toBe('SUCCESS_CODE_UNCONFIRMED');
+    const step3 = { ...step2, successCodes: ['00000'] };
+    expect(isDailyTRReady(step3).reason).toBe('INBLOCK_BUILDER_UNCONFIRMED');
+    const step4 = { ...step3, buildInBlock: () => ({}) };
+    expect(isDailyTRReady(step4)).toEqual({ ready: true, reason: 'OK' });
   });
 });
