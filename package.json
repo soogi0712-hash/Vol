@@ -15,6 +15,7 @@
     "ls:kr-scan": "tsx local-runner/ls-kr-scan.ts",
     "ls:usws": "tsx local-runner/ls-usws.ts",
     "ls:us-history-diag": "tsx local-runner/ls-us-history-diag.ts",
+    "yeokmae:diag": "tsx local-runner/yeokmae-diag.ts",
     "db:create": "wrangler d1 create bollinger-trader-production",
     "db:migrate:local": "wrangler d1 migrations apply bollinger-trader-production --local",
     "db:migrate:prod": "wrangler d1 migrations apply bollinger-trader-production --remote",

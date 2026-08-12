@@ -58,6 +58,7 @@ async function main() {
   const scrub = makeScrubber([cfg.appKey, cfg.appSecret, token, cfg.accountNo]);
 
   const live = cfg.liveTrading;
+  const legacyBbLive = process.env.LEGACY_BB_LIVE_ENABLED === 'true';   // P0-32: 기본 false → BB BUY 후보수집 차단
   const maxQty = 1;                                          // 상한 1 강제
   const dailyMaxBuys = intEnv('LS_KR_DAILY_MAX_BUYS', 1, 0, 1);
   const mbrNo = (process.env.LS_KR_MBR_NO || 'NXT').trim().toUpperCase();
@@ -66,6 +67,7 @@ async function main() {
   const batchSize = intEnv('LS_KR_SCAN_BATCH', 50, 1, 500);
   const includeEtf = process.env.LS_KR_INCLUDE_ETF === 'true';
   log.info(`모드: ${live ? 'LIVE' : 'OBSERVE/DRY-RUN'} · reqPerSec=${reqPerSec} batchSize=${batchSize} includeEtf=${includeEtf} dailyMaxBuys=${dailyMaxBuys} MbrNo=${mbrNo}`);
+  log.info(`[YEOKMAE-SAFETY] LEGACY_BB_LIVE=${legacyBbLive} (P0-32: 기본 false → 기존 BB/RSI BUY 후보수집 차단. 역매공파는 별도 일봉엔진, 이 15분 스캐너에 미연결)`);
 
   const deps: KRTraderDeps = {
     place: (p) => placeLSKRBuyOrder(acct, token, p),
@@ -207,7 +209,8 @@ async function main() {
       const bands = calcBB(closes, dts, 20, 2);
       const rsi = calcRSI(closes, 14);
       const sig = getBBSignal(bands, false, false, rsi);           // 요구 4: 여기까지 오면 전략평가 완료
-      if (sig.action === 'BUY') {
+      // P0-32: 기존 BB/RSI live BUY 는 LEGACY_BB_LIVE_ENABLED(기본 false)일 때만 후보 수집. 기본은 BB BUY 완전 차단.
+      if (legacyBbLive && sig.action === 'BUY') {
         counts.BUY_SIGNAL++;                                       // 요구 5
         if (buySignalCodes.length < 200) buySignalCodes.push(shcode);
         const last = r.candles[r.candles.length - 1];

@@ -35,6 +35,7 @@ import {
 } from './us-position';
 import { loadLiveConfig, type LiveConfig } from './live-config';
 import { computeUSP0Checklist, formatUSP0Checklist } from './us-live-checklist';
+import { realOrderFromYeokmaeEnabled, YEOKMAE_STRATEGY_VALIDATED } from '../src/lib/yeokmae';
 import { calcBB, calcRSI, getBBSignal, validateCandleData } from '../src/lib/bollinger';
 
 function kstYmd(offsetDays = 0): string {
@@ -276,6 +277,11 @@ async function main() {
   const totalCapitalKrw = (() => { const v = process.env.LS_US_TOTAL_CAPITAL_KRW; if (v == null || v.trim() === '') return null; const n = Number(v); return Number.isFinite(n) && n > 0 ? n : null; })();
   log.info(`[US-CAPITAL-CFG] 총운용자금한도=${totalCapitalKrw == null ? '미설정(한도없음)' : `${totalCapitalKrw}KRW`} · 종목당예산(P0-29)=${liveCfg.perTradeBudgetUsd == null ? '미설정' : `${liveCfg.perTradeBudgetUsd}USD`} · 환율=LS기준환율(실시간)`);
   log.info(`[US-SELL-CFG] SELL_REAL_ORDER_ENABLED=${SELL_REAL_ORDER_ENABLED} mode=${sellLive ? 'LIVE(실매도)' : 'DIAGNOSTIC(주문없음)'} · 매도TR확인(코드)=${LS_US_SELL_TR_CONFIRMED} LS_US_SELL_LIVE=${sellLiveEnv} LS_LIVE_TRADING=${liveCfg.liveTrading} · 일일목표=${dailyTargetUsd == null ? '미설정' : dailyTargetUsd} 손실한도=${dailyLossLimitUsd == null ? '미설정' : dailyLossLimitUsd}`);
+  // P0-32: 전략 교체 안전상태. 기존 BB/RSI live BUY 기본 차단, 역매공파 live BUY 미연결(검증 전).
+  const legacyBbLive = process.env.LEGACY_BB_LIVE_ENABLED === 'true';
+  const yeokmaeLiveEnv = process.env.YEOKMAE_LIVE_TRADING === 'true';
+  const yeokmaeRealOrder = realOrderFromYeokmaeEnabled({ liveTrading: liveCfg.liveTrading, yeokmaeLive: yeokmaeLiveEnv });
+  log.info(`[YEOKMAE-SAFETY] LEGACY_BB_LIVE=${legacyBbLive} YEOKMAE_LIVE_TRADING=${yeokmaeLiveEnv} YEOKMAE_STRATEGY_VALIDATED=${YEOKMAE_STRATEGY_VALIDATED} REAL_ORDER_FROM_YEOKMAE=${yeokmaeRealOrder} (전략교체 중 — 기존 BB BUY 차단, 역매공파 BUY 미연결)`);
 
   // ── WebSocket 계좌이벤트(AS0~AS4) 등록 토글 — 원인 격리용(req 3) ──
   //   LS_US_WS_ACCOUNT_EVENTS=false → GSC/GSH 만 등록(AS 미등록)으로 close 원인 분리.
@@ -862,8 +868,9 @@ async function main() {
           const rec = await reconcilePending(traderDeps, { orders: ctx.orders, exchcd: ctx.exchcd, ordDate: etDate, timeoutMs: liveCfg.pendingTimeoutSec * 1000, autoCancel: liveCfg.autoCancel });
           for (const o of rec) log.info(`[RECONCILE ${ctx.symbol}] ordNo=${o.ordNo} ${o.status} — ${o.reason}`);
         }
-        // BUY 후보 수집(전략 불변 · warmup 종료 · GSC/GSH 신선 · 세션 · dataReady 일 때만)
-        if (sig?.action === 'BUY' && !r.warmup && r.allowSignal && inSession && wsReady && !r.stale) {
+        // P0-32: 기존 BB/RSI live BUY 후보 수집은 LEGACY_BB_LIVE_ENABLED(기본 false)일 때만. 역매공파 전면교체 중 —
+        //   기본은 BB BUY 완전 차단(후보 0 → 주문 0). 역매공파 BUY 는 아직 미연결(YEOKMAE_LIVE_TRADING=false, 별도 단계).
+        if (legacyBbLive && sig?.action === 'BUY' && !r.warmup && r.allowSignal && inSession && wsReady && !r.stale) {
           const confirmed = ctx.builder.confirmedCandles();
           const closes = confirmed.map(c => c.close); const dts = confirmed.map(c => c.datetime);
           const bands = calcBB(closes, dts, 20, 2); const rsi = calcRSI(closes, 14);
