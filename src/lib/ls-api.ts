@@ -158,6 +158,8 @@ let _lastAt = 0;
 export function configureLSRateLimiter(opts: Partial<LSLimiterState>): void {
   _lim = { ..._lim, ...opts };
 }
+/** 현재 공용 limiter 최소간격(ms) — capacity/ETA 계산용(추측 금지, 실제 값 사용). */
+export function getLSMinIntervalMs(): number { return _lim.minIntervalMs; }
 // 직렬 실행(chain) + 최소간격 대기 + rate-limit 재시도.
 async function runLimited<T>(op: () => Promise<T>): Promise<T> {
   const exec = async (): Promise<T> => {
