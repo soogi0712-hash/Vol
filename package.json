@@ -20,6 +20,8 @@
     "yeokmae:find-reverse": "tsx local-runner/yeokmae-find-reverse.ts",
     "yeokmae:build-us-history": "tsx local-runner/yeokmae-build-us-history.ts",
     "yeokmae:scan-candidates": "tsx local-runner/yeokmae-scan-candidates.ts",
+    "yeokmae:signals": "tsx local-runner/yeokmae-signals.ts",
+    "yeokmae:near-matches": "tsx local-runner/yeokmae-near-matches.ts",
     "yeokmae:batch-diag": "tsx local-runner/yeokmae-batch-diag.ts",
     "yeokmae:semantics-grid": "tsx local-runner/yeokmae-semantics-grid.ts",
     "yeokmae:probe-daily": "tsx local-runner/yeokmae-probe-daily.ts",

@@ -9,25 +9,32 @@ import { makeScrubber } from './mask';
 import { loadUSUniverse } from './us-universe';
 import { fetchUSDaily } from './yeokmae/us-daily';
 import { DailyCache, YEOKMAE_DAILY_ROOT, type DailyBar } from './yeokmae-daily-cache';
-import { computeHistoryCapacity, classifyUSCacheState, needsFetch, reverseAlignmentAt, type CacheState } from './yeokmae/us-history-pool';
+import { computeHistoryCapacity, classifyUSCacheState, needsFetch, type CacheState } from './yeokmae/us-history-pool';
+import { analyzeSymbol, summarize, rankNearMatches, conditionsLine, SIGNAL_TYPES, type SymbolDiscovery } from './yeokmae/discovery';
 import { getLSMinIntervalMs, type LSUSMasterRow } from '../src/lib/ls-api';
-import { marketToday } from '../src/lib/yeokmae';
+import { marketToday, type Candle } from '../src/lib/yeokmae';
 import { writeFileSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 
 const INITIAL = { targetBars: 1000, windowDays: 1200, maxPages: 4 };   // 최초 백필(~2-3 calls)
 const INCREMENTAL = { targetBars: 1, windowDays: 40, maxPages: 1 };    // 증분(최근 창 1 call)
 const CANDIDATES_FILE = join(YEOKMAE_DAILY_ROOT, 'US.reverse-candidates.json');
+const SIGNALS_FILE = join(YEOKMAE_DAILY_ROOT, 'US.real-signals.json');
 
 interface CandidateRec { symbol: string; exchange: string; exchcd: string; bars: number; ema112: number; ema224: number; ema448: number; lastConfirmed: string | null }
+interface SignalRec {
+  symbol: string; exchange: string; confirmedDate: string | null; searcherFormula: boolean;
+  '112_ORIGINAL': boolean; '224_ORIGINAL': boolean; '112_UPGRADE': boolean; '224_UPGRADE': boolean; 'LONG_TERM': boolean;
+  conditions: string; ema112: number; ema224: number; ema448: number; verifiedFailed: string[]; unverified: string[];
+}
 
-function confirmedCandlesOf(cache: DailyCache) {
+function confirmedCandlesOf(cache: DailyCache): Candle[] {
   return (cache.body?.bars ?? []).filter(b => b.confirmed).map(b => ({ date: b.date, open: b.open, high: b.high, low: b.low, close: b.close, volume: b.volume }));
 }
-function saveCandidatesAtomic(cands: CandidateRec[], nowIso: string) {
-  const tmp = CANDIDATES_FILE + '.tmp';
-  writeFileSync(tmp, JSON.stringify({ generatedAt: nowIso, market: 'US', count: cands.length, candidates: cands }, null, 2), 'utf8');
-  renameSync(tmp, CANDIDATES_FILE);
+function saveJsonAtomic(file: string, payload: unknown) {
+  const tmp = file + '.tmp';
+  writeFileSync(tmp, JSON.stringify(payload, null, 2), 'utf8');
+  renameSync(tmp, file);
 }
 
 async function main() {
@@ -73,6 +80,9 @@ async function main() {
 
   // 3) 순차 구축(rate limiter 가 직렬화 — 병렬 폭주 금지)
   const candidates: CandidateRec[] = [];
+  const signalRecs: SignalRec[] = [];
+  const discoveries: SymbolDiscovery[] = [];
+  const nowIso = new Date(nowMs).toISOString();
   let done = 0, fetched = 0, skipped = 0, failed = 0, insufficientAfter = 0;
   for (let idx = 0; idx < work.length; idx++) {
     const r = work[idx];
@@ -98,22 +108,40 @@ async function main() {
       } catch (e) { failed++; log.warn(`[YEOKMAE-HISTORY] ${tag} EXCEPTION ${scrub(String(e))}`); continue; }
     }
 
-    // 6) 준비 즉시 역배열 판정(1차 필터). 원본 EMA112<=224<=448.
-    const ra = reverseAlignmentAt(confirmedCandlesOf(cache));
-    if (!ra.ready) { insufficientAfter++; }
-    else if (ra.reverse) {
-      const rec: CandidateRec = { symbol: r.symbol, exchange: r.market, exchcd: r.exchcd, bars: ra.bars, ema112: +ra.ema112.toFixed(2), ema224: +ra.ema224.toFixed(2), ema448: +ra.ema448.toFixed(2), lastConfirmed: ra.lastDate };
-      candidates.push(rec);
-      log.info(`[YEOKMAE-REVERSE-CANDIDATE] symbol=${r.symbol} exch=${r.market} bars=${ra.bars} ema112=${rec.ema112}<=ema224=${rec.ema224}<=ema448=${rec.ema448} lastConfirmed=${ra.lastDate}`);
-      saveCandidatesAtomic(candidates, new Date(nowMs).toISOString());   // 점진 저장(중단 대비)
+    // 6~7) 준비 즉시 1차 역배열 → 통과 시 A~U + 5신호(계층화, 원본 무변경).
+    const d = analyzeSymbol(r.symbol, confirmedCandlesOf(cache), { excluded: false, isCommonStock: true, isEtfEtnSpac: false });
+    discoveries.push(d);
+    if (!d.ready) { insufficientAfter++; }
+    else if (d.reverse) {
+      candidates.push({ symbol: r.symbol, exchange: r.market, exchcd: r.exchcd, bars: d.bars, ema112: +d.ema112.toFixed(2), ema224: +d.ema224.toFixed(2), ema448: +d.ema448.toFixed(2), lastConfirmed: d.lastConfirmed });
+      saveJsonAtomic(CANDIDATES_FILE, { generatedAt: nowIso, market: 'US', count: candidates.length, candidates });   // 점진 저장(exMap 소스)
+      if (d.anyArrow) {
+        // 4) 화살표 1개+ true → 실제 신호. 역배열만 true(화살표 0)는 여기 저장 안 함(BUY 후보 아님).
+        const rec: SignalRec = {
+          symbol: r.symbol, exchange: r.market, confirmedDate: d.lastConfirmed, searcherFormula: d.searcherFormulaPass,
+          '112_ORIGINAL': d.arrows['112_ORIGINAL'], '224_ORIGINAL': d.arrows['224_ORIGINAL'], '112_UPGRADE': d.arrows['112_UPGRADE'], '224_UPGRADE': d.arrows['224_UPGRADE'], 'LONG_TERM': d.arrows['LONG_TERM'],
+          conditions: conditionsLine(d.conditions), ema112: +d.ema112.toFixed(2), ema224: +d.ema224.toFixed(2), ema448: +d.ema448.toFixed(2), verifiedFailed: d.verifiedFailed, unverified: d.unverifiedExternal,
+        };
+        signalRecs.push(rec);
+        saveJsonAtomic(SIGNALS_FILE, { generatedAt: nowIso, market: 'US', count: signalRecs.length, signals: signalRecs });
+        const on = SIGNAL_TYPES.filter(t => d.arrows[t]);
+        log.info(`[YEOKMAE-REAL-SIGNAL] symbol=${r.symbol} exch=${r.market} confirmedDate=${d.lastConfirmed} arrows=[${on.join(',')}] searcherFormula=${d.searcherFormulaPass} verifiedFailed=[${d.verifiedFailed.join(',')}] unverified=[${d.unverifiedExternal.join(',')}]`);
+      }
     }
     done++;
   }
 
-  saveCandidatesAtomic(candidates, new Date(nowMs).toISOString());
-  log.info('──── [YEOKMAE-HISTORY-SUMMARY] ────');
-  log.info(`  processed=${done} fetched=${fetched} skipped(ready)=${skipped} failed=${failed} stillInsufficient=${insufficientAfter}`);
-  log.info(`  reverseCandidates=${candidates.length} → ${CANDIDATES_FILE}`);
-  log.info(`  다음: npm run yeokmae:scan-candidates -- US  (후보별 A~U + 5신호). 중단됐다면 이 명령 재실행 시 READY 는 건너뜀.`);
+  saveJsonAtomic(CANDIDATES_FILE, { generatedAt: nowIso, market: 'US', count: candidates.length, candidates });
+  saveJsonAtomic(SIGNALS_FILE, { generatedAt: nowIso, market: 'US', count: signalRecs.length, signals: signalRecs });
+
+  const sum = summarize(done, discoveries);
+  const near = rankNearMatches(discoveries).slice(0, 10);
+  log.info('──── [YEOKMAE-DISCOVERY-SUMMARY] ────');
+  log.info(`  cached=${sum.cached} reverse=${sum.reverse} arrow112Original=${sum.arrow112Original} arrow224Original=${sum.arrow224Original} arrow112Upgrade=${sum.arrow112Upgrade} arrow224Upgrade=${sum.arrow224Upgrade} longTerm=${sum.longTerm}`);
+  log.info(`  searcherFormulaPass=${sum.searcherFormulaPass} bothSearcherAndArrow=${sum.bothSearcherAndArrow} withAnyArrow=${sum.anyArrow}`);
+  log.info(`  topNearMatches(verifiedFailedCount 오름차순, BUY 아님)=[${near.map(d => `${d.symbol}:${d.verifiedFailedCount}`).join(' ') || '없음'}]`);
+  log.info(`  build: processed=${done} fetched=${fetched} skipped(ready)=${skipped} failed=${failed} stillInsufficient=${insufficientAfter}`);
+  log.info(`  files: ${CANDIDATES_FILE} · ${SIGNALS_FILE}`);
+  log.info(`  다음: npm run yeokmae:signals -- US (실신호) / npm run yeokmae:near-matches -- US (근접후보). 재실행 시 READY skip(resume).`);
 }
 main();
