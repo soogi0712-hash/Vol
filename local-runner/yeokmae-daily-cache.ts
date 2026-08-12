@@ -1,6 +1,6 @@
 // 역매공파 일봉 영구 캐시 (P0-32B) — 실제 LS 일봉 저장/증분갱신. 경로: yeokmae-daily/<market>/<symbol>.json
 //   재실행 시 전체 재취득 금지 — 누락 일봉만 증분 병합. confirmed 가 provisional 을 덮어쓴다. 합성/복제/0-padding 금지.
-import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync, readdirSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import type { Candle } from '../src/lib/yeokmae/hts';
 import type { AdjustmentStatus } from '../src/lib/yeokmae/history';
@@ -46,6 +46,13 @@ export function lastConfirmedCachedDate(bars: readonly DailyBar[]): string | nul
   let last: string | null = null;
   for (const b of bars) if (b.confirmed && (last === null || b.date > last)) last = b.date;
   return last;
+}
+
+// 시장별 캐시된 심볼 목록(파일명 기준). 없으면 빈 배열.
+export function listCachedSymbols(market: 'KR' | 'US', root = YEOKMAE_DAILY_ROOT): string[] {
+  const dir = join(root, market);
+  if (!existsSync(dir)) return [];
+  return readdirSync(dir).filter(f => f.endsWith('.json') && !f.endsWith('.tmp') && !f.endsWith('.corrupt')).map(f => f.replace(/\.json$/, '')).sort();
 }
 
 export class DailyCache {
