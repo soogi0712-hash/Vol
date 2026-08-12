@@ -36,3 +36,13 @@ export const DEFAULT_LONG_TERM: YeokmaeLongTermVars = {
 
 // 최소 필요 일봉수(EMA600 + Ichimoku/Bollinger warmup 여유). 부족하면 INSUFFICIENT_HISTORY.
 export const YEOKMAE_MIN_BARS = 600;   // EMA600 유효 + 신호(매집봉위치50/역배열200 등) 참조에 최소 필요
+
+// ── P0-32A: HTS 함수 의미 미확정 4종 — A/B 검증용 설정 ([SHIFT-DIR][STDDEV-POP][ICHI-DISP][SEED]) ──
+// 기본값 = P0-32 표준 해석. 실제 HTS 수치/화살표와 대조해 어느 조합이 일치하는지 A/B 테스트하고 [YEOKMAE-SEMANTICS] 보고.
+export interface YeokmaeSemantics {
+  emaSeed: 'first' | 'sma';        // eavg 초기값: first=첫값(표준) / sma=첫 n개 SMA
+  shiftDir: 'past' | 'future';     // shift(x,n): past=x[i-n](표준·과거참조) / future=x[i+n](look-ahead·repaint 위험)
+  stddevPopulation: boolean;       // Stddevmv flag0: true=모집단(÷N,표준) / false=표본(÷N-1)
+  ichimokuDisplaced: boolean;      // 선행스팬: true=26봉 미래변위 span[i]=raw[i-26](표준) / false=변위없음 raw[i]
+}
+export const DEFAULT_SEMANTICS: YeokmaeSemantics = { emaSeed: 'first', shiftDir: 'past', stddevPopulation: true, ichimokuDisplaced: true };

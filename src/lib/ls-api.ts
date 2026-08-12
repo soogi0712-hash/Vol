@@ -651,6 +651,14 @@ export async function lsOverseasChartRaw(
   const { data, rspCd, rspMsg, diag } = await lsPost(token, '/overseas-stock/chart', trCd, inBlock, cont);
   return { rspCd, rspMsg, out1: data[`${trCd}OutBlock1`] || [], outBlock: data[`${trCd}OutBlock`] || {}, diag };
 }
+// 국내 차트 원문 프로브(진단 전용, P0-32A) — 임의 TR(t8410/t8413/t8412 등)을 그대로 호출해 원문 필드 확인용.
+//   ⚠️ 필드 매핑을 추측하지 않기 위한 도구: OutBlock1 의 실제 키/샘플행을 그대로 반환한다.
+export async function lsDomesticChartRaw(
+  token: string, trCd: string, inBlock: Record<string, unknown>, cont: { trCont?: string; trContKey?: string } = {},
+): Promise<{ rspCd: string; rspMsg: string; out1: any[]; outBlock: any; diag: LSHttpDiag }> {
+  const { data, rspCd, rspMsg, diag } = await lsPost(token, '/stock/chart', trCd, inBlock, cont);
+  return { rspCd, rspMsg, out1: data[`${trCd}OutBlock1`] || [], outBlock: data[`${trCd}OutBlock`] || {}, diag };
+}
 
 // ─── 국내 계좌 잔고 (CSPAQ12200) ──────────────────────────────
 // req: { CSPAQ12200InBlock1: { BalCreTp: "1" } }

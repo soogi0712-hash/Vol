@@ -5,9 +5,9 @@ import {
   countLastN, prev, type Candle,
 } from './hts';
 import {
-  type YeokmaeSignalResult, type Yeokmae112OrigVars, type Yeokmae224OrigVars, type YeokmaeLongTermVars,
+  type YeokmaeSignalResult, type Yeokmae112OrigVars, type Yeokmae224OrigVars, type YeokmaeLongTermVars, type YeokmaeSemantics,
   DEFAULT_112_ORIGINAL, DEFAULT_224_ORIGINAL, DEFAULT_112_UPGRADE, DEFAULT_224_UPGRADE, DEFAULT_LONG_TERM,
-  YEOKMAE_MIN_BARS,
+  DEFAULT_SEMANTICS, YEOKMAE_MIN_BARS,
 } from './types';
 
 // ── 공용 지표 계산 (파란점기간=26, 매집퍼센트=12 는 5종 공통) ──
@@ -17,19 +17,21 @@ export interface YeokmaeIndicators {
   tp: number[]; blueX: number[]; bolUp40: number[]; bolDn40: number[]; span1: number[]; span2: number[];
   aCum: number[]; bCum: number[]; highest5: number[];
 }
-export function computeYeokmaeIndicators(candles: readonly Candle[], opts: { blueDotPeriod?: number; accumPct?: number } = {}): YeokmaeIndicators {
+export function computeYeokmaeIndicators(candles: readonly Candle[], opts: { blueDotPeriod?: number; accumPct?: number; semantics?: YeokmaeSemantics } = {}): YeokmaeIndicators {
   const blueDotPeriod = opts.blueDotPeriod ?? 26;
   const accumPct = opts.accumPct ?? 12;
+  const S = opts.semantics ?? DEFAULT_SEMANTICS;
   const o = candles.map(k => k.open); const c = candles.map(k => k.close);
   const h = candles.map(k => k.high); const l = candles.map(k => k.low);
   const tp = candles.map(k => (k.close + k.high + k.low) / 3);   // (C+H+L)/3 typical price
-  const e1 = eavg(c, 5), e2 = eavg(c, 20), e3 = eavg(c, 60), e4 = eavg(c, 112), e5 = eavg(c, 224), e6 = eavg(c, 448), e7 = eavg(c, 600);
+  const em = (arr: readonly number[], p: number) => eavg(arr, p, S.emaSeed);
+  const e1 = em(c, 5), e2 = em(c, 20), e3 = em(c, 60), e4 = em(c, 112), e5 = em(c, 224), e6 = em(c, 448), e7 = em(c, 600);
   // 파란점선 x = shift(eavg(c,기간)+2.5*Stddevmv((C+H+L)/3,0,기간), 25)
-  const blueMid = eavg(c, blueDotPeriod);
-  const blueSd = stddevmv(tp, 0, blueDotPeriod);
-  const blueX = shift(blueMid.map((m, i) => (Number.isNaN(m) || Number.isNaN(blueSd[i])) ? NaN : m + 2.5 * blueSd[i]), 25);
-  const bolUp40 = bollingerUp(tp, 2, 40), bolDn40 = bollingerDn(tp, 2, 40);
-  const { span1, span2 } = ichimokuSpans(h, l, 9, 26, 52, 26);
+  const blueMid = em(c, blueDotPeriod);
+  const blueSd = stddevmv(tp, S.stddevPopulation ? 0 : 1, blueDotPeriod);
+  const blueX = shift(blueMid.map((m, i) => (Number.isNaN(m) || Number.isNaN(blueSd[i])) ? NaN : m + 2.5 * blueSd[i]), 25, S.shiftDir);
+  const bolUp40 = bollingerUp(tp, 2, 40, S.stddevPopulation), bolDn40 = bollingerDn(tp, 2, 40, S.stddevPopulation);
+  const { span1, span2 } = ichimokuSpans(h, l, 9, 26, 52, S.ichimokuDisplaced ? 26 : 0);
   const f = 1 + accumPct / 100;
   const aCum = sumCum(c.map((_, i) => i >= 1 && c[i - 1] * f <= h[i]));   // c(1)*(100+매집%)/100 <= h
   const bCum = sumCum(o.map((_, i) => o[i] * f <= h[i]));                  // o*(100+매집%)/100 <= h

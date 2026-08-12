@@ -4,6 +4,7 @@
 //   and ((M and N) or (O and P)) and (Q or R) and S and T and U
 // 지수이평 = EMA. "지수 1 이평" = EMA(1) = 종가. "현재가" = 0봉전 종가. "0봉전" = 현재봉(마지막).
 import { eavg, bollingerUp, crossup, ichimokuSpans, type Candle } from './hts';
+import { type YeokmaeSemantics, DEFAULT_SEMANTICS } from './types';
 
 // A/B/C 는 시장 마스터 플래그(종목구분/위험등급)로 판정 — 시장별로 다르므로 외부 주입.
 export interface YeokmaeMarketFlags {
@@ -14,6 +15,7 @@ export interface YeokmaeMarketFlags {
 export interface YeokmaeSearcherOpts {
   minTurnoverKRW?: number;   // T: 10봉 평균 거래대금 하한(원). 기본 100,000만원 = 1,000,000,000원
   turnoverKRW?: number[];    // 봉별 원화거래대금(US 는 price×volume×LS환율). 미지정 시 close×volume(KR 원화)
+  semantics?: YeokmaeSemantics;   // P0-32A: EMA seed / stddev pop / ichimoku 변위 A/B
 }
 export interface YeokmaeSearcherResult {
   matched: boolean;
@@ -29,13 +31,15 @@ export function evaluateYeokmaeSearcher(candles: readonly Candle[], flags: Yeokm
   const n = candles.length;
   if (n < SEARCHER_MIN_BARS) return { matched: false, conditions: {}, failed: ['INSUFFICIENT_HISTORY'], insufficientHistory: true };
   const i = n - 1;
+  const S = opts.semantics ?? DEFAULT_SEMANTICS;
   const o = candles.map(k => k.open); const c = candles.map(k => k.close);
   const h = candles.map(k => k.high); const l = candles.map(k => k.low); const v = candles.map(k => k.volume);
+  const em = (arr: readonly number[], p: number) => eavg(arr, p, S.emaSeed);
   const e1 = c;   // 지수 1 이평 = 종가(EMA period 1)
-  const e5 = eavg(c, 5), e20 = eavg(c, 20), e60 = eavg(c, 60), e112 = eavg(c, 112), e224 = eavg(c, 224), e448 = eavg(c, 448), e600 = eavg(c, 600);
+  const e5 = em(c, 5), e20 = em(c, 20), e60 = em(c, 60), e112 = em(c, 112), e224 = em(c, 224), e448 = em(c, 448), e600 = em(c, 600);
   const tp = candles.map(k => (k.close + k.high + k.low) / 3);
-  const bolUp40 = bollingerUp(tp, 2, 40);
-  const { span1, span2 } = ichimokuSpans(h, l, 9, 26, 52, 26);
+  const bolUp40 = bollingerUp(tp, 2, 40, S.stddevPopulation);
+  const { span1, span2 } = ichimokuSpans(h, l, 9, 26, 52, S.ichimokuDisplaced ? 26 : 0);
   const turnover = opts.turnoverKRW ?? c.map((_, k) => c[k] * v[k]);
   const minTurn = opts.minTurnoverKRW ?? YEOKMAE_DEFAULT_MIN_TURNOVER_KRW;
   const price = c[i];   // 현재가 = 0봉전 종가

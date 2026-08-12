@@ -8,13 +8,19 @@
 export interface Candle { date: string; open: number; high: number; low: number; close: number; volume: number }
 
 // ── eavg(x, n): 지수이동평균(EMA). LS HTS eavg 재현. ──
-// ⚠️ [SEED] 시드=첫 데이터값(EMA[0]=x[0]) 후 재귀. k=2/(n+1). (HTS eavg 표준. SMA-seed 아님 — 보고서 명시/테스트)
-export function eavg(x: readonly number[], n: number): number[] {
+// ⚠️ [SEED] 시드 선택(P0-32A A/B): 'first'=첫값 EMA[0]=x[0](기본,표준) / 'sma'=첫 n개 SMA 후 시작. k=2/(n+1).
+export function eavg(x: readonly number[], n: number, seed: 'first' | 'sma' = 'first'): number[] {
   const out = new Array<number>(x.length).fill(NaN);
   if (x.length === 0 || n <= 0) return out;
   const k = 2 / (n + 1);
-  let ema = x[0];
-  out[0] = ema;
+  if (seed === 'sma') {
+    if (x.length < n) return out;   // SMA 시드조차 불가 → 전부 NaN
+    let s = 0; for (let i = 0; i < n; i++) s += x[i];
+    let ema = s / n; out[n - 1] = ema;
+    for (let i = n; i < x.length; i++) { ema = ema + k * (x[i] - ema); out[i] = ema; }
+    return out;
+  }
+  let ema = x[0]; out[0] = ema;
   for (let i = 1; i < x.length; i++) { ema = ema + k * (x[i] - ema); out[i] = ema; }
   return out;
 }
@@ -40,9 +46,10 @@ export function countLastN(cum: readonly number[], i: number, n: number): number
 // ── shift(series, n): 데이터를 n봉 뒤로 이동 → shifted[i] = series[i-n]. ──
 // ⚠️ [SHIFT-DIR] 방향: LS shift(data,n) 는 데이터를 오른쪽(미래방향)으로 n봉 이동 = 현재봉 값이 n봉 전 데이터.
 //    파란점선 x=shift(...,25) → x[i]=raw[i-25](25봉 전 밴드값). look-ahead 아님(과거참조). 보고서 명시/테스트.
-export function shift(series: readonly number[], n: number): number[] {
+export function shift(series: readonly number[], n: number, dir: 'past' | 'future' = 'past'): number[] {
   const out = new Array<number>(series.length).fill(NaN);
-  for (let i = 0; i < series.length; i++) { const j = i - n; if (j >= 0) out[i] = series[j]; }
+  // past: shifted[i]=series[i-n] (표준·과거참조). future: shifted[i]=series[i+n] (⚠️ look-ahead/repaint).
+  for (let i = 0; i < series.length; i++) { const j = dir === 'past' ? i - n : i + n; if (j >= 0 && j < series.length) out[i] = series[j]; }
   return out;
 }
 
@@ -74,13 +81,13 @@ export function smaSeries(x: readonly number[], period: number): number[] {
   return out;
 }
 
-// ── bollinger_up/dn(price, mult, period, 단순이평): 볼린저 상/하단. SMA ± mult×모집단표준편차. ──
-export function bollingerUp(price: readonly number[], mult: number, period: number): number[] {
-  const mid = smaSeries(price, period); const sd = stddevmv(price, 0, period);
+// ── bollinger_up/dn(price, mult, period, 단순이평): 볼린저 상/하단. SMA ± mult×표준편차. population 선택([STDDEV-POP]). ──
+export function bollingerUp(price: readonly number[], mult: number, period: number, population = true): number[] {
+  const mid = smaSeries(price, period); const sd = stddevmv(price, population ? 0 : 1, period);
   return mid.map((m, i) => (Number.isNaN(m) || Number.isNaN(sd[i])) ? NaN : m + mult * sd[i]);
 }
-export function bollingerDn(price: readonly number[], mult: number, period: number): number[] {
-  const mid = smaSeries(price, period); const sd = stddevmv(price, 0, period);
+export function bollingerDn(price: readonly number[], mult: number, period: number, population = true): number[] {
+  const mid = smaSeries(price, period); const sd = stddevmv(price, population ? 0 : 1, period);
   return mid.map((m, i) => (Number.isNaN(m) || Number.isNaN(sd[i])) ? NaN : m - mult * sd[i]);
 }
 
