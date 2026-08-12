@@ -11,7 +11,8 @@ const VERSION = 2;
 export interface DailyBar {
   date: string;            // YYYY-MM-DD
   open: number; high: number; low: number; close: number; volume: number;
-  turnoverKRW: number | null;   // 원화거래대금(KR=원화 / US=환율적용, 공식 제공 시). 미제공=null
+  turnoverKRW: number | null;   // 원화거래대금(공식 확정 시). 단위 미확정 raw 는 여기 넣지 않는다 → null.
+  rawTurnover?: number | null;  // TR 원문 거래대금(예: KR t8413 value). 단위 실측 추정만(estimateTurnoverUnit) — KRW 단정 금지.
   confirmed: boolean;           // 확정봉 true / 진행중 당일봉 false
 }
 export interface DailyCacheBody {

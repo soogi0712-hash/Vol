@@ -45,6 +45,30 @@ export function normalizeDailyRows(rawRows: readonly any[], map: DailyFieldMap):
   return { ok: true, candles };
 }
 
+// ── 거래대금 raw value 단위 실측 추정 (P0-32C) ──
+//   LS KR value 필드 단위 미공표 → close×volume(원) 대비 raw 비율의 중앙값으로 배수를 실측 추정(단정 금지).
+//   예: close 61,400 × volume 20,213,724 = 1.241e12원, value=1,243,103 → 비율≈998,406 ≈ 1e6 → '백만원' 추정.
+export interface TurnoverUnitEstimate { samples: number; medianMultiplier: number | null; guessLabel: string }
+export function estimateTurnoverUnit(bars: readonly { close: number; volume: number; rawTurnover?: number | null }[]): TurnoverUnitEstimate {
+  const ratios: number[] = [];
+  for (const b of bars) {
+    const raw = b.rawTurnover;
+    if (raw == null || !Number.isFinite(raw) || raw <= 0) continue;
+    const notional = b.close * b.volume;   // 원 단위(KR)
+    if (!Number.isFinite(notional) || notional <= 0) continue;
+    ratios.push(notional / raw);
+  }
+  if (ratios.length === 0) return { samples: 0, medianMultiplier: null, guessLabel: 'UNKNOWN' };
+  ratios.sort((a, b) => a - b);
+  const mid = ratios[Math.floor(ratios.length / 2)];
+  // 가장 가까운 10의 거듭제곱으로 라벨링(실측 근사) — 정확 단위는 공식 미확인이라 라벨은 추정.
+  const label = mid >= 5e5 && mid < 5e6 ? 'MILLION_KRW(백만원)_추정'
+    : mid >= 5e2 && mid < 5e3 ? 'THOUSAND_KRW(천원)_추정'
+    : mid >= 0.5 && mid < 5 ? 'KRW(원)_추정'
+    : `x${mid.toPrecision(3)}_미상`;
+  return { samples: ratios.length, medianMultiplier: mid, guessLabel: label };
+}
+
 // ── 일봉 무결성 검사 — 실데이터 즉시 검증. 잘못된 데이터는 signal 계산 금지. ──
 export interface IntegrityResult { valid: boolean; errors: string[]; warnings: string[] }
 export function validateDailyIntegrity(bars: readonly { date: string; open: number; high: number; low: number; close: number; volume: number }[]): IntegrityResult {
