@@ -9,7 +9,7 @@ import {
   YEOKMAE_MIN_BARS, YEOKMAE_DEFAULT_MIN_TURNOVER_KRW, YEOKMAE_STRATEGY_VALIDATED, DEFAULT_SEMANTICS,
   type Candle, type YeokmaeMarketFlags, type YeokmaeSemantics,
 } from '../src/lib/yeokmae';
-import { DailyCache, YEOKMAE_DAILY_DIR } from './yeokmae-daily-cache';
+import { DailyCache, YEOKMAE_DAILY_ROOT } from './yeokmae-daily-cache';
 
 function loadDaily(symbol: string, market: 'KR' | 'US'): Candle[] {
   const envPath = process.env.YEOKMAE_DAILY_FILE;
@@ -22,8 +22,7 @@ function loadDaily(symbol: string, market: 'KR' | 'US'): Candle[] {
   if (cache.corrupt) { console.error(`[YEOKMAE-DIAG] 캐시 손상: ${cache.file}`); process.exit(2); }
   const candles = cache.toCandles();
   if (candles.length === 0) {
-    const flat = join(YEOKMAE_DAILY_DIR, `${symbol}.json`);
-    console.error(`[YEOKMAE-DIAG] 일봉 데이터 없음: ${flat}`);
+    console.error(`[YEOKMAE-DIAG] 일봉 데이터 없음: ${cache.file}`);
     console.error(`  → LS 일봉을 취득해 캐시에 저장하거나(HTS export → DailyCache), YEOKMAE_DAILY_FILE 로 JSON 경로 지정.`);
     console.error(`  ⚠️ 합성/복제 데이터는 사용하지 않음. 실제 일봉만.`);
     process.exit(2);

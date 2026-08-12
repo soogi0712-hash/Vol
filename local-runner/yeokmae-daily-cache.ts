@@ -1,41 +1,50 @@
-// 역매공파 일봉 영구 캐시 (P0-32A) — 실제 LS 일봉을 종목별로 저장/증분갱신.
-//   경로: local-runner/data/yeokmae-daily/<SYMBOL>.json
-//   재실행 시 전체를 다시 받지 않고 '누락 일봉만' 증분 병합한다. 합성/복제/0-padding 금지.
+// 역매공파 일봉 영구 캐시 (P0-32B) — 실제 LS 일봉 저장/증분갱신. 경로: yeokmae-daily/<market>/<symbol>.json
+//   재실행 시 전체 재취득 금지 — 누락 일봉만 증분 병합. confirmed 가 provisional 을 덮어쓴다. 합성/복제/0-padding 금지.
 import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import type { Candle } from '../src/lib/yeokmae/hts';
+import type { AdjustmentStatus } from '../src/lib/yeokmae/history';
 
-export const YEOKMAE_DAILY_DIR = resolve(process.cwd(), 'local-runner', 'data', 'yeokmae-daily');
-const VERSION = 1;
+export const YEOKMAE_DAILY_ROOT = resolve(process.cwd(), 'local-runner', 'data', 'yeokmae-daily');
+const VERSION = 2;
 
-// 캐시 봉 — OHLCV + turnover(공식제공 시) + 수정주가여부 + 출처/취득시각.
 export interface DailyBar {
-  date: string;            // YYYY-MM-DD (확정 일봉)
+  date: string;            // YYYY-MM-DD
   open: number; high: number; low: number; close: number; volume: number;
-  turnover?: number | null;    // 거래대금(공식 제공 시). 미제공=null
+  turnoverKRW: number | null;   // 원화거래대금(KR=원화 / US=환율적용, 공식 제공 시). 미제공=null
+  confirmed: boolean;           // 확정봉 true / 진행중 당일봉 false
 }
 export interface DailyCacheBody {
   version: number;
   market: 'KR' | 'US';
   symbol: string;
-  adjusted: boolean | null;    // 수정주가 여부(공식 확인 시). 미확인=null
-  source: string;              // 데이터 출처(TR명 또는 'manual'/'hts-export')
-  fetchedAt: string;           // 마지막 취득시각(ISO). ⚠️ 러너가 넘김(new Date 회피 위해 인자화)
-  bars: DailyBar[];            // 과거→최근, date 오름차순, 중복 없음
+  sourceTR: string | null;      // 취득 TR(예: t8413/g3103). manual/hts-export 도 가능. 미확정=null
+  adjustment: AdjustmentStatus; // UNKNOWN | RAW | ADJUSTED
+  fetchedAt: string;            // 마지막 취득시각 ISO(러너가 인자로 넘김 — 순수성)
+  firstDate: string | null; lastDate: string | null; barCount: number;
+  confirmedThrough: string | null;   // 마지막 확정봉 date
+  provisionalDate: string | null;    // 진행중 당일봉 date(있으면)
+  bars: DailyBar[];             // 과거→최근, date 유니크, 오름차순
 }
 
-// ── 순수 병합: 기존 + 신규 → date 유니크·오름차순. 신규가 같은 date 를 덮어씀(최근 취득 우선). ──
+// ── 순수 병합: date 유니크·오름차순. confirmed 가 provisional 을 덮어쓴다. 같은 상태면 신규 우선. ──
 export function mergeDailyBars(existing: readonly DailyBar[], incoming: readonly DailyBar[]): DailyBar[] {
   const map = new Map<string, DailyBar>();
-  for (const b of existing) if (b && b.date) map.set(b.date, b);
-  for (const b of incoming) if (b && b.date) map.set(b.date, b);   // 신규 우선(덮어쓰기)
+  for (const b of existing) if (b?.date) map.set(b.date, b);
+  for (const b of incoming) {
+    if (!b?.date) continue;
+    const prev = map.get(b.date);
+    if (!prev) { map.set(b.date, b); continue; }
+    // confirmed 우선: 기존이 confirmed 이고 신규가 provisional 이면 유지, 그 외엔 신규로 갱신.
+    if (prev.confirmed && !b.confirmed) continue;
+    map.set(b.date, b);
+  }
   return [...map.values()].sort((a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : 0);
 }
-
-// 증분 취득에 필요한 '누락 시작일' — 캐시 마지막 date 의 다음날부터만 받으면 됨(없으면 null=전체).
-export function lastCachedDate(body: DailyCacheBody | null): string | null {
-  if (!body || body.bars.length === 0) return null;
-  return body.bars[body.bars.length - 1].date;
+export function lastConfirmedCachedDate(bars: readonly DailyBar[]): string | null {
+  let last: string | null = null;
+  for (const b of bars) if (b.confirmed && (last === null || b.date > last)) last = b.date;
+  return last;
 }
 
 export class DailyCache {
@@ -44,7 +53,8 @@ export class DailyCache {
   body: DailyCacheBody | null = null;
   corrupt = false;
 
-  constructor(public readonly market: 'KR' | 'US', public readonly symbol: string, dir = YEOKMAE_DAILY_DIR) {
+  constructor(public readonly market: 'KR' | 'US', public readonly symbol: string, root = YEOKMAE_DAILY_ROOT) {
+    const dir = join(root, market);
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
     const safe = symbol.replace(/[^A-Za-z0-9_.-]/g, '_');
     this.file = join(dir, `${safe}.json`);
@@ -52,19 +62,29 @@ export class DailyCache {
   }
   load(): void {
     if (!existsSync(this.file)) return;
-    try { this.body = JSON.parse(readFileSync(this.file, 'utf8')); }
-    catch { this.corrupt = true; try { renameSync(this.file, this.file + '.corrupt'); } catch { /* noop */ } }
+    try {
+      const b = JSON.parse(readFileSync(this.file, 'utf8'));
+      if (!b || !Array.isArray(b.bars)) { this.corrupt = true; return; }
+      this.body = b;
+    } catch { this.corrupt = true; try { renameSync(this.file, this.file + '.corrupt'); } catch { /* noop */ } }
   }
   bars(): DailyBar[] { return this.body?.bars ?? []; }
-  toCandles(): Candle[] {
-    return (this.body?.bars ?? []).map(b => ({ date: b.date, open: b.open, high: b.high, low: b.low, close: b.close, volume: b.volume }));
+  toCandles(confirmedOnly = false): Candle[] {
+    return (this.body?.bars ?? []).filter(b => !confirmedOnly || b.confirmed)
+      .map(b => ({ date: b.date, open: b.open, high: b.high, low: b.low, close: b.close, volume: b.volume }));
   }
-  // 증분 병합 저장. fetchedAtISO 는 러너가 넘김(순수성 유지). source/adjusted 는 취득경로가 지정.
-  upsert(incoming: readonly DailyBar[], meta: { source: string; adjusted: boolean | null; fetchedAtISO: string }): { added: number; total: number } {
+  upsert(incoming: readonly DailyBar[], meta: { sourceTR: string | null; adjustment: AdjustmentStatus; fetchedAtISO: string }): { added: number; total: number } {
     const prev = this.body?.bars ?? [];
     const merged = mergeDailyBars(prev, incoming);
     const added = merged.length - prev.length;
-    this.body = { version: VERSION, market: this.market, symbol: this.symbol, adjusted: meta.adjusted, source: meta.source, fetchedAt: meta.fetchedAtISO, bars: merged };
+    const confirmedThrough = lastConfirmedCachedDate(merged);
+    const prov = merged.find(b => !b.confirmed) ?? null;
+    this.body = {
+      version: VERSION, market: this.market, symbol: this.symbol,
+      sourceTR: meta.sourceTR, adjustment: meta.adjustment, fetchedAt: meta.fetchedAtISO,
+      firstDate: merged.length ? merged[0].date : null, lastDate: merged.length ? merged[merged.length - 1].date : null,
+      barCount: merged.length, confirmedThrough, provisionalDate: prov ? prov.date : null, bars: merged,
+    };
     return { added, total: merged.length };
   }
   flush(): void {
