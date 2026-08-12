@@ -35,7 +35,7 @@ import {
 } from './us-position';
 import { loadLiveConfig, type LiveConfig } from './live-config';
 import { computeUSP0Checklist, formatUSP0Checklist } from './us-live-checklist';
-import { realOrderFromYeokmaeEnabled, YEOKMAE_STRATEGY_VALIDATED } from '../src/lib/yeokmae';
+import { realOrderFromYeokmaeEnabled, YEOKMAE_STRATEGY_VALIDATED, bbSellAppliesTo } from '../src/lib/yeokmae';
 import { calcBB, calcRSI, getBBSignal, validateCandleData } from '../src/lib/bollinger';
 
 function kstYmd(offsetDays = 0): string {
@@ -792,6 +792,9 @@ async function main() {
   //   BB SELL 조건(코드): 상단선 돌파 이력(aboveUpper) 후 하락 시 전량매도. 손절/시간청산은 전략에 없음(추가 안 함).
   async function evaluateSell(ctx: SymCtx, pos: USPosition, now: number): Promise<void> {
     const etDate = etDateStr(now);
+    // P0-34: 전략 SELL 분리 — YEOKMAE 태그 포지션에는 BB SELL 을 적용하지 않는다(역매공파 청산은 별도 정책 P0-34).
+    const tag = posStore.getStrategyTag(ctx.symbol);
+    if (!bbSellAppliesTo(tag)) { log.info(`[US-SELL-SKIP ${ctx.symbol}] strategyTag=${tag} → BB SELL 미적용(YEOKMAE 포지션은 P0-34 정책 전용).`); return; }
     const priceNow = ctx.bestAsk || ctx.lastPrice || 0;
     log.info(formatUSPosition({ symbol: ctx.symbol, qty: pos.qty, avgPrice: pos.avgPrice, currentPrice: priceNow, pnlPct: positionPnlPct(pos.avgPrice, priceNow) }));
     if (ctx.builder.confirmedCount < MIN_RT_CANDLES) { log.info(formatUSSellSignal({ symbol: ctx.symbol, signal: 'NONE', reason: `confirmed<${MIN_RT_CANDLES}(데이터 부족)`, qty: 0 })); return; }

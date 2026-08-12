@@ -4,6 +4,7 @@
 //  · 실현손익은 gross(수수료·세금 미반영) — LS 응답에 수수료/세금 필드가 없어 net 은 산출 불가(추측 금지).
 import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync, readdirSync } from 'node:fs';
 import { resolve, join } from 'node:path';
+import type { StrategyTag } from '../src/lib/yeokmae';
 
 const DEFAULT_DIR = resolve(process.cwd(), 'local-runner', 'data');
 const VERSION = 1;
@@ -15,6 +16,7 @@ export interface USPosition {
   sellableQty: number;      // 매도가능수량(holdings)
   avgPrice: number | null;  // 평균매입가 — 우리 BUY 체결에서 축적. 실계좌 조회엔 없음(미상=null)
   aboveUpper: boolean;      // BB 상단선 돌파 이력(매도 트리거 판정용, getBBSignal aboveUpper). 재시작 복원.
+  strategyTag: StrategyTag; // P0-34: 'YEOKMAE'|'LEGACY_BB'|'UNKNOWN'. SELL 정책 분리(YEOKMAE 에 BB SELL 금지).
 }
 
 // ── 순수 로직 (결정적 테스트 가능) ──────────────────────────
@@ -24,7 +26,7 @@ export interface USPosition {
 //   · avgPrice 는 우리 BUY 체결기록에서만 알 수 있음 → 기존 포지션이면 유지, 실계좌에만 있으면 null(미상).
 export function mergePositions(
   holdings: { symbol: string; balQty: number; sellableQty: number }[],
-  known: Map<string, { exchcd: string; avgPrice: number | null; aboveUpper: boolean }>,
+  known: Map<string, { exchcd: string; avgPrice: number | null; aboveUpper: boolean; strategyTag?: StrategyTag }>,
   exchcdOf: (symbol: string) => string,
 ): USPosition[] {
   return holdings
@@ -38,6 +40,7 @@ export function mergePositions(
         sellableQty: Math.max(0, Math.min(h.sellableQty, h.balQty)),
         avgPrice: k?.avgPrice ?? null,   // 실계좌에 avg 없음 → 우리 기록 없으면 미상
         aboveUpper: k?.aboveUpper ?? false,
+        strategyTag: k?.strategyTag ?? 'UNKNOWN',   // 우리 기록 없으면 미상(BB SELL 은 UNKNOWN 에는 적용됨)
       };
     });
 }
@@ -162,7 +165,7 @@ export function formatUSSellFill(p: { symbol: string; qty: number; price: number
 // ── 영구 저장: 포지션(avgPrice/aboveUpper) + 당일 실현손익 원장 ──────────
 interface PositionBody {
   version: number;
-  positions: Record<string, { exchcd: string; qty: number; avgPrice: number | null; aboveUpper: boolean }>;
+  positions: Record<string, { exchcd: string; qty: number; avgPrice: number | null; aboveUpper: boolean; strategyTag?: StrategyTag }>;
   realized: Record<string, { gross: number; sellCount: number }>;   // etDate → 당일 실현손익(gross)/매도횟수
 }
 export class PositionStore {
@@ -187,30 +190,32 @@ export class PositionStore {
     } catch { this.corrupt = true; try { renameSync(this.file, this.file + '.corrupt'); } catch { /* noop */ } }
   }
   // 알려진 포지션(avgPrice/aboveUpper) 조회 — mergePositions 입력용.
-  knownMap(): Map<string, { exchcd: string; avgPrice: number | null; aboveUpper: boolean }> {
-    const m = new Map<string, { exchcd: string; avgPrice: number | null; aboveUpper: boolean }>();
-    for (const [sym, p] of Object.entries(this.body.positions)) m.set(sym, { exchcd: p.exchcd, avgPrice: p.avgPrice, aboveUpper: p.aboveUpper });
+  knownMap(): Map<string, { exchcd: string; avgPrice: number | null; aboveUpper: boolean; strategyTag: StrategyTag }> {
+    const m = new Map<string, { exchcd: string; avgPrice: number | null; aboveUpper: boolean; strategyTag: StrategyTag }>();
+    for (const [sym, p] of Object.entries(this.body.positions)) m.set(sym, { exchcd: p.exchcd, avgPrice: p.avgPrice, aboveUpper: p.aboveUpper, strategyTag: p.strategyTag ?? 'UNKNOWN' });
     return m;
   }
-  // BUY 체결 반영 — 가중평균 매입가 갱신(재시작 후 실현손익 계산 근거). flush 필요.
-  applyBuyFill(symbol: string, exchcd: string, fillQty: number, fillPrice: number): void {
+  // P0-34: 포지션 strategyTag 조회(미기록=UNKNOWN). BB SELL 적용여부 판정용.
+  getStrategyTag(symbol: string): StrategyTag { return this.body.positions[symbol]?.strategyTag ?? 'UNKNOWN'; }
+  // BUY 체결 반영 — 가중평균 매입가 갱신(재시작 후 실현손익 계산 근거). strategyTag 기본 LEGACY_BB(현재 유일 BUYER=BB). flush 필요.
+  applyBuyFill(symbol: string, exchcd: string, fillQty: number, fillPrice: number, strategyTag: StrategyTag = 'LEGACY_BB'): void {
     if (!(fillQty > 0)) return;
-    const cur = this.body.positions[symbol] ?? { exchcd, qty: 0, avgPrice: null, aboveUpper: false };
+    const cur = this.body.positions[symbol] ?? { exchcd, qty: 0, avgPrice: null, aboveUpper: false, strategyTag };
     const prevQty = cur.qty; const prevAvg = cur.avgPrice ?? 0;
     const newQty = prevQty + fillQty;
     const newAvg = newQty > 0 ? (prevQty * prevAvg + fillQty * fillPrice) / newQty : fillPrice;
-    this.body.positions[symbol] = { exchcd: exchcd || cur.exchcd, qty: newQty, avgPrice: newAvg, aboveUpper: cur.aboveUpper };
+    this.body.positions[symbol] = { exchcd: exchcd || cur.exchcd, qty: newQty, avgPrice: newAvg, aboveUpper: cur.aboveUpper, strategyTag: cur.strategyTag ?? strategyTag };
   }
   // aboveUpper 플래그 저장(BB 상단돌파 이력) — 매도 트리거 판정. flush 필요.
   setAboveUpper(symbol: string, exchcd: string, aboveUpper: boolean): void {
-    const cur = this.body.positions[symbol] ?? { exchcd, qty: 0, avgPrice: null, aboveUpper: false };
+    const cur = this.body.positions[symbol] ?? { exchcd, qty: 0, avgPrice: null, aboveUpper: false, strategyTag: 'UNKNOWN' as StrategyTag };
     this.body.positions[symbol] = { ...cur, exchcd: exchcd || cur.exchcd, aboveUpper };
   }
-  // 실계좌 holdings 로 수량 동기화(진실원본). 보유 0 이면 포지션 제거. flush 필요.
+  // 실계좌 holdings 로 수량 동기화(진실원본). 보유 0 이면 포지션 제거. strategyTag 보존. flush 필요.
   syncQty(symbol: string, qty: number, sellableQty: number): void {
     const cur = this.body.positions[symbol];
     if (!(qty > 0)) { if (cur) delete this.body.positions[symbol]; return; }
-    this.body.positions[symbol] = { exchcd: cur?.exchcd ?? '', qty, avgPrice: cur?.avgPrice ?? null, aboveUpper: cur?.aboveUpper ?? false };
+    this.body.positions[symbol] = { exchcd: cur?.exchcd ?? '', qty, avgPrice: cur?.avgPrice ?? null, aboveUpper: cur?.aboveUpper ?? false, strategyTag: cur?.strategyTag ?? 'UNKNOWN' };
   }
   getPosition(symbol: string): { exchcd: string; qty: number; avgPrice: number | null; aboveUpper: boolean } | null {
     return this.body.positions[symbol] ?? null;

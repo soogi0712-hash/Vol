@@ -9,6 +9,7 @@ export * from './calendar';
 export * from './historical';
 export * from './live';
 export * from './snapshot';
+export * from './exit';
 
 import { evaluateAllYeokmae } from './signals';
 import { evaluateYeokmaeSearcher, type YeokmaeMarketFlags, type YeokmaeSearcherOpts } from './searcher';
