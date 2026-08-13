@@ -34,6 +34,7 @@ async function main() {
     pilotLive: process.env.YEOKMAE_PILOT_LIVE === 'true',
     legacyBbBlocked: process.env.LEGACY_BB_LIVE_ENABLED !== 'true',
     budgetUSD: Number(process.env.LS_US_PER_TRADE_BUDGET_USD || 60) || 60,
+    totalCapitalKRW: Number(process.env.LS_US_TOTAL_CAPITAL_KRW || 1000000) || 1000000,
   };
   log.info(`===== [YEOKMAE-PILOT-LIVE] market=${market}${dryRun ? ' (--dry-run: POST 0)' : ''} =====`);
   log.info(`[YEOKMAE-SAFETY] LS_LIVE_TRADING=${env.liveTrading} YEOKMAE_LIVE_TRADING=${env.yeokmaeLive} YEOKMAE_PILOT_LIVE=${env.pilotLive} · YEOKMAE_STRATEGY_VALIDATED=${YEOKMAE_STRATEGY_VALIDATED} YEOKMAE_SEMANTICS_VERIFIED=${YEOKMAE_SEMANTICS_VERIFIED} · PILOT=사용자승인 소액시험(검증완료 아님)`);

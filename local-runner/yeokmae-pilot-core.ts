@@ -34,7 +34,7 @@ export interface ReconDiag {
 export function logPilotPreflight(log: (m: string) => void, pf: PilotPreflight): void {
   if (!pf.ok) { log(`[YEOKMAE-PILOT-PREFLIGHT] FAIL_CLOSED(${pf.failReason}) → 주문 없음.`); return; }
   if (pf.gateInput) {
-    log(formatYeokmaePilotChecklist(pf.gateInput, { strategyTag: 'YEOKMAE', orderBudgetUSD: pf.budgetUSD, calcQty: pf.qty, committedKRW: 0, remainingKRW: 0, sellPolicyArmed: true, exitConfig: DEFAULT_YEOKMAE_EXIT_CONFIG }));
+    log(formatYeokmaePilotChecklist(pf.gateInput, { strategyTag: 'YEOKMAE', orderBudgetUSD: pf.budgetUSD, calcQty: pf.qty, committedKRW: pf.committedKRW, remainingKRW: pf.remainingKRW, sellPolicyArmed: true, exitConfig: DEFAULT_YEOKMAE_EXIT_CONFIG }));
   }
   // 대사 진단 — '0건 정상' vs 'API 실패' 구분(추측 금지). 실 rsp_cd 노출.
   if (pf.reconDiag) {
@@ -46,6 +46,7 @@ export function logPilotPreflight(log: (m: string) => void, pf: PilotPreflight):
   log(`[YEOKMAE-PILOT-PREFLIGHT-VALUES] cashOnly=${pf.cashOnly} orderableQty=${pf.orderable} capitalGuardOk=${pf.capitalGuardOk} perSymbolBudgetOk=${pf.perSymbolBudgetOk}`
     + ` pending=${!pf.noPending}(exchPendingBuys=${pf.exchangePendingBuys}) reconciliationOk=${pf.reconciliationOk} duplicateSymbolDate=${!pf.notDuplicateOrder}`
     + ` currentYeokmaePositions=${pf.currentYeokmaePositions}/${1} currentPrice=${pf.price} calculatedQty=${pf.qty} orderAmount=${pf.orderAmount.toFixed(2)}`);
+  log(`[YEOKMAE-PILOT-CAPITAL] totalCapitalKRW=${Math.round(pf.totalCapitalKRW)} committedKRW=${Math.round(pf.committedKRW)} remainingKRW=${Math.round(pf.remainingKRW)} baseXchRate=${pf.baseXchRate} perTradeBudgetUSD=${pf.budgetUSD}`);
   log(`[YEOKMAE-PILOT-LIVE-GATE] gateAllowed=${pf.gateAllowed} gateReasons=[${pf.gateReasons.join(',')}] PILOT_REAL_ORDER_ENABLED=${pf.realOrderEnabled} blockers=[${pf.realOrderReasons.join(',')}]`);
 }
 
@@ -53,6 +54,7 @@ export interface PilotPreflight {
   ok: boolean; failReason?: string;
   market: 'KR' | 'US'; candidate: YeokmaeLiveCandidate | null; exchcd: string;
   price: number; orderable: number; qty: number; orderAmount: number; budgetUSD: number;
+  committedKRW: number; remainingKRW: number; totalCapitalKRW: number; baseXchRate: number;
   cashOnly: boolean; capitalGuardOk: boolean; perSymbolBudgetOk: boolean;
   noPending: boolean; reconciliationOk: boolean; notDuplicateOrder: boolean;
   exchangePendingBuys: number; currentYeokmaePositions: number;
@@ -66,12 +68,13 @@ export interface PilotPreflight {
 // 모든 게이트를 실제 조회로 채운다(POST 없음). scrub 로 민감정보 마스킹.
 export async function pilotPreflight(
   cfg: LocalLSConfig, token: string, market: 'KR' | 'US',
-  env: { liveTrading: boolean; yeokmaeLive: boolean; pilotLive: boolean; legacyBbBlocked: boolean; budgetUSD: number },
+  env: { liveTrading: boolean; yeokmaeLive: boolean; pilotLive: boolean; legacyBbBlocked: boolean; budgetUSD: number; totalCapitalKRW: number },
   scrub: (s: string) => string,
 ): Promise<PilotPreflight> {
   const posStore = new YeokmaePositionStore(); posStore.load();
   const base: PilotPreflight = {
     ok: false, market, candidate: null, exchcd: '', price: 0, orderable: 0, qty: 0, orderAmount: 0, budgetUSD: env.budgetUSD,
+    committedKRW: 0, remainingKRW: env.totalCapitalKRW, totalCapitalKRW: env.totalCapitalKRW, baseXchRate: 1,
     cashOnly: false, capitalGuardOk: false, perSymbolBudgetOk: false, noPending: false, reconciliationOk: false, notDuplicateOrder: false,
     exchangePendingBuys: 0, currentYeokmaePositions: posStore.corrupt ? -1 : posStore.all().length,
     reconDiag: null,
@@ -105,6 +108,7 @@ export async function pilotPreflight(
   let price = 0, orderable = 0, qty = 0, cashOnly = false, exchcd = '', delaygb = 'R';
   let reconciliationOk = false, exchangePendingBuys = 0;
   let reconDiag: ReconDiag | null = null;
+  let baseXchRate = 1;   // KR=원화(1). US=LS 기준환율(예수금 조회에서).
   if (market === 'US') {
     const us = loadUSSymbols(); const sym = us.ok.find(s => s.symbol === candidate.symbol.toUpperCase());
     if (!sym) return failClosed(`US 종목 미확인: ${candidate.symbol}`);
@@ -113,6 +117,7 @@ export async function pilotPreflight(
     let dep; try { dep = await getLSUSDeposit(cfg, token); } catch (e) { return failClosed(`US 예수금 조회 실패: ${scrub(String(e))}`); }
     if (!dep.ok) return failClosed('US 예수금 조회 실패(ok=false)');
     cashOnly = isCashOnly(dep);
+    baseXchRate = dep.baseXchRate > 0 ? dep.baseXchRate : 0;   // 총자본(원) 한도 환산용
     orderable = price > 0 ? Math.floor(usCashOnlyUsdCap(dep, {}) / price) : 0;
     qty = computeUSOrderQty({ perTradeBudgetUsd: env.budgetUSD, orderableQty: orderable, bestAsk: price, maxQty: null }).finalQty;
     try {
@@ -144,7 +149,12 @@ export async function pilotPreflight(
   if (!(price > 0)) return failClosed('실시간가 미확보(quote stale) → 손절/익절 오발동 방지 위해 주문 금지');
 
   const noPending = localNoPending && exchangePendingBuys === 0;
-  const capitalGuardOk = qty >= 1 && cashOnly;
+  // 총자본 100만원(원) 한도 — PILOT 은 포지션 0개에서만 진행하므로 committed=이번 주문. US 는 환율로 원화 환산.
+  const totalCapitalKRW = env.totalCapitalKRW;
+  const committedKRW = market === 'US' ? qty * price * baseXchRate : qty * price;
+  const remainingKRW = totalCapitalKRW - committedKRW;
+  const xchOk = market === 'US' ? baseXchRate > 0 : true;   // US 는 환율 확보돼야 원화한도 판정 가능
+  const capitalGuardOk = qty >= 1 && cashOnly && xchOk && committedKRW > 0 && committedKRW <= totalCapitalKRW;
   const perSymbolBudgetOk = qty >= 1;
   const currentYeokmaePositions = posStore.all().length;
 
@@ -158,6 +168,7 @@ export async function pilotPreflight(
 
   return {
     ...base, ok: true, exchcd, price, orderable, qty, orderAmount: qty * price, delaygb,
+    committedKRW, remainingKRW, totalCapitalKRW, baseXchRate,
     cashOnly, capitalGuardOk, perSymbolBudgetOk, noPending, reconciliationOk, notDuplicateOrder, exchangePendingBuys, currentYeokmaePositions,
     reconDiag,
     gateInput, gateAllowed: gate.allowed, gateReasons: gate.reasons, realOrderEnabled: rl.enabled, realOrderReasons: rl.reasons,

@@ -1,10 +1,12 @@
 // 역매공파 실제 신호 종목 (P0-32G) — 실행: npm run yeokmae:signals -- US|KR
 //   캐시 전체에서 5신호 중 하나라도 ON 인 종목만 출력([YEOKMAE-REAL-SIGNAL]). 원본 무변경, 주문 0.
 //   ⚠️ 역배열만 true 이고 5신호 모두 false 인 종목은 BUY 후보 아님(여기 출력 안 됨).
+import { loadEnvLocal } from './env';
 import { scanCachedDiscovery } from './yeokmae/discovery-scan';
 import { conditionsLine, summarize, SIGNAL_TYPES } from './yeokmae/discovery';
 
 function main() {
+  loadEnvLocal();   // P0-35US: .env.local 자동로드(일관성)
   const market = ((process.argv[2] || 'US').toUpperCase() === 'KR' ? 'KR' : 'US') as 'KR' | 'US';
   console.log(`===== [YEOKMAE-SIGNALS] market=${market} — 5신호 중 1개+ ON 종목 (주문 0) =====`);
   console.log(`[YEOKMAE-SAFETY] YEOKMAE_STRATEGY_VALIDATED=false · REAL_ORDER_FROM_YEOKMAE=false · 관찰 전용`);
