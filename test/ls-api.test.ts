@@ -469,11 +469,23 @@ describe('해외 주문/체결/예수금 (공식 필드)', () => {
     expect(r.ordNo).toBe('141');
   });
 
-  it('isUSOrderSuccess — 00000 또는 OrdNo 존재 시 성공(코드 오탐 방지)', () => {
+  it('isUSOrderSuccess — 00000/00040 또는 OrdNo 존재 시 성공(코드 오탐 방지)', () => {
     expect(isUSOrderSuccess('00000', null)).toBe(true);
+    expect(isUSOrderSuccess('00040', null)).toBe(true);      // P0-35US6: 00040 "매수 주문이 완료되었습니다"(실측)
     expect(isUSOrderSuccess('99999', '141')).toBe(true);     // 코드 몰라도 OrdNo 있으면 성공
     expect(isUSOrderSuccess('40510', null)).toBe(false);     // 거부
     expect(isUSOrderSuccess('99999', '(unknown)')).toBe(false);
+  });
+  it('P0-35US6 COSAT00301 rsp_cd=00040 → place 성공(throw 없음, PRGO 재현)', async () => {
+    stubFetch((url, init) => {
+      expect(init.headers['tr_cd']).toBe('COSAT00301');
+      return { json: { rsp_cd: '00040', rsp_msg: '매수 주문이 완료되었습니다.', COSAT00301OutBlock2: { OrdNo: 777 } } };
+    });
+    // 00040 이 성공코드로 등록되어 lsPost 가 throw 하지 않아야 한다(기존엔 SEND_EXCEPTION 유발).
+    const r = await placeLSUSBuyOrder(cfg, 'T', { exchcd: '81', symbol: 'PRGO', qty: 4, price: 12.86 });
+    expect(r.rspCd).toBe('00040');
+    expect(r.ordNo).toBe('777');   // OutBlock2 에서 OrdNo 파싱
+    expect(isUSOrderSuccess(r.rspCd, r.ordNo)).toBe(true);
   });
   it('P0-28 prevYmd — 하루 전(월/년 경계 포함)', () => {
     expect(prevYmd('20260807')).toBe('20260806');

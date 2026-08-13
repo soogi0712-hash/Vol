@@ -1,0 +1,129 @@
+// 역매공파 지속실행 러너 (P0-35US6) — 실행: npm run yeokmae:live -- US [--once]
+//   오늘 미국장 동안 계속: ① broker 실보유 복원(원장 우선순위: broker evidence) → ② 시작요약 →
+//   ③ quote 갱신 → ④ P0-34 SELL 감시(관찰) → ⑤ 신규 confirmed 신호 탐색(단, PILOT 1포지션 제한: 보유 중 신규 BUY 0).
+//   ⚠️ 이번 빌드는 POST 금지(추가 BUY/SELL 실주문 없음). 재주문/candle·order lock 삭제 절대 금지. 관찰/복원/감시 전용.
+import { loadEnvLocal } from './env';
+import { createLogger } from './logger';
+import { loadConfig, getTokenCached, resolveUSQuote } from './ls-client';
+import { makeScrubber } from './mask';
+import { loadUSSymbols } from './universe';
+import { YeokmaePositionStore } from './yeokmae-position-store';
+import { YEOKMAE_DAILY_ROOT } from './yeokmae-daily-cache';
+import { marketDate } from './yeokmae-pilot-core';
+import { recoverYeokmaeUSFromBroker, applyYeokmaeRecoveryToLedger, summarizeYeokmaeLive } from './yeokmae-recover';
+import { getLSUSHoldings, getLSUSPrice, usEtSession } from '../src/lib/ls-api';
+import {
+  evaluateYeokmaeExit, updateHighestPrice, formatYeokmaeExitPolicy, DEFAULT_YEOKMAE_EXIT_CONFIG,
+  YEOKMAE_PILOT_MAX_POSITIONS, YEOKMAE_STRATEGY_VALIDATED, YEOKMAE_SEMANTICS_VERIFIED,
+} from '../src/lib/yeokmae';
+import { existsSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
+
+const SIGNAL_KEYS = ['112_ORIGINAL', '224_ORIGINAL', '112_UPGRADE', '224_UPGRADE', 'LONG_TERM'];
+
+// real-signals.json → symbol별 진입근거(confirmedDate/matchedSignals/exchange) 매핑(있으면).
+function loadSignalMeta(market: 'US'): Map<string, { confirmedDate: string | null; matchedSignals: string[]; exchange: string }> {
+  const m = new Map<string, { confirmedDate: string | null; matchedSignals: string[]; exchange: string }>();
+  const file = join(YEOKMAE_DAILY_ROOT, `${market}.real-signals.json`);
+  if (!existsSync(file)) return m;
+  try {
+    const signals: any[] = JSON.parse(readFileSync(file, 'utf8')).signals ?? [];
+    for (const s of signals) {
+      const matched = SIGNAL_KEYS.filter(k => s[k] === true);
+      m.set(String(s.symbol).toUpperCase(), { confirmedDate: s.confirmedDate ?? null, matchedSignals: matched, exchange: String(s.exchange ?? '') });
+    }
+  } catch { /* 무시 — 메타 없어도 복원은 broker evidence 로 진행 */ }
+  return m;
+}
+
+async function watchCycle(cfg: any, token: string, posStore: YeokmaePositionStore, log: (m: string) => void): Promise<void> {
+  const held = posStore.all().filter(p => p.qty > 0);
+  const delaygb = resolveUSQuote().delaygb ?? 'R';
+  for (const pos of held) {
+    let price = 0; let quoteOk = false;
+    try { const q = await getLSUSPrice(cfg, token, pos.symbol, pos.exchcd, delaygb); price = q.price; quoteOk = price > 0; }
+    catch (e) { log(`[YEOKMAE-LIVE-WATCH] ${pos.symbol} quote 조회실패 → SELL 판정 보류(관찰). ${e instanceof Error ? e.message : String(e)}`); continue; }
+    if (quoteOk) { posStore.updateHighest(pos.symbol, price); posStore.flush(); }
+    const decision = evaluateYeokmaeExit({
+      state: { entryAvgPrice: pos.entryAvgPrice, qty: pos.qty, highestPrice: updateHighestPrice(pos.highestPrice, price), holdDays: pos.holdDays },
+      config: { ...DEFAULT_YEOKMAE_EXIT_CONFIG, stopLossPct: pos.stopLossPct, takeProfitPct: pos.takeProfitPct, profitMode: pos.profitMode, trailingActivatePct: pos.trailingActivatePct, trailingDrawdownPct: pos.trailingDrawdownPct },
+      quote: { reliableRealtime: quoteOk, price },
+    });
+    log(`[YEOKMAE-LIVE-WATCH] ${pos.symbol} qty=${pos.qty} entryAvg=${pos.entryAvgPrice.toFixed(2)} price=${quoteOk ? price.toFixed(2) : 'n/a'} pnl=${decision.pnlPct == null ? 'n/a' : decision.pnlPct.toFixed(2) + '%'} action=${decision.action}${decision.reason ? ` reason=${decision.reason}` : ''} holdDays=${pos.holdDays}/${DEFAULT_YEOKMAE_EXIT_CONFIG.maxHoldDays}`);
+    if (decision.action === 'SELL') {
+      log(`[YEOKMAE-LIVE-SELL-SIGNAL] ${pos.symbol} reason=${decision.reason} pnl=${decision.pnlPct?.toFixed(2)}% — ⚠️ 이번 빌드 POST 금지(관찰). 실 SELL 은 후속 커밋에서 게이트 활성 후.`);
+    }
+  }
+}
+
+async function main() {
+  loadEnvLocal();
+  const log = createLogger('yeokmae-live');
+  const args = process.argv.slice(2);
+  const market = (args.find(a => !a.startsWith('--')) || '').toUpperCase();
+  const once = args.includes('--once');
+  if (market !== 'US') { log.error('사용법: npm run yeokmae:live -- US [--once] (현재 US 전용)'); process.exit(1); return; }
+  const intervalSec = Math.max(10, Number(process.env.YEOKMAE_LIVE_INTERVAL_SEC || 30) || 30);
+
+  log.info(`===== [YEOKMAE-LIVE] market=US 지속실행(복원→감시) — ⚠️ 이번 빌드 BUY/SELL POST=0 =====`);
+  log.info(`[YEOKMAE-SAFETY] YEOKMAE_STRATEGY_VALIDATED=${YEOKMAE_STRATEGY_VALIDATED} YEOKMAE_SEMANTICS_VERIFIED=${YEOKMAE_SEMANTICS_VERIFIED} · PILOT 1포지션 제한 유지`);
+  log.info(formatYeokmaeExitPolicy(DEFAULT_YEOKMAE_EXIT_CONFIG));
+
+  let cfg; try { cfg = loadConfig(); } catch (e) { log.error(`[YEOKMAE-LIVE] FAIL_CLOSED(config: ${String(e)})`); process.exit(2); return; }
+  const scrub = makeScrubber([cfg.appKey, cfg.appSecret]);
+  let token: string;
+  try { token = await getTokenCached(cfg); } catch (e) { log.error(`[YEOKMAE-LIVE] FAIL_CLOSED(token: ${scrub(String(e))})`); process.exit(2); return; }
+
+  const posStore = new YeokmaePositionStore(); posStore.load();
+  if (posStore.corrupt) { log.error('[YEOKMAE-LIVE] 원장 파일 손상 → 복원/감시 중단(fail-closed).'); process.exit(2); return; }
+
+  const etDate = marketDate(-5);
+  const et = usEtSession(new Date());
+  log.info(`[YEOKMAE-LIVE-SESSION] session=${et.session} etTime=${et.etTime} etDate=${etDate}`);
+
+  // ── ① broker 실보유 복원 (broker evidence 우선, 재POST/lock 삭제 없음) ──
+  const meta = loadSignalMeta('US');
+  const uni = loadUSSymbols();
+  let holdingsOk = false; let heldSymbols: string[] = [];
+  try {
+    const hold = await getLSUSHoldings(cfg, token, etDate);
+    holdingsOk = hold.ok; heldSymbols = hold.holdings.map(h => h.symbol.toUpperCase());
+    log.info(`[YEOKMAE-LIVE-HOLDINGS] ok=${hold.ok} rsp_cd=${hold.rspCd} 보유종목=[${heldSymbols.join(',') || '없음'}] rawRows=${hold.rawRows}`);
+  } catch (e) { log.warn(`[YEOKMAE-LIVE-HOLDINGS] 조회 실패 → 원장 기존값 유지(감시만). ${scrub(String(e))}`); }
+
+  if (holdingsOk) {
+    for (const sym of heldSymbols) {
+      const u = uni.ok.find(s => s.symbol === sym);
+      const md = meta.get(sym);
+      const exchcd = u?.exchcd ?? '';
+      if (!exchcd) { log.warn(`[YEOKMAE-LIVE-RECOVER] ${sym} exchcd 미해결(universe 없음) → 복원 보류(추측 금지).`); continue; }
+      try {
+        const rec = await recoverYeokmaeUSFromBroker(cfg, token, { symbol: sym, exchcd, ordDate: etDate, baseDate: etDate });
+        log.info(`[YEOKMAE-LIVE-RECOVER] ${sym} exchcd=${exchcd} ordNo=${rec.ordNo ?? '-'} ordQty=${rec.ordQty} execQty=${rec.execQty} unfilled=${rec.unfilledQty} entryAvg=${rec.entryAvgPrice.toFixed(2)} 보유수량=${rec.holdingBalQty} sellable=${rec.holdingSellableQty} evidenceOk=${rec.evidenceOk} ${rec.reason}`);
+        const applied = applyYeokmaeRecoveryToLedger(posStore, rec, { entryDate: (md?.confirmedDate ?? etDate), confirmedSignalDate: md?.confirmedDate ?? null, matchedSignals: md?.matchedSignals ?? [] });
+        log.info(`[YEOKMAE-LIVE-LEDGER] ${sym} applied=${applied.applied} qty=${applied.qty} ${applied.reason}`);
+      } catch (e) { log.warn(`[YEOKMAE-LIVE-RECOVER] ${sym} 복원 조회 실패 → 보류. ${scrub(String(e))}`); }
+    }
+  }
+
+  // ── ② 시작요약(item 3·4 필수 확인값) ──
+  const startup = summarizeYeokmaeLive(posStore.all(), YEOKMAE_PILOT_MAX_POSITIONS);
+  for (const p of startup.positions) {
+    log.info(`[YEOKMAE-LIVE-POSITION] symbol=${p.symbol} qty=${p.qty} strategyTag=${p.strategyTag} entryAvgPrice=${p.entryAvgPrice.toFixed(2)} confirmedSignalDate=${p.confirmedSignalDate ?? '-'} matchedSignals=[${p.matchedSignals.join(',')}] SELL_ARMED=${p.sellArmed} (STOP_LOSS=-${p.stopLossPct}% TAKE_PROFIT=+${p.takeProfitPct}% MAX_HOLD_DAYS=${p.maxHoldDays})`);
+  }
+  log.info(`[YEOKMAE-LIVE-STARTUP] currentYeokmaePositions=${startup.currentYeokmaePositions}/${startup.maxPositions} additionalBuyAllowed=${startup.additionalBuyAllowed} SELL_ARMED=${startup.sellArmed} · BB SELL 미적용(별도 저장소 물리분리)`);
+  if (!startup.additionalBuyAllowed) log.info(`[YEOKMAE-LIVE-BUY-GATE] 보유 ${startup.currentYeokmaePositions}/${startup.maxPositions} → 신규 BUY 차단(additionalBuyAllowed=false). 보유청산 후에만 신규 진입.`);
+
+  // ── ③~⑤ 지속 감시 루프 (POST 없음) ──
+  await watchCycle(cfg, token, posStore, (m) => log.info(m));
+  if (once) { log.info('[YEOKMAE-LIVE] --once → 1회 감시 후 종료(POST 0).'); return; }
+
+  log.info(`[YEOKMAE-LIVE] ${intervalSec}s 간격 지속 감시 시작(Ctrl+C 종료). 신규 BUY 는 pilot-live 로 별도 진행(보유 중 차단).`);
+  const tick = async () => {
+    try { await watchCycle(cfg, token, posStore, (m) => log.info(m)); }
+    catch (e) { log.warn(`[YEOKMAE-LIVE] 감시 tick 오류(계속). ${scrub(String(e))}`); }
+    setTimeout(tick, intervalSec * 1000);
+  };
+  setTimeout(tick, intervalSec * 1000);
+}
+main();

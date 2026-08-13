@@ -94,7 +94,9 @@ export const LS_SUCCESS_CODES: Record<string, string[]> = {
 
   CSPAT00601: ['00000', '00040'],   // 현물주문 — 00040 "매수 주문이 완료되었습니다."(실계정 확인) = 정상
   CSPAT00801: ['00000', '00156'],   // 현물취소주문 — 00156(취소 접수) 도 정상(공식 resExample)
-  COSAT00301: ['00000'],            // 미국시장주문 — 공식 확인 성공코드(00000). 그 외 코드+OrdNo 는 아래 isUSOrderSuccess 로 판정
+  // P0-35US6: 미국시장주문 — 00000 외 00040 "매수 주문이 완료되었습니다."(실계정 PRGO 실측, HTS 주문 존재 확인) = 정상.
+  //   ⚠️ COSAT00301 한정(전역/타 TR 금지). KR 현물 CSPAT00601 과 동일 메시지·코드 패턴. 그 외 코드+OrdNo 는 isUSOrderSuccess 로 판정.
+  COSAT00301: ['00000', '00040'],
 };
 /** 정상이나 데이터가 없는(빈 결과) 코드 — 잔고 0 으로 처리한다. */
 export const LS_EMPTY_CODES: Record<string, string[]> = {
@@ -737,8 +739,10 @@ export async function getLSUSBalance(cfg: LSConfig, token: string, baseDateYYYYM
 //   OrdMktCode=거래소코드(exchcd), IsuNo=심볼, OvrsOrdPrc=해외주문가(지정가).
 export interface LSOrderResult { rspCd: string; rspMsg: string; ordNo: string | null; raw: any; diag: LSHttpDiag; }
 
-// COSAT00301 주문 성공 판정 — 성공코드(00000) 또는 주문번호(OrdNo) 존재. (KR 00040 오탐 사고 방지 패턴 이식)
-export const US_ORDER_SUCCESS_CODES = new Set(['00000']);
+// COSAT00301 주문 성공 판정 — 성공코드(00000/00040) 또는 주문번호(OrdNo) 존재.
+//   P0-35US6: 00040 "매수 주문이 완료되었습니다."(실계정 PRGO 실측) 을 COSAT00301 성공코드로 등록.
+//   ⚠️ 이 Set 은 COSAT00301(isUSOrderSuccess) 전용 — 전역/타 TR 성공판정에 쓰지 않는다.
+export const US_ORDER_SUCCESS_CODES = new Set(['00000', '00040']);
 export function isUSOrderSuccess(rspCd: string, ordNo: string | null | undefined): boolean {
   return (ordNo != null && ordNo !== '' && ordNo !== '(unknown)') || US_ORDER_SUCCESS_CODES.has(rspCd);
 }
@@ -767,9 +771,11 @@ async function placeLSUSOrderRaw(
     },
   };
   const { data, rspCd, rspMsg, diag } = await lsPost(token, '/overseas-stock/order', 'COSAT00301', inb);
-  // 응답 주문번호 필드는 공식 카탈로그 resExample 이 비어 있어 미확정 → 있으면 OrdNo 사용, 없으면 null.
-  // 확정 주문번호/체결/미체결은 COSAQ00102(계좌주문체결내역조회)로 재조회한다.
-  const ob = data.COSAT00301OutBlock1 || data.COSAT00301OutBlock2 || {};
+  // 응답 주문번호 필드는 공식 카탈로그 resExample 이 비어 있어 미확정 → OrdNo 를 담은 OutBlock 을 우선 선택(둘 다 확인).
+  //   P0-35US6: OutBlock1 이 존재해도 OrdNo 가 OutBlock2 에 있을 수 있어 'OrdNo 보유 블록' 을 우선한다(단순 || 는 놓칠 수 있음).
+  //   확정 주문번호/체결/미체결은 COSAQ00102(계좌주문체결내역조회)로 재조회해 최종 복원한다.
+  const b1 = data.COSAT00301OutBlock1, b2 = data.COSAT00301OutBlock2;
+  const ob = (b1 && b1.OrdNo != null) ? b1 : (b2 && b2.OrdNo != null) ? b2 : (b1 || b2 || {});
   const ordNo = ob.OrdNo != null ? String(ob.OrdNo) : null;
   return { rspCd, rspMsg, ordNo, raw: data, diag };
 }
