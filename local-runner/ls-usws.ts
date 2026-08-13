@@ -481,8 +481,9 @@ async function main() {
     cancel: (pp) => cancelLSUSOrder(cfg, token, pp),
     // 현금 주문가능금액 — 확정 경로(USD현금)만. 타통화+원화 선환전은 실측확인 전까지 제외(cash-only, 레버리지 절대 미사용).
     cashOrderable: async () => {
-      try { const d = await getLSUSDeposit(cfg, token); return { ok: d.ok, cash: usCashOnlyUsdCap(d, { crossWonVerified: liveCfg.crossWonVerified }) }; }
-      catch (e) { log.warn(`[US] 현금 주문가능금액 조회 실패: ${scrub(String(e))}`); return { ok: false, cash: 0 }; }
+      // ⚠️ AAPL 성공경로: crossWonVerified 를 전달 → cash-only 상한에 통합증거금(원화현금) USD환산 포함(PILOT 과의 차이점).
+      try { const d = await getLSUSDeposit(cfg, token); return { ok: d.ok, cash: usCashOnlyUsdCap(d, { crossWonVerified: liveCfg.crossWonVerified }), rspCd: d.rspCd, rspMsg: scrub(d.rspMsg), httpStatus: d.diag?.status ?? null }; }
+      catch (e) { log.warn(`[US] 현금 주문가능금액 조회 실패: ${scrub(String(e))}`); return { ok: false, cash: 0, rspCd: 'EXCEPTION', rspMsg: scrub(String(e)) }; }
     },
     now: () => Date.now(),
     log: (m) => log.info(scrub(m)),

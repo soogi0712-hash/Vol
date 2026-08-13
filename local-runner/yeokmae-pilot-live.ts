@@ -70,11 +70,12 @@ async function main() {
       place: (pp) => placeLSUSBuyOrder(cfg, token, pp),
       query: (pp) => queryLSUSOrderExec(cfg, token, pp, { emptyCodes: LS_US_ORDEREXEC_EMPTY_CODES }),
       cancel: (pp) => cancelLSUSOrder(cfg, token, pp),
-      cashOrderable: async () => { const d = await getLSUSDeposit(cfg, token); return { ok: d.ok, cash: usCashOnlyUsdCap(d, {}) }; },
+      // P0-35US4: cash 값은 변경하지 않음(usCashOnlyUsdCap(d,{}) = 순수 USD, 게이트 blocker 유지). rspCd/msg 는 진단 노출용.
+      cashOrderable: async () => { const d = await getLSUSDeposit(cfg, token); return { ok: d.ok, cash: usCashOnlyUsdCap(d, {}), rspCd: d.rspCd, rspMsg: scrub(d.rspMsg), httpStatus: d.diag?.status ?? null }; },
       now: () => Date.now(), log: (m) => log.info(m),
     };
     return {
-      executeBuy: async (o: any) => { const out = await executeBuyOrder(traderDeps, { orders, exchcd: o.exchcd, symbol: o.symbol, candleDatetime: o.candleDatetime, qty: o.qty, price: o.price, etDate: o.etDate, dailyMaxBuys: 1 }); return { status: out.status, ordNo: out.ordNo, filledQty: out.status === 'placed-filled' ? o.qty : 0, fillPrice: o.price }; },
+      executeBuy: async (o: any) => { const out = await executeBuyOrder(traderDeps, { orders, exchcd: o.exchcd, symbol: o.symbol, candleDatetime: o.candleDatetime, qty: o.qty, price: o.price, etDate: o.etDate, dailyMaxBuys: 1, reqTag: 'US-PILOT-BUY' }); return { status: out.status, ordNo: out.ordNo, filledQty: out.status === 'placed-filled' ? o.qty : 0, fillPrice: o.price }; },
       recordPosition: (o: any) => { posStore.applyYeokmaeBuyFill(o); posStore.flush(); },
       log: (m: string) => log.info(m),
     };
