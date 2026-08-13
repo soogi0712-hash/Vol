@@ -10,7 +10,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   getLSKRPrice, getLSUSPrice, getLSKRBalance, getLSUSDeposit, isCashOnly, usCashOnlyUsdCap, computeUSOrderQty,
-  queryLSUSOrderExec, queryLSKROrderExecClassified, LS_US_ORDEREXEC_EMPTY_CODES, type OrderExecClassification,
+  queryLSUSOrderExec, queryLSKROrderExecClassified, usExchcdFromMarket, LS_US_ORDEREXEC_EMPTY_CODES, type OrderExecClassification,
 } from '../src/lib/ls-api';
 import {
   buildYeokmaeLiveCandidate, evaluateYeokmaePilotGate, pilotRealOrderEnabled, formatYeokmaePilotChecklist,
@@ -29,9 +29,18 @@ export interface ReconDiag {
   tr: string; rspCd: string; rspMsg: string; httpStatus: number | null; hasEnvelope: boolean;
   todayBuy: number; pendingRows: number; classification: OrderExecClassification; reconciliationOk: boolean; failureReason: string;
 }
+// US 심볼/거래소 resolve 진단(P0-35US2) — 검증된 signal metadata 재사용 vs static universe 교차검증.
+export interface UsSymbolDiag {
+  candidateSymbol: string; storedExchange: string; storedExchcd: string;
+  universeFound: boolean; universeExchange: string; resolved: string; failureReason: string;
+}
 
 // 실제 값 체크리스트 + 게이트 로그(pilot-live / pilot-preflight 공통).
 export function logPilotPreflight(log: (m: string) => void, pf: PilotPreflight): void {
+  if (pf.symbolDiag) {
+    const d = pf.symbolDiag;
+    log(`[US-PILOT-SYMBOL-DIAG] candidateSymbol=${d.candidateSymbol} storedExchange=${d.storedExchange} storedExchcd=${d.storedExchcd} universeFound=${d.universeFound} universeExchange=${d.universeExchange} resolved=${d.resolved} failureReason=${d.failureReason}`);
+  }
   if (!pf.ok) { log(`[YEOKMAE-PILOT-PREFLIGHT] FAIL_CLOSED(${pf.failReason}) → 주문 없음.`); return; }
   if (pf.gateInput) {
     log(formatYeokmaePilotChecklist(pf.gateInput, { strategyTag: 'YEOKMAE', orderBudgetUSD: pf.budgetUSD, calcQty: pf.qty, committedKRW: pf.committedKRW, remainingKRW: pf.remainingKRW, sellPolicyArmed: true, exitConfig: DEFAULT_YEOKMAE_EXIT_CONFIG }));
@@ -59,6 +68,7 @@ export interface PilotPreflight {
   noPending: boolean; reconciliationOk: boolean; notDuplicateOrder: boolean;
   exchangePendingBuys: number; currentYeokmaePositions: number;
   reconDiag: ReconDiag | null;
+  symbolDiag: UsSymbolDiag | null;
   gateInput: YeokmaePilotGateInput | null; gateAllowed: boolean; gateReasons: string[];
   realOrderEnabled: boolean; realOrderReasons: string[];
   // 실행 핸들(pilot-live 가 POST 진행 시 사용)
@@ -77,7 +87,7 @@ export async function pilotPreflight(
     committedKRW: 0, remainingKRW: env.totalCapitalKRW, totalCapitalKRW: env.totalCapitalKRW, baseXchRate: 1,
     cashOnly: false, capitalGuardOk: false, perSymbolBudgetOk: false, noPending: false, reconciliationOk: false, notDuplicateOrder: false,
     exchangePendingBuys: 0, currentYeokmaePositions: posStore.corrupt ? -1 : posStore.all().length,
-    reconDiag: null,
+    reconDiag: null, symbolDiag: null,
     gateInput: null, gateAllowed: false, gateReasons: [], realOrderEnabled: false, realOrderReasons: [],
     cfg, token, orders: null, posStore, etDate: market === 'US' ? marketDate(-5) : marketDate(9), delaygb: 'R',
   };
@@ -110,21 +120,35 @@ export async function pilotPreflight(
   let reconDiag: ReconDiag | null = null;
   let baseXchRate = 1;   // KR=원화(1). US=LS 기준환율(예수금 조회에서).
   if (market === 'US') {
-    const us = loadUSSymbols(); const sym = us.ok.find(s => s.symbol === candidate.symbol.toUpperCase());
-    if (!sym) return failClosed(`US 종목 미확인: ${candidate.symbol}`);
-    exchcd = sym.exchcd; delaygb = resolveUSQuote().delaygb ?? 'R';
-    try { price = (await getLSUSPrice(cfg, token, sym.symbol, sym.exchcd, delaygb)).price; } catch (e) { return failClosed(`US 시세 조회 실패: ${scrub(String(e))}`); }
-    let dep; try { dep = await getLSUSDeposit(cfg, token); } catch (e) { return failClosed(`US 예수금 조회 실패: ${scrub(String(e))}`); }
-    if (!dep.ok) return failClosed('US 예수금 조회 실패(ok=false)');
+    const symUpper = candidate.symbol.toUpperCase();
+    // ── US 심볼 resolve — 검증된 signal metadata(수집시 g3190) 우선 재사용, static universe 는 교차검증만(item 4·5) ──
+    const storedExchange = String(first.exchange ?? '');   // 'NASDAQ'|'NYSE_AMEX'|'ETC'
+    const storedExchcd = first.exchcd ? String(first.exchcd) : (usExchcdFromMarket(storedExchange) ?? '');
+    const uni = loadUSSymbols(); const universeSym = uni.ok.find(s => s.symbol === symUpper);
+    let resolvedExchcd = ''; let failureReason = '';
+    if (storedExchcd && universeSym && universeSym.exchcd !== storedExchcd) failureReason = `STORED_UNIVERSE_CONFLICT(stored=${storedExchcd} vs universe=${universeSym.exchcd})`;
+    else if (storedExchcd) resolvedExchcd = storedExchcd;
+    else if (universeSym) resolvedExchcd = universeSym.exchcd;
+    else failureReason = 'NO_EXCHCD(signal metadata·static universe 모두 없음 → build-us-history 재실행으로 exchcd 저장 필요)';
+    const symbolDiag: UsSymbolDiag = {
+      candidateSymbol: candidate.symbol, storedExchange: storedExchange || '(없음)', storedExchcd: storedExchcd || '(없음)',
+      universeFound: !!universeSym, universeExchange: universeSym?.exchange ?? '-', resolved: resolvedExchcd || 'FAIL', failureReason: failureReason || '-',
+    };
+    base.symbolDiag = symbolDiag;
+    if (!resolvedExchcd) return { ...failClosed(`US 종목 exchcd 미해결: ${candidate.symbol} (${failureReason})`), symbolDiag };
+    exchcd = resolvedExchcd; delaygb = resolveUSQuote().delaygb ?? 'R';
+    try { price = (await getLSUSPrice(cfg, token, symUpper, exchcd, delaygb)).price; } catch (e) { return { ...failClosed(`US 시세 조회 실패: ${scrub(String(e))}`), symbolDiag }; }
+    let dep; try { dep = await getLSUSDeposit(cfg, token); } catch (e) { return { ...failClosed(`US 예수금 조회 실패: ${scrub(String(e))}`), symbolDiag }; }
+    if (!dep.ok) return { ...failClosed('US 예수금 조회 실패(ok=false)'), symbolDiag };
     cashOnly = isCashOnly(dep);
     baseXchRate = dep.baseXchRate > 0 ? dep.baseXchRate : 0;   // 총자본(원) 한도 환산용
     orderable = price > 0 ? Math.floor(usCashOnlyUsdCap(dep, {}) / price) : 0;
     qty = computeUSOrderQty({ perTradeBudgetUsd: env.budgetUSD, orderableQty: orderable, bestAsk: price, maxQty: null }).finalQty;
     try {
-      const rec = await queryLSUSOrderExec(cfg, token, { exchcd: sym.exchcd, symbol: sym.symbol, ordDate: base.etDate }, { emptyCodes: LS_US_ORDEREXEC_EMPTY_CODES });
+      const rec = await queryLSUSOrderExec(cfg, token, { exchcd, symbol: symUpper, ordDate: base.etDate }, { emptyCodes: LS_US_ORDEREXEC_EMPTY_CODES });
       reconciliationOk = pilotReconOkUS(rec.classification);
-      const todayBuy = rec.rows.filter(r => r.symbol === sym.symbol && r.ordPtnCode === '02').length;
-      exchangePendingBuys = rec.rows.filter(r => r.symbol === sym.symbol && r.ordPtnCode === '02' && r.unfilledQty > 0).length;
+      const todayBuy = rec.rows.filter(r => r.symbol === symUpper && r.ordPtnCode === '02').length;
+      exchangePendingBuys = rec.rows.filter(r => r.symbol === symUpper && r.ordPtnCode === '02' && r.unfilledQty > 0).length;
       reconDiag = { tr: 'COSAQ00102', rspCd: rec.rspCd, rspMsg: rec.rspMsg, httpStatus: rec.httpStatus ?? null, hasEnvelope: rec.hasEnvelope, todayBuy, pendingRows: exchangePendingBuys, classification: rec.classification, reconciliationOk, failureReason: reconciliationOk ? '-' : `classification=${rec.classification}` };
     } catch (e) { return failClosed(`US 대사 조회 실패: ${scrub(String(e))}`); }
   } else {
@@ -170,7 +194,7 @@ export async function pilotPreflight(
     ...base, ok: true, exchcd, price, orderable, qty, orderAmount: qty * price, delaygb,
     committedKRW, remainingKRW, totalCapitalKRW, baseXchRate,
     cashOnly, capitalGuardOk, perSymbolBudgetOk, noPending, reconciliationOk, notDuplicateOrder, exchangePendingBuys, currentYeokmaePositions,
-    reconDiag,
+    reconDiag, symbolDiag: base.symbolDiag,
     gateInput, gateAllowed: gate.allowed, gateReasons: gate.reasons, realOrderEnabled: rl.enabled, realOrderReasons: rl.reasons,
     orders,
   };

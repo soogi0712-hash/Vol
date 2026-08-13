@@ -24,7 +24,7 @@ const SNAPSHOTS_FILE = join(YEOKMAE_DAILY_ROOT, 'US.signal-report.json');
 
 interface CandidateRec { symbol: string; exchange: string; exchcd: string; bars: number; ema112: number; ema224: number; ema448: number; lastConfirmed: string | null }
 interface SignalRec {
-  symbol: string; exchange: string; confirmedDate: string | null; searcherFormula: boolean;
+  symbol: string; exchange: string; exchcd: string; confirmedDate: string | null; searcherFormula: boolean;
   '112_ORIGINAL': boolean; '224_ORIGINAL': boolean; '112_UPGRADE': boolean; '224_UPGRADE': boolean; 'LONG_TERM': boolean;
   conditions: string; ema112: number; ema224: number; ema448: number; verifiedFailed: string[]; unverified: string[];
 }
@@ -120,7 +120,7 @@ async function main() {
       if (d.anyArrow) {
         // 4) 화살표 1개+ true → 실제 신호. 역배열만 true(화살표 0)는 여기 저장 안 함(BUY 후보 아님).
         const rec: SignalRec = {
-          symbol: r.symbol, exchange: r.market, confirmedDate: d.lastConfirmed, searcherFormula: d.searcherFormulaPass,
+          symbol: r.symbol, exchange: r.market, exchcd: r.exchcd, confirmedDate: d.lastConfirmed, searcherFormula: d.searcherFormulaPass,
           '112_ORIGINAL': d.arrows['112_ORIGINAL'], '224_ORIGINAL': d.arrows['224_ORIGINAL'], '112_UPGRADE': d.arrows['112_UPGRADE'], '224_UPGRADE': d.arrows['224_UPGRADE'], 'LONG_TERM': d.arrows['LONG_TERM'],
           conditions: conditionsLine(d.conditions), ema112: +d.ema112.toFixed(2), ema224: +d.ema224.toFixed(2), ema448: +d.ema448.toFixed(2), verifiedFailed: d.verifiedFailed, unverified: d.unverifiedExternal,
         };

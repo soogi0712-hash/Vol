@@ -403,6 +403,10 @@ export interface LSUSMasterRow {
 function usMarketFromExchcd(exchcd: string): 'NASDAQ' | 'NYSE_AMEX' | 'ETC' {
   return exchcd === '82' ? 'NASDAQ' : exchcd === '81' ? 'NYSE_AMEX' : 'ETC';
 }
+// market(라벨) → exchcd 역매핑(P0-35US2) — usMarketFromExchcd 의 정확한 역(추측 아님). ETC/미상은 null.
+export function usExchcdFromMarket(market: string): string | null {
+  return market === 'NASDAQ' ? '82' : market === 'NYSE_AMEX' ? '81' : null;
+}
 export function parseLSUSMasterRow(r: any): LSUSMasterRow {
   const exchcd = String(r.exchcd ?? '');
   const expire = String(r.expire_date ?? '00000000');
