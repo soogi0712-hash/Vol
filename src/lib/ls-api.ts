@@ -1274,13 +1274,18 @@ export function isKROrderSuccess(rspCd: string, ordNo: string | null | undefined
 //   MbrNo 는 회원(거래소 라우팅) — 공식 reqExample 값 "NXT". 실주문 전 사용자 확인 필요(env 로 조정).
 // 응답 OutBlock2.OrdNo = 주문번호.
 export interface LSKROrderResult { rspCd: string; rspMsg: string; ordNo: string | null; raw: any; diag: LSHttpDiag; }
-export async function placeLSKRBuyOrder(cfg: LSConfig, token: string, p: { shcode: string; qty: number; price: number; mbrNo?: string }): Promise<LSKROrderResult> {
-  const inb = {
+// CSPAT00601 매수 InBlock 빌더(공식 필드) — placeLSKRBuyOrder 와 진단로그가 '동일 소스' 사용(드리프트 방지, P0-35P7).
+//   민감정보(계좌/비번/토큰) 없음. MbrNo 는 거래소 라우팅(NXT=넥스트레이드 ATS / KRX 등) — 호출측이 env 로 주입.
+export function buildKRBuyInBlock(p: { shcode: string; qty: number; price: number; mbrNo?: string }): { CSPAT00601InBlock1: Record<string, unknown> } {
+  return {
     CSPAT00601InBlock1: {
       IsuNo: krIsuNo(p.shcode), OrdQty: p.qty, OrdPrc: p.price, BnsTpCode: LS_KR_BNS_BUY,
       OrdprcPtnCode: '00', MgntrnCode: '000', LoanDt: '', OrdCndiTpCode: '0', MbrNo: p.mbrNo ?? 'NXT',
     },
   };
+}
+export async function placeLSKRBuyOrder(cfg: LSConfig, token: string, p: { shcode: string; qty: number; price: number; mbrNo?: string }): Promise<LSKROrderResult> {
+  const inb = buildKRBuyInBlock(p);
   const { data, rspCd, rspMsg, diag } = await lsPost(token, '/stock/order', 'CSPAT00601', inb);
   const ob2 = data.CSPAT00601OutBlock2 || {};
   return { rspCd, rspMsg, ordNo: ob2.OrdNo != null ? String(ob2.OrdNo) : null, raw: data, diag };

@@ -12,6 +12,7 @@ import { executeKRBuyOrder, type KRTraderDeps } from './kr-trader';
 import {
   getLSUSDeposit, usCashOnlyUsdCap, placeLSUSBuyOrder, queryLSUSOrderExec, cancelLSUSOrder,
   placeLSKRBuyOrder, queryLSKROrderExecUnified, cancelLSKRBuyOrder, getLSKRBalance, LS_US_ORDEREXEC_EMPTY_CODES,
+  buildKRBuyInBlock,
 } from '../src/lib/ls-api';
 import {
   runYeokmaePilotBuy, formatYeokmaeExitPolicy, DEFAULT_YEOKMAE_EXIT_CONFIG,
@@ -48,6 +49,14 @@ async function main() {
   logPilotPreflight((m) => log.info(m), pf);
   if (!pf.ok) { process.exit(2); return; }
 
+  // P0-35P7: 실제 CSPAT00601 request InBlock 을 전송 전 마스킹 출력(계좌/비번/토큰 없음). dry-run 에서도 구조 검증.
+  const krMbrNo = (process.env.LS_KR_MBR_NO || 'NXT').trim().toUpperCase();   // ls-kr-scan 과 동일 소스(기존 정상경로 정합)
+  if (market === 'KR' && pf.candidate) {
+    const ib = buildKRBuyInBlock({ shcode: pf.candidate.symbol, qty: pf.qty, price: pf.price, mbrNo: krMbrNo }).CSPAT00601InBlock1 as any;
+    log.info(`[KR-PILOT-ORDER-REQ] IsuNo=${ib.IsuNo} OrdQty=${ib.OrdQty} OrdPrc=${ib.OrdPrc} BnsTpCode=${ib.BnsTpCode}(매수) OrdprcPtnCode=${ib.OrdprcPtnCode}(지정가) MgntrnCode=${ib.MgntrnCode}(현금) LoanDt='${ib.LoanDt}' OrdCndiTpCode=${ib.OrdCndiTpCode} MbrNo=${ib.MbrNo}`);
+    log.info(`  ℹ️ MbrNo 는 거래소 라우팅(NXT=넥스트레이드 ATS). 01065 '거래불가 종목' 은 종목필터 확정 전에 라우팅/장중여부부터 대조 — LS_KR_MBR_NO 로 조정.`);
+  }
+
   if (dryRun) { log.info(`[YEOKMAE-PILOT-STATUS] --dry-run → BUY POST=0 (게이트만 조회). realOrderEnabled=${pf.realOrderEnabled}`); return; }
 
   // executor 연결 — realOrderEnabled=true 일 때만 POST(runYeokmaePilotBuy 가 강제).
@@ -74,7 +83,7 @@ async function main() {
       now: () => Date.now(), log: (m) => log.info(m),
     };
     return {
-      executeBuy: async (o: any) => { const out = await executeKRBuyOrder(krDeps, { orders, shcode: o.symbol, candleDatetime: o.candleDatetime, qty: o.qty, price: o.price, krDate: o.etDate, dailyMaxBuys: 1 }); return { status: out.status, ordNo: out.ordNo, filledQty: out.execQty, fillPrice: o.price }; },
+      executeBuy: async (o: any) => { const out = await executeKRBuyOrder(krDeps, { orders, shcode: o.symbol, candleDatetime: o.candleDatetime, qty: o.qty, price: o.price, krDate: o.etDate, mbrNo: krMbrNo, dailyMaxBuys: 1 }); return { status: out.status, ordNo: out.ordNo, filledQty: out.execQty, fillPrice: o.price }; },
       recordPosition: (o: any) => { posStore.applyYeokmaeBuyFill(o); posStore.flush(); },
       log: (m: string) => log.info(m),
     };
