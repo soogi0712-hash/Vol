@@ -12,7 +12,7 @@ import { makeScrubber } from './mask';
 import {
   getLSKR15Min, getLSKRPrice, classifyChart, getLSKRBalance,
   placeLSKRBuyOrder, queryLSKROrderExec, cancelLSKRBuyOrder, krIsuNo, LS_KR_BNS_BUY,
-  LSApiError, type LSCandle, type LSHttpDiag,
+  resolveKRMbrNo, LSApiError, type LSCandle, type LSHttpDiag,
 } from '../src/lib/ls-api';
 import { OrderStore } from './order-store';
 import { isKRRegularSession, krDateStr } from './trade-gate';
@@ -94,7 +94,7 @@ async function main() {
     live: cfg.liveTrading,
     maxQty: Math.max(1, Math.min(1, parseInt(process.env.LS_KR_MAX_QTY || '1', 10) || 1)),   // 상한 1 강제
     dailyMaxBuys: Math.max(0, Math.min(1, parseInt(process.env.LS_KR_DAILY_MAX_BUYS || '1', 10))),
-    mbrNo: (process.env.LS_KR_MBR_NO || 'NXT').trim().toUpperCase(),
+    mbrNo: resolveKRMbrNo(process.env.LS_KR_MBR_NO).value,   // P0-35P8: 공용 resolver(PILOT 과 동일)
     pendingTimeoutSec: Math.max(10, Math.min(1800, parseInt(process.env.LS_KR_PENDING_TIMEOUT_SEC || '120', 10) || 120)),
     exitAfterClose: process.env.LS_KR_EXIT_AFTER_CLOSE === 'true',
   };

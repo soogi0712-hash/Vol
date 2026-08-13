@@ -12,7 +12,7 @@ import { makeScrubber } from './mask';
 import {
   getLSKR15Min, getLSKRStockMaster, classifyChart, getLSKRBalance,
   placeLSKRBuyOrder, queryLSKROrderExec, cancelLSKRBuyOrder, krIsuNo, LS_KR_BNS_BUY,
-  LSApiError,
+  resolveKRMbrNo, LSApiError,
 } from '../src/lib/ls-api';
 import { OrderStore } from './order-store';
 import { isKRRegularSession, krDateStr } from './trade-gate';
@@ -61,7 +61,7 @@ async function main() {
   const legacyBbLive = process.env.LEGACY_BB_LIVE_ENABLED === 'true';   // P0-32: 기본 false → BB BUY 후보수집 차단
   const maxQty = 1;                                          // 상한 1 강제
   const dailyMaxBuys = intEnv('LS_KR_DAILY_MAX_BUYS', 1, 0, 1);
-  const mbrNo = (process.env.LS_KR_MBR_NO || 'NXT').trim().toUpperCase();
+  const mbrNo = resolveKRMbrNo(process.env.LS_KR_MBR_NO).value;   // P0-35P8: 공용 resolver(PILOT 과 동일)
   const pendingTimeoutSec = intEnv('LS_KR_PENDING_TIMEOUT_SEC', 120, 10, 1800);
   const reqPerSec = intEnv('LS_KR_SCAN_REQ_PER_SEC', 1, 1, 10);   // 개인=1, 법인=3 (env 주입)
   const batchSize = intEnv('LS_KR_SCAN_BATCH', 50, 1, 500);

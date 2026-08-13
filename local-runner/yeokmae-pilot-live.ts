@@ -12,7 +12,7 @@ import { executeKRBuyOrder, type KRTraderDeps } from './kr-trader';
 import {
   getLSUSDeposit, usCashOnlyUsdCap, placeLSUSBuyOrder, queryLSUSOrderExec, cancelLSUSOrder,
   placeLSKRBuyOrder, queryLSKROrderExecUnified, cancelLSKRBuyOrder, getLSKRBalance, LS_US_ORDEREXEC_EMPTY_CODES,
-  buildKRBuyInBlock,
+  buildKRBuyInBlock, resolveKRMbrNo,
 } from '../src/lib/ls-api';
 import {
   runYeokmaePilotBuy, formatYeokmaeExitPolicy, DEFAULT_YEOKMAE_EXIT_CONFIG,
@@ -49,12 +49,15 @@ async function main() {
   logPilotPreflight((m) => log.info(m), pf);
   if (!pf.ok) { process.exit(2); return; }
 
-  // P0-35P7: 실제 CSPAT00601 request InBlock 을 전송 전 마스킹 출력(계좌/비번/토큰 없음). dry-run 에서도 구조 검증.
-  const krMbrNo = (process.env.LS_KR_MBR_NO || 'NXT').trim().toUpperCase();   // ls-kr-scan 과 동일 소스(기존 정상경로 정합)
+  // P0-35P8: MbrNo 라우팅을 공용 resolver 로 통일(ls-kr-scan/ls-trade 와 동일). env 미설정=NXT(문서 예제값).
+  const mbr = resolveKRMbrNo(process.env.LS_KR_MBR_NO);
+  const krMbrNo = mbr.value;
+  // P0-35P7/P8: 전송 전 CSPAT00601 request InBlock + MbrNo 라우팅 진단(주문 0). dry-run 에서도 출력.
   if (market === 'KR' && pf.candidate) {
     const ib = buildKRBuyInBlock({ shcode: pf.candidate.symbol, qty: pf.qty, price: pf.price, mbrNo: krMbrNo }).CSPAT00601InBlock1 as any;
+    log.info(`[KR-MBR-ROUTING-DIAG] envValue=${mbr.envValue === null ? '(미설정)' : `'${mbr.envValue}'`} resolvedValue='${mbr.value}' source=${mbr.source} IsuNo=${ib.IsuNo} market=${pf.candidate.exchange}`);
     log.info(`[KR-PILOT-ORDER-REQ] IsuNo=${ib.IsuNo} OrdQty=${ib.OrdQty} OrdPrc=${ib.OrdPrc} BnsTpCode=${ib.BnsTpCode}(매수) OrdprcPtnCode=${ib.OrdprcPtnCode}(지정가) MgntrnCode=${ib.MgntrnCode}(현금) LoanDt='${ib.LoanDt}' OrdCndiTpCode=${ib.OrdCndiTpCode} MbrNo=${ib.MbrNo}`);
-    log.info(`  ℹ️ MbrNo 는 거래소 라우팅(NXT=넥스트레이드 ATS). 01065 '거래불가 종목' 은 종목필터 확정 전에 라우팅/장중여부부터 대조 — LS_KR_MBR_NO 로 조정.`);
+    log.info(`  ℹ️ MbrNo=NXT 는 넥스트레이드 ATS 라우팅(repo 내 유일 확정근거=공식 reqExample). 정규거래소(KRX) 값은 repo 에 공식 catalog 없음 → 추측 금지. LS 공식 문서 확인 후 LS_KR_MBR_NO 로 지정(빈 문자열도 명시 가능).`);
   }
 
   if (dryRun) { log.info(`[YEOKMAE-PILOT-STATUS] --dry-run → BUY POST=0 (게이트만 조회). realOrderEnabled=${pf.realOrderEnabled}`); return; }

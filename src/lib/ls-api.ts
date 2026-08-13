@@ -1274,6 +1274,17 @@ export function isKROrderSuccess(rspCd: string, ordNo: string | null | undefined
 //   MbrNo 는 회원(거래소 라우팅) — 공식 reqExample 값 "NXT". 실주문 전 사용자 확인 필요(env 로 조정).
 // 응답 OutBlock2.OrdNo = 주문번호.
 export interface LSKROrderResult { rspCd: string; rspMsg: string; ordNo: string | null; raw: any; diag: LSHttpDiag; }
+// ── KR MbrNo(거래소 라우팅) 공용 resolver (P0-35P8) — 모든 KR 주문경로(ls-kr-scan/ls-trade/PILOT)가 공유 ──
+//   ⚠️ repo 에 LS 공식 catalog(MbrNo 허용값 목록)이 없다. 확인 가능한 것은 CSPAT00601 reqExample 값 'NXT'(=넥스트레이드 ATS)뿐.
+//   따라서 KRX/빈문자열이 정규거래소를 의미하는지 '추측 금지'. env 미설정 시 문서 예제값 'NXT' 유지.
+//   env 를 명시 설정하면(빈 문자열 포함) 그 값을 그대로 전송 → 사용자가 LS 공식값을 확인해 라우팅을 조정할 수 있게 한다.
+export interface KRMbrNoResolution { value: string; source: 'ENV' | 'DEFAULT_REQEXAMPLE'; envValue: string | null }
+export const KR_MBRNO_DEFAULT_REQEXAMPLE = 'NXT';   // LS 공식 reqExample 값(넥스트레이드 ATS). repo 내 유일 확정근거.
+export function resolveKRMbrNo(rawEnv: string | undefined | null): KRMbrNoResolution {
+  if (rawEnv === undefined || rawEnv === null) return { value: KR_MBRNO_DEFAULT_REQEXAMPLE, source: 'DEFAULT_REQEXAMPLE', envValue: null };
+  return { value: rawEnv.trim().toUpperCase(), source: 'ENV', envValue: rawEnv };   // 빈 문자열도 그대로(사용자 명시 테스트 허용)
+}
+
 // CSPAT00601 매수 InBlock 빌더(공식 필드) — placeLSKRBuyOrder 와 진단로그가 '동일 소스' 사용(드리프트 방지, P0-35P7).
 //   민감정보(계좌/비번/토큰) 없음. MbrNo 는 거래소 라우팅(NXT=넥스트레이드 ATS / KRX 등) — 호출측이 env 로 주입.
 export function buildKRBuyInBlock(p: { shcode: string; qty: number; price: number; mbrNo?: string }): { CSPAT00601InBlock1: Record<string, unknown> } {
