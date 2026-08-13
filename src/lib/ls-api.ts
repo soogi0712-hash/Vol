@@ -99,6 +99,9 @@ export const LS_SUCCESS_CODES: Record<string, string[]> = {
 /** 정상이나 데이터가 없는(빈 결과) 코드 — 잔고 0 으로 처리한다. */
 export const LS_EMPTY_CODES: Record<string, string[]> = {
   COSOQ00201: ['02679'],
+  // P0-35P5: CSPAQ13700(현물 주문체결내역) 실측 — rsp_cd=00200 "조회내역이 없습니다."(HTTP200+envelope+rows0) = 정상 0건.
+  //   ⚠️ 이 TR 한정. 다른 TR 전역 적용 금지. rows>0/malformed envelope 이면 EMPTY 아님(fail-closed).
+  CSPAQ13700: ['00200'],
 };
 
 export interface LSResult { data: any; rspCd: string; rspMsg: string; empty: boolean; diag: LSHttpDiag; }
@@ -1308,10 +1311,18 @@ export interface LSKROrderExecClassified {
   hasEnvelope: boolean; httpStatus: number | null; kind?: LSErrorKind; diag?: LSHttpDiag;
 }
 // 순수 분류 — successCodes/emptyCodes 는 실측·문서 확정분만(추측 금지). 그 외 HTTP200 업무코드=BUSINESS_ERROR.
-export function classifyKROrderExec(p: { rspCd: string; hasEnvelope: boolean; successCodes: string[]; emptyCodes: string[] }): OrderExecClassification {
-  if (p.emptyCodes.includes(p.rspCd)) return 'EMPTY';
-  if (p.successCodes.includes(p.rspCd)) return p.hasEnvelope ? 'SUCCESS' : 'EMPTY';
-  return 'BUSINESS_ERROR';   // 미확정 업무코드 → fail-closed(호출측이 대사 실패로 처리)
+//   EMPTY 확정 조건(P0-35P5): httpStatus=200 + envelope 정상 + rawRows=0. 하나라도 어긋나면 fail-closed(BUSINESS_ERROR).
+export function classifyKROrderExec(p: { rspCd: string; httpStatus: number | null; hasEnvelope: boolean; rowCount: number; successCodes: string[]; emptyCodes: string[] }): OrderExecClassification {
+  if (p.httpStatus !== 200) return 'BUSINESS_ERROR';         // 200 아니면 통과 금지(엄격)
+  if (p.emptyCodes.includes(p.rspCd)) {
+    // 예: CSPAQ13700 00200 "조회내역 없음" — 반드시 envelope 정상 + rows=0 일 때만 EMPTY.
+    return (p.hasEnvelope && p.rowCount === 0) ? 'EMPTY' : 'BUSINESS_ERROR';
+  }
+  if (p.successCodes.includes(p.rspCd)) {
+    if (!p.hasEnvelope) return 'BUSINESS_ERROR';             // 성공코드인데 envelope 없음 → 이상 → fail-closed
+    return p.rowCount > 0 ? 'SUCCESS' : 'EMPTY';
+  }
+  return 'BUSINESS_ERROR';   // 미확정 업무코드 → fail-closed
 }
 export async function queryLSKROrderExecClassified(cfg: LSConfig, token: string, p: { shcode: string; ordDate: string; bnsTpCode?: string }): Promise<LSKROrderExecClassified> {
   const inb = { CSPAQ13700InBlock1: { OrdMktCode: '00', BnsTpCode: p.bnsTpCode ?? '0', IsuNo: krIsuNo(p.shcode), ExecYn: '0', OrdDt: p.ordDate, SrtOrdNo2: 0, BkseqTpCode: '0', OrdPtnCode: '00' } };
@@ -1322,11 +1333,13 @@ export async function queryLSKROrderExecClassified(cfg: LSConfig, token: string,
     const { data, rspCd, rspMsg, diag } = await lsPost(token, '/stock/accno', 'CSPAQ13700', inb, { soft: true });
     const o2 = data?.CSPAQ13700OutBlock2;
     const hasEnvelope = o2 != null;
-    const classification = classifyKROrderExec({ rspCd, hasEnvelope, successCodes, emptyCodes });
+    const buyOrdQty = toNum(o2?.BuyOrdQty), buyExecQty = toNum(o2?.BuyExecQty), sellOrdQty = toNum(o2?.SellOrdQty), sellExecQty = toNum(o2?.SellExecQty);
+    const rowCount = buyOrdQty + buyExecQty + sellOrdQty + sellExecQty;   // 주문/체결 내역 유무(0=조회내역 없음)
+    const classification = classifyKROrderExec({ rspCd, httpStatus: diag.status, hasEnvelope, rowCount, successCodes, emptyCodes });
     const queryOk = classification === 'SUCCESS' || classification === 'EMPTY';
     return {
       queryOk, classification, rspCd, rspMsg,
-      buyOrdQty: toNum(o2?.BuyOrdQty), buyExecQty: toNum(o2?.BuyExecQty), sellOrdQty: toNum(o2?.SellOrdQty), sellExecQty: toNum(o2?.SellExecQty),
+      buyOrdQty, buyExecQty, sellOrdQty, sellExecQty,
       hasEnvelope, httpStatus: diag.status, diag,
     };
   } catch (e) {
