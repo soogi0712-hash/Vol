@@ -11,7 +11,7 @@ import { executeBuyOrder, type TraderDeps } from './trader';
 import { executeKRBuyOrder, type KRTraderDeps } from './kr-trader';
 import {
   getLSUSDeposit, usCashOnlyUsdCap, placeLSUSBuyOrder, queryLSUSOrderExec, cancelLSUSOrder,
-  placeLSKRBuyOrder, queryLSKROrderExec, cancelLSKRBuyOrder, getLSKRBalance, LS_US_ORDEREXEC_EMPTY_CODES,
+  placeLSKRBuyOrder, queryLSKROrderExecUnified, cancelLSKRBuyOrder, getLSKRBalance, LS_US_ORDEREXEC_EMPTY_CODES,
 } from '../src/lib/ls-api';
 import {
   runYeokmaePilotBuy, formatYeokmaeExitPolicy, DEFAULT_YEOKMAE_EXIT_CONFIG,
@@ -68,7 +68,7 @@ async function main() {
   })() : (() => {
     const krDeps: KRTraderDeps = {
       place: (pp) => placeLSKRBuyOrder(cfg, token, pp),
-      queryExec: (pp) => queryLSKROrderExec(cfg, token, pp),
+      queryExec: (pp) => queryLSKROrderExecUnified(cfg, token, pp),   // P0-35P6: preflight 와 동일 strict classifier
       cancel: (pp) => cancelLSKRBuyOrder(cfg, token, pp),
       cashOrderable: async () => { try { const b = await getLSKRBalance(cfg, token); return { ok: true, cash: b.orderableCash }; } catch { return { ok: false, cash: 0 }; } },
       now: () => Date.now(), log: (m) => log.info(m),

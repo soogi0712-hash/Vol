@@ -1299,7 +1299,7 @@ export async function cancelLSKRBuyOrder(cfg: LSConfig, token: string, p: { orgO
 // OutBlock2(공식): BuyOrdQty/BuyExecQty/SellOrdQty/SellExecQty (당일 종목 집계).
 //   하루 매수 1회 제한 하에서 BuyExecQty>=BuyOrdQty(>0) → 전량체결, 0<BuyExecQty<BuyOrdQty → 부분체결.
 // ⚠️ OutBlock3(주문별 행) 필드는 공식 스냅샷에 없어 사용하지 않는다(추측 금지) — 집계로만 판정.
-export interface LSKROrderExec { ok: boolean; rspCd: string; rspMsg: string; buyOrdQty: number; buyExecQty: number; sellOrdQty: number; sellExecQty: number; diag?: LSHttpDiag; }
+export interface LSKROrderExec { ok: boolean; rspCd: string; rspMsg: string; buyOrdQty: number; buyExecQty: number; sellOrdQty: number; sellExecQty: number; diag?: LSHttpDiag; classification?: OrderExecClassification; }
 
 // ── KR 주문체결 대사 '분류형' 조회 (P0-35P4) — US(COSAQ00102)와 대칭. soft 조회로 raw rsp_cd 를 잡아 SUCCESS/EMPTY/
 //   BUSINESS_ERROR/TRANSPORT_ERROR 로 분류(추측 금지). '0건 정상'과 'API 실패'를 절대 혼동하지 않는다.
@@ -1323,6 +1323,13 @@ export function classifyKROrderExec(p: { rspCd: string; httpStatus: number | nul
     return p.rowCount > 0 ? 'SUCCESS' : 'EMPTY';
   }
   return 'BUSINESS_ERROR';   // 미확정 업무코드 → fail-closed
+}
+// PILOT 통일 대사 (P0-35P6) — classified(strict) 결과를 LSKROrderExec 형태로 반환.
+//   ok = queryOk(SUCCESS/EMPTY strict: httpStatus200+envelope+rows0). classification 을 함께 실어 executor 진단에 사용.
+//   ⚠️ preflight 와 '동일 strict classifier' 공유 → 이중판정(preflight=true/executor=false) 제거. safety 완화 아님.
+export async function queryLSKROrderExecUnified(cfg: LSConfig, token: string, p: { shcode: string; ordDate: string; bnsTpCode?: string }): Promise<LSKROrderExec> {
+  const r = await queryLSKROrderExecClassified(cfg, token, p);
+  return { ok: r.queryOk, rspCd: r.rspCd, rspMsg: r.rspMsg, buyOrdQty: r.buyOrdQty, buyExecQty: r.buyExecQty, sellOrdQty: r.sellOrdQty, sellExecQty: r.sellExecQty, diag: r.diag, classification: r.classification };
 }
 export async function queryLSKROrderExecClassified(cfg: LSConfig, token: string, p: { shcode: string; ordDate: string; bnsTpCode?: string }): Promise<LSKROrderExecClassified> {
   const inb = { CSPAQ13700InBlock1: { OrdMktCode: '00', BnsTpCode: p.bnsTpCode ?? '0', IsuNo: krIsuNo(p.shcode), ExecYn: '0', OrdDt: p.ordDate, SrtOrdNo2: 0, BkseqTpCode: '0', OrdPtnCode: '00' } };
