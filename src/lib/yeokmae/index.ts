@@ -10,6 +10,7 @@ export * from './historical';
 export * from './live';
 export * from './snapshot';
 export * from './exit';
+export * from './validation';
 
 import { evaluateAllYeokmae } from './signals';
 import { evaluateYeokmaeSearcher, type YeokmaeMarketFlags, type YeokmaeSearcherOpts } from './searcher';
@@ -17,7 +18,9 @@ import type { Candle } from './hts';
 import type { YeokmaeSignalType } from './types';
 
 // ── 안전 게이트 (rule 15) — 실주문 하드 차단 ──
-// YEOKMAE_STRATEGY_VALIDATED 는 코드상수(원본재현 검증 완료 전 절대 true 금지). P0-33 에서 검증 후 전환.
+// YEOKMAE_STRATEGY_VALIDATED 는 코드상수(원본재현 검증 완료 전 절대 true 금지).
+// ⚠️ P0-35 불변식: 이 값은 YEOKMAE_SEMANTICS_VERIFIED=true(4종 CONFIRMED) + 최소 2종목 HTS 재현 확인 후에만 true 로 전환.
+//    (semantics 검증 전 true 금지 — validation.ts + strategy-unchanged 테스트가 불변식을 강제.)
 // (env 읽기는 worker 컨텍스트(src/lib)에서 불가 → 러너가 LEGACY_BB_LIVE_ENABLED/YEOKMAE_LIVE_TRADING 를 읽어 넘긴다.)
 export const YEOKMAE_STRATEGY_VALIDATED = false;
 // 최종 실주문 허용 = LS_LIVE_TRADING AND YEOKMAE_LIVE_TRADING AND YEOKMAE_STRATEGY_VALIDATED(코드상수 false → 항상 false).

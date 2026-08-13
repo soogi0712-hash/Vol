@@ -7,7 +7,9 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   buildYeokmaeLiveCandidate, evaluateYeokmaeLiveGate, formatYeokmaeLiveChecklist,
+  formatYeokmaeExitPolicy, DEFAULT_YEOKMAE_EXIT_CONFIG,
   YEOKMAE_STRATEGY_VALIDATED, YEOKMAE_SELL_RULE_DEFINED, YEOKMAE_BUY_SELL_POLICY,
+  YEOKMAE_SEMANTICS_VERIFIED, YEOKMAE_SEMANTICS_STATUS, yeokmaeActivationReadiness,
   type YeokmaeSignalType,
 } from '../src/lib/yeokmae';
 import { YEOKMAE_DAILY_ROOT } from './yeokmae-daily-cache';
@@ -32,6 +34,13 @@ function main() {
 
   console.log(`[YEOKMAE-SAFETY] LEGACY_BB_LIVE=${process.env.LEGACY_BB_LIVE_ENABLED === 'true'} · YEOKMAE_LIVE_TRADING=${yeokmaeLive} · YEOKMAE_STRATEGY_VALIDATED=${YEOKMAE_STRATEGY_VALIDATED} · REAL_ORDER_FROM_YEOKMAE=false`);
   console.log(`[YEOKMAE-SELL] ruleDefined=${YEOKMAE_SELL_RULE_DEFINED} policy=${YEOKMAE_BUY_SELL_POLICY} — ⚠️ BB SELL 을 역매공파 SELL 로 사용하지 않음(임의 손절/익절 없음).`);
+  // rule 9: 첫 실주문 전 EXIT-POLICY 도 함께 출력.
+  console.log(formatYeokmaeExitPolicy(DEFAULT_YEOKMAE_EXIT_CONFIG));
+  // rule 3~5: semantics 검증 상태 + 활성화 준비도(HTS 대조 완료 전에는 절대 활성화 불가).
+  const semStat = YEOKMAE_SEMANTICS_STATUS;
+  console.log(`[YEOKMAE-SEMANTICS-STATUS] verified=${YEOKMAE_SEMANTICS_VERIFIED} shiftDir=${semStat.shiftDir} stddevPopulation=${semStat.stddevPopulation} ichimokuDisplaced=${semStat.ichimokuDisplaced} emaSeed=${semStat.emaSeed}`);
+  const activation = yeokmaeActivationReadiness({ semanticsVerified: YEOKMAE_SEMANTICS_VERIFIED, verifiedSignalSymbols: 0 });
+  console.log(`[YEOKMAE-ACTIVATION] canActivate=${activation.canActivate} blockers=[${activation.reasons.join(',')}] (HTS 1:1 대조 완료 + 2종목 재현 전 YEOKMAE_STRATEGY_VALIDATED=true 금지)`);
   if (assumeSafety) console.log(`[YEOKMAE-LIVE] ⚠️ YEOKMAE_LIVE_ASSUME_SAFETY=true → 안전게이트 SIMULATED(실집행 아님). 최종 게이트는 strategyValidated 로 여전히 차단.`);
   else console.log(`[YEOKMAE-LIVE] 안전게이트(cash-only/통합증거금/예수금/pending/reconciliation/idempotency/자본100만/종목$60/당일재진입)는 실행시 기존 US BUY 파이프라인이 강제 — 프리뷰에선 미평가(✗).`);
 

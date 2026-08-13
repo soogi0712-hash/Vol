@@ -66,6 +66,13 @@ export interface YeokmaeExitDecision {
   note: string;
 }
 
+// [YEOKMAE-EXIT-POLICY] 한 줄(첫 실주문 전 출력 — rule 9). 자료기반 SELL 없음 명시.
+export function formatYeokmaeExitPolicy(c: YeokmaeExitConfig): string {
+  return `[YEOKMAE-EXIT-POLICY] SOURCE_BASED_SELL=${YEOKMAE_SOURCE_BASED_SELL} AUTOMATION_RISK_POLICY=${YEOKMAE_AUTOMATION_RISK_POLICY}`
+    + ` stopLoss=-${c.stopLossPct}% profitMode=${c.profitMode} takeProfit=+${c.takeProfitPct}%`
+    + ` trailing(activate+${c.trailingActivatePct}%/drawdown${c.trailingDrawdownPct}%) maxHoldDays=${c.maxHoldDays} structureInvalidation=OBSERVE_ONLY`;
+}
+
 export function updateHighestPrice(prevHighest: number, price: number): number {
   return Math.max(Number.isFinite(prevHighest) ? prevHighest : 0, Number.isFinite(price) ? price : 0);
 }
