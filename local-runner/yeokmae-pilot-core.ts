@@ -10,7 +10,9 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   getLSKRPrice, getLSUSPrice, getLSKRBalance, getLSUSDeposit, isCashOnly, usCashOnlyUsdCap, computeUSOrderQty,
-  queryLSUSOrderExec, queryLSKROrderExecClassified, usExchcdFromMarket, LS_US_ORDEREXEC_EMPTY_CODES, type OrderExecClassification,
+  usOrderableQty, evaluateCrossWon, usEtSession, CROSS_WON_ADOPTED_FIELD, LS_US_CROSS_WON_TR_CONFIRMED,
+  queryLSUSOrderExec, queryLSKROrderExecClassified, usExchcdFromMarket, LS_US_ORDEREXEC_EMPTY_CODES,
+  type OrderExecClassification, type USMarketSession,
 } from '../src/lib/ls-api';
 import {
   buildYeokmaeLiveCandidate, evaluateYeokmaePilotGate, pilotRealOrderEnabled, formatYeokmaePilotChecklist,
@@ -34,6 +36,22 @@ export interface UsSymbolDiag {
   candidateSymbol: string; storedExchange: string; storedExchcd: string;
   universeFound: boolean; universeExchange: string; resolved: string; failureReason: string;
 }
+// US orderableQty 근본원인 진단(P0-35US3) — 어떤 TR/필드로 산정했는지·budget/orderable/final 분리·세션.
+//   ⚠️ 예산부족(budgetQty=0)과 broker 주문가능0(orderableQty=0)을 같은 이유로 표시하지 않는다(failureReason 로 구분).
+//   orderableQty 산정은 ls-usws(검증된 AAPL 매수경로)와 동일: Math.max(crossWon.programQty, qtyCountry).
+export interface UsOrderableDiag {
+  tr: string; rspCd: string; rspMsg: string;          // COSOQ02701(예수금) 실 응답코드
+  exchange: string; symbol: string;
+  etTime: string; session: USMarketSession;           // ET 시각/세션(장전이라 0 오해 배제용 — orderableQty 는 세션 무관)
+  usdCash: number; usdOrderable: number; usdPrexchOrderable: number;   // FcurrDps / FcurrOrdAbleAmt / PrexchOrdAbleAmt(원자료)
+  krwCash: number; krwCashMin: number; baseXchRate: number;            // WonDpsBalAmt / min(WonDpsBalAmt,MnyoutAbleAmt) / BaseXchrat
+  cashOnly: boolean; overseasMargin: number; loanAmt: number;
+  cashOnlyUsdCap: number;                              // 순수 USD현금 명목상한(참고)
+  qtyCountry: number; qtyCrossWon: number;            // 거래국가 USD현금 주수 / 선환전(참고)
+  crossWonProgramQty: number; crossWonAdoptedField: string; crossWonVerified: boolean;   // 통합증거금(WonCashMin) 주수
+  budgetQty: number; orderableQty: number; finalQty: number;   // ⚠️ 3개 분리(예산 게이트 vs 주문가능 게이트 vs 최종)
+  failureReason: string;
+}
 
 // 실제 값 체크리스트 + 게이트 로그(pilot-live / pilot-preflight 공통).
 export function logPilotPreflight(log: (m: string) => void, pf: PilotPreflight): void {
@@ -44,6 +62,15 @@ export function logPilotPreflight(log: (m: string) => void, pf: PilotPreflight):
   if (!pf.ok) { log(`[YEOKMAE-PILOT-PREFLIGHT] FAIL_CLOSED(${pf.failReason}) → 주문 없음.`); return; }
   if (pf.gateInput) {
     log(formatYeokmaePilotChecklist(pf.gateInput, { strategyTag: 'YEOKMAE', orderBudgetUSD: pf.budgetUSD, calcQty: pf.qty, committedKRW: pf.committedKRW, remainingKRW: pf.remainingKRW, sellPolicyArmed: true, exitConfig: DEFAULT_YEOKMAE_EXIT_CONFIG }));
+  }
+  // US orderableQty 근본원인 진단(P0-35US3) — budgetQty/orderableQty/finalQty 분리 + 세션 + 실 예수금 원자료.
+  if (pf.orderableDiag) {
+    const d = pf.orderableDiag;
+    log(`[US-PILOT-ORDERABLE-DIAG] tr=${d.tr} rsp_cd=${d.rspCd} rsp_msg=${d.rspMsg} exchange=${d.exchange} symbol=${d.symbol} session=${d.session} etTime=${d.etTime}`);
+    log(`  cash: usdCash=${d.usdCash} usdOrderable(FcurrOrdAbleAmt)=${d.usdOrderable} usdPrexchOrderable(PrexchOrdAbleAmt)=${d.usdPrexchOrderable} krwCash(WonDpsBalAmt)=${d.krwCash} krwCashMin=${d.krwCashMin} baseXchRate=${d.baseXchRate}`);
+    log(`  cashOnly=${d.cashOnly}(OvrsMgn=${d.overseasMargin} LoanAmt=${d.loanAmt}) cashOnlyUsdCap=${d.cashOnlyUsdCap.toFixed(2)} crossWonAdoptedField=${d.crossWonAdoptedField} crossWonVerified=${d.crossWonVerified}`);
+    log(`  qtyCountry(USD현금)=${d.qtyCountry} qtyCrossWon(선환전·참고)=${d.qtyCrossWon} crossWonProgramQty(WonCashMin)=${d.crossWonProgramQty}`);
+    log(`  ⇒ budgetQty=${d.budgetQty} orderableQty=${d.orderableQty} finalQty=${d.finalQty} failureReason=${d.failureReason}`);
   }
   // 대사 진단 — '0건 정상' vs 'API 실패' 구분(추측 금지). 실 rsp_cd 노출.
   if (pf.reconDiag) {
@@ -69,6 +96,7 @@ export interface PilotPreflight {
   exchangePendingBuys: number; currentYeokmaePositions: number;
   reconDiag: ReconDiag | null;
   symbolDiag: UsSymbolDiag | null;
+  orderableDiag: UsOrderableDiag | null;
   gateInput: YeokmaePilotGateInput | null; gateAllowed: boolean; gateReasons: string[];
   realOrderEnabled: boolean; realOrderReasons: string[];
   // 실행 핸들(pilot-live 가 POST 진행 시 사용)
@@ -87,7 +115,7 @@ export async function pilotPreflight(
     committedKRW: 0, remainingKRW: env.totalCapitalKRW, totalCapitalKRW: env.totalCapitalKRW, baseXchRate: 1,
     cashOnly: false, capitalGuardOk: false, perSymbolBudgetOk: false, noPending: false, reconciliationOk: false, notDuplicateOrder: false,
     exchangePendingBuys: 0, currentYeokmaePositions: posStore.corrupt ? -1 : posStore.all().length,
-    reconDiag: null, symbolDiag: null,
+    reconDiag: null, symbolDiag: null, orderableDiag: null,
     gateInput: null, gateAllowed: false, gateReasons: [], realOrderEnabled: false, realOrderReasons: [],
     cfg, token, orders: null, posStore, etDate: market === 'US' ? marketDate(-5) : marketDate(9), delaygb: 'R',
   };
@@ -115,9 +143,10 @@ export async function pilotPreflight(
   const localNoPending = !orders.hasPending();
 
   // 시세 + cash + 수량 + reconciliation(실제 조회). reconDiag 로 '0건 정상' vs 'API 실패' 구분.
-  let price = 0, orderable = 0, qty = 0, cashOnly = false, exchcd = '', delaygb = 'R';
+  let price = 0, orderable = 0, qty = 0, budgetQty = 0, cashOnly = false, exchcd = '', delaygb = 'R';
   let reconciliationOk = false, exchangePendingBuys = 0;
   let reconDiag: ReconDiag | null = null;
+  let orderableDiag: UsOrderableDiag | null = null;
   let baseXchRate = 1;   // KR=원화(1). US=LS 기준환율(예수금 조회에서).
   if (market === 'US') {
     const symUpper = candidate.symbol.toUpperCase();
@@ -142,8 +171,44 @@ export async function pilotPreflight(
     if (!dep.ok) return { ...failClosed('US 예수금 조회 실패(ok=false)'), symbolDiag };
     cashOnly = isCashOnly(dep);
     baseXchRate = dep.baseXchRate > 0 ? dep.baseXchRate : 0;   // 총자본(원) 한도 환산용
-    orderable = price > 0 ? Math.floor(usCashOnlyUsdCap(dep, {}) / price) : 0;
-    qty = computeUSOrderQty({ perTradeBudgetUsd: env.budgetUSD, orderableQty: orderable, bestAsk: price, maxQty: null }).finalQty;
+    // ── P0-35US3 근본수정: orderableQty 산정을 ls-usws(검증된 AAPL 매수경로)와 통일 ──
+    //   기존 PILOT: usCashOnlyUsdCap(dep,{})/price = 순수 USD현금(FcurrOrdAbleAmt)만 → USD현금 0(원화보유) 계좌에서 항상 0.
+    //   통일 후: Math.max(crossWon.programQty, qtyCountry) — 통합증거금(WonCashMin 원화현금) 경로 포함(ls-usws L715 동일).
+    //   POST 는 여전히 게이트 OFF 로 0(진단 전용). 원본 BUY 공식/서쳐 무변경.
+    const crossWon = evaluateCrossWon(dep, price, null);   // htsQty=null(PILOT 은 HTS 입력값 없음)
+    const { qtyCountry, qtyCrossWon } = usOrderableQty(dep, price);
+    orderable = Math.max(crossWon.programQty, qtyCountry);   // = ls-usws orderableQty
+    const qtyDec = computeUSOrderQty({ perTradeBudgetUsd: env.budgetUSD, orderableQty: orderable, bestAsk: price, maxQty: null });
+    budgetQty = qtyDec.budgetQty;   // 예산 게이트(perSymbolBudgetOk) 근거 — orderable 과 독립
+    qty = qtyDec.finalQty;          // = min(orderable, budgetQty)
+    // ── [US-PILOT-ORDERABLE-DIAG] 근본원인 진단 — 예산부족 vs broker주문가능0 구분(추측 없음, 실 응답값) ──
+    const krwCashMin = Math.min(dep.krwCash, dep.krwWithdrawable);
+    const et = usEtSession(new Date());
+    // crossWonVerified: live-config 와 동일 판정(코드상수 AND 채택필드 AND env). orderable 산정엔 ls-usws 처럼 미적용(programQty 그대로).
+    const crossWonVerified = LS_US_CROSS_WON_TR_CONFIRMED && CROSS_WON_ADOPTED_FIELD != null && process.env.LS_US_CROSS_WON_VERIFIED !== 'false';
+    let orderableFailure: string;
+    if (orderable >= 1 && budgetQty >= 1) orderableFailure = '-';   // 주문가능·예산 모두 충분 → orderableQty 는 blocker 아님
+    else if (orderable >= 1 && budgetQty < 1) orderableFailure = `BUDGET_TOO_SMALL(예산 $${env.budgetUSD} < 1주 $${price.toFixed(2)} — 자본부족 아님, 예산 상향 필요)`;
+    else if (!cashOnly) orderableFailure = `NOT_CASH_ONLY(OvrsMgn=${dep.overseasMargin} LoanAmt=${dep.loanAmt} — 미수/대출 계좌는 주문 금지)`;
+    else if (dep.usdCash <= 0 && krwCashMin <= 0) orderableFailure = 'CAPITAL_INSUFFICIENT(usdCash=0 · krwCash=0 — 실입금 필요, broker 잔액 자체가 0)';
+    else if (qtyCountry < 1 && crossWon.programQty < 1) orderableFailure = `ORDERABLE_QTY_0(현금 있으나 1주 미만: usdOrderable=${dep.usdOrderable} krwCashMin=${krwCashMin} price=${price.toFixed(2)} crossWonReason=${crossWon.reason})`;
+    else orderableFailure = `ORDERABLE_QTY_0(qtyCountry=${qtyCountry} crossWonProgramQty=${crossWon.programQty})`;
+    if (et.session !== 'REGULAR' && et.session !== 'AFTER_HOURS' && et.session !== 'PRE_MARKET') {
+      orderableFailure = `${orderableFailure} · [SESSION_NOT_ORDERABLE_YET] ${et.session}@${et.etTime}(단, orderableQty 는 예수금 기반이라 세션 무관)`;
+    }
+    orderableDiag = {
+      tr: 'COSOQ02701', rspCd: dep.rspCd, rspMsg: scrub(dep.rspMsg),
+      exchange: storedExchange || '-', symbol: symUpper,
+      etTime: et.etTime, session: et.session,
+      usdCash: dep.usdCash, usdOrderable: dep.usdOrderable, usdPrexchOrderable: dep.usdPrexchOrderable,
+      krwCash: dep.krwCash, krwCashMin, baseXchRate: dep.baseXchRate,
+      cashOnly, overseasMargin: dep.overseasMargin, loanAmt: dep.loanAmt,
+      cashOnlyUsdCap: usCashOnlyUsdCap(dep, { crossWonVerified }),
+      qtyCountry, qtyCrossWon, crossWonProgramQty: crossWon.programQty,
+      crossWonAdoptedField: crossWon.adoptedField ?? '(미채택)', crossWonVerified,
+      budgetQty, orderableQty: orderable, finalQty: qty, failureReason: orderableFailure,
+    };
+    base.orderableDiag = orderableDiag;
     try {
       const rec = await queryLSUSOrderExec(cfg, token, { exchcd, symbol: symUpper, ordDate: base.etDate }, { emptyCodes: LS_US_ORDEREXEC_EMPTY_CODES });
       reconciliationOk = pilotReconOkUS(rec.classification);
@@ -158,6 +223,7 @@ export async function pilotPreflight(
     cashOnly = bal.orderableCash > 0;
     orderable = price > 0 ? Math.floor(bal.orderableCash / price) : 0;
     qty = Math.max(0, Math.min(1, orderable));   // 기존 KR 규칙(maxQty=1) + 결제가능 확인
+    budgetQty = orderable;   // KR 은 예산 개념 없음 → orderable 로 게이트 동치 유지(budgetQty>=1 ⇔ 기존 qty>=1)
     // P0-35P4: 분류형 대사(soft) — raw rsp_cd 를 잡아 SUCCESS/EMPTY/BUSINESS_ERROR/TRANSPORT_ERROR 구분(추측 금지).
     const rec = await queryLSKROrderExecClassified(cfg, token, { shcode: candidate.symbol, ordDate: base.etDate, bnsTpCode: '2' });
     reconciliationOk = rec.queryOk;   // SUCCESS/EMPTY 만 통과. 미확정 업무코드/transport = fail-closed.
@@ -178,8 +244,11 @@ export async function pilotPreflight(
   const committedKRW = market === 'US' ? qty * price * baseXchRate : qty * price;
   const remainingKRW = totalCapitalKRW - committedKRW;
   const xchOk = market === 'US' ? baseXchRate > 0 : true;   // US 는 환율 확보돼야 원화한도 판정 가능
+  // P0-35US3: 예산 게이트와 주문가능/자본 게이트 분리 — budgetQty/orderable/finalQty 를 서로 다른 이유로 판정.
+  //   perSymbolBudgetOk = 1회 예산으로 ≥1주(budgetQty>=1) — '자본부족'이 아닌 '예산 상한' 관점.
+  //   capitalGuardOk   = 최종수량 ≥1주(finalQty>=1, broker 주문가능+예산 결합) AND cash-only AND 총자본 한도 내.
+  const perSymbolBudgetOk = budgetQty >= 1;
   const capitalGuardOk = qty >= 1 && cashOnly && xchOk && committedKRW > 0 && committedKRW <= totalCapitalKRW;
-  const perSymbolBudgetOk = qty >= 1;
   const currentYeokmaePositions = posStore.all().length;
 
   const gateInput: YeokmaePilotGateInput = {
@@ -194,7 +263,7 @@ export async function pilotPreflight(
     ...base, ok: true, exchcd, price, orderable, qty, orderAmount: qty * price, delaygb,
     committedKRW, remainingKRW, totalCapitalKRW, baseXchRate,
     cashOnly, capitalGuardOk, perSymbolBudgetOk, noPending, reconciliationOk, notDuplicateOrder, exchangePendingBuys, currentYeokmaePositions,
-    reconDiag, symbolDiag: base.symbolDiag,
+    reconDiag, symbolDiag: base.symbolDiag, orderableDiag,
     gateInput, gateAllowed: gate.allowed, gateReasons: gate.reasons, realOrderEnabled: rl.enabled, realOrderReasons: rl.reasons,
     orders,
   };

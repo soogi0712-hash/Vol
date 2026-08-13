@@ -983,6 +983,31 @@ export function usOrderableQty(dep: LSUSDeposit, priceUsd: number): { qtyCountry
     qtyCrossWon: Math.floor(dep.usdPrexchOrderable / priceUsd), // 타통화+원화 선환전 [미확정·참고]
   };
 }
+// ── 미국장 세션 판정 (P0-35US3) — IANA America/New_York(DST 자동) 로 ET 시각/세션을 결정. 추측 없음. ──
+//   orderableQty(예수금 COSOQ02701 기반)는 세션과 무관(현금 기반)이지만, '장전이라 0' 오해를 진단으로 배제하기 위해 노출.
+//   세션 경계(ET): PRE_MARKET 04:00–09:30 · REGULAR 09:30–16:00 · AFTER_HOURS 16:00–20:00 · 그 외 CLOSED · 주말 CLOSED_WEEKEND.
+export type USMarketSession = 'PRE_MARKET' | 'REGULAR' | 'AFTER_HOURS' | 'CLOSED' | 'CLOSED_WEEKEND';
+export function usEtSession(now: Date): { etTime: string; session: USMarketSession; minutesEt: number } {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', hour12: false,
+    weekday: 'short', year: 'numeric', month: '2-digit', day: '2-digit',
+  }).formatToParts(now);
+  const p: Record<string, string> = {};
+  for (const x of parts) p[x.type] = x.value;
+  const hh = Number(p.hour) % 24;   // 일부 런타임이 자정을 '24' 로 반환 → 0 으로 정규화
+  const mm = Number(p.minute);
+  const minutesEt = hh * 60 + mm;
+  const wd = p.weekday;
+  const etTime = `${p.year}-${p.month}-${p.day} ${String(hh).padStart(2, '0')}:${p.minute} ET(${wd})`;
+  let session: USMarketSession;
+  if (wd === 'Sat' || wd === 'Sun') session = 'CLOSED_WEEKEND';
+  else if (minutesEt < 4 * 60) session = 'CLOSED';
+  else if (minutesEt < 9 * 60 + 30) session = 'PRE_MARKET';
+  else if (minutesEt < 16 * 60) session = 'REGULAR';
+  else if (minutesEt < 20 * 60) session = 'AFTER_HOURS';
+  else session = 'CLOSED';
+  return { etTime, session, minutesEt };
+}
 export function decideUSCashPayment(dep: LSUSDeposit, priceUsd: number, qty: number, opts: { crossWonVerified?: boolean } = {}): USCashDecision {
   const estimatedUsd = priceUsd * qty;
   const { qtyCountry, qtyCrossWon } = usOrderableQty(dep, priceUsd);
