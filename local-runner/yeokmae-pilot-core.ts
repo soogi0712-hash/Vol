@@ -10,7 +10,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   getLSKRPrice, getLSUSPrice, getLSKRBalance, getLSUSDeposit, isCashOnly, usCashOnlyUsdCap, computeUSOrderQty,
-  queryLSUSOrderExec, queryLSKROrderExec, LS_US_ORDEREXEC_EMPTY_CODES, type OrderExecClassification,
+  queryLSUSOrderExec, queryLSKROrderExecClassified, LS_US_ORDEREXEC_EMPTY_CODES, type OrderExecClassification,
 } from '../src/lib/ls-api';
 import {
   buildYeokmaeLiveCandidate, evaluateYeokmaePilotGate, pilotRealOrderEnabled, formatYeokmaePilotChecklist,
@@ -24,11 +24,23 @@ export const marketDate = (tzOffsetH: number): string => { const d = new Date(Da
 // US 대사 성공 판정(순수, 테스트용) — SUCCESS/EMPTY 만 POST 허용.
 export function pilotReconOkUS(cls: OrderExecClassification): boolean { return cls === 'SUCCESS' || cls === 'EMPTY'; }
 
+// 대사 진단 상세(0건 정상 vs API 실패 구분용) — [KR/US-PILOT-RECON-DIAG] 로 출력.
+export interface ReconDiag {
+  tr: string; rspCd: string; rspMsg: string; httpStatus: number | null; hasEnvelope: boolean;
+  todayBuy: number; pendingRows: number; classification: OrderExecClassification; reconciliationOk: boolean; failureReason: string;
+}
+
 // 실제 값 체크리스트 + 게이트 로그(pilot-live / pilot-preflight 공통).
 export function logPilotPreflight(log: (m: string) => void, pf: PilotPreflight): void {
   if (!pf.ok) { log(`[YEOKMAE-PILOT-PREFLIGHT] FAIL_CLOSED(${pf.failReason}) → 주문 없음.`); return; }
   if (pf.gateInput) {
     log(formatYeokmaePilotChecklist(pf.gateInput, { strategyTag: 'YEOKMAE', orderBudgetUSD: pf.budgetUSD, calcQty: pf.qty, committedKRW: 0, remainingKRW: 0, sellPolicyArmed: true, exitConfig: DEFAULT_YEOKMAE_EXIT_CONFIG }));
+  }
+  // 대사 진단 — '0건 정상' vs 'API 실패' 구분(추측 금지). 실 rsp_cd 노출.
+  if (pf.reconDiag) {
+    const d = pf.reconDiag;
+    log(`[${pf.market}-PILOT-RECON-DIAG] tr=${d.tr} rsp_cd=${d.rspCd} rsp_msg=${d.rspMsg} httpStatus=${d.httpStatus ?? '-'} envelope=${d.hasEnvelope}`
+      + ` todayBuy=${d.todayBuy} pendingRows=${d.pendingRows} classification=${d.classification} reconciliationOk=${d.reconciliationOk} failureReason=${d.failureReason}`);
   }
   // 실제 조회값(요구: 전부 실제 값 출력)
   log(`[YEOKMAE-PILOT-PREFLIGHT-VALUES] cashOnly=${pf.cashOnly} orderableQty=${pf.orderable} capitalGuardOk=${pf.capitalGuardOk} perSymbolBudgetOk=${pf.perSymbolBudgetOk}`
@@ -44,6 +56,7 @@ export interface PilotPreflight {
   cashOnly: boolean; capitalGuardOk: boolean; perSymbolBudgetOk: boolean;
   noPending: boolean; reconciliationOk: boolean; notDuplicateOrder: boolean;
   exchangePendingBuys: number; currentYeokmaePositions: number;
+  reconDiag: ReconDiag | null;
   gateInput: YeokmaePilotGateInput | null; gateAllowed: boolean; gateReasons: string[];
   realOrderEnabled: boolean; realOrderReasons: string[];
   // 실행 핸들(pilot-live 가 POST 진행 시 사용)
@@ -61,6 +74,7 @@ export async function pilotPreflight(
     ok: false, market, candidate: null, exchcd: '', price: 0, orderable: 0, qty: 0, orderAmount: 0, budgetUSD: env.budgetUSD,
     cashOnly: false, capitalGuardOk: false, perSymbolBudgetOk: false, noPending: false, reconciliationOk: false, notDuplicateOrder: false,
     exchangePendingBuys: 0, currentYeokmaePositions: posStore.corrupt ? -1 : posStore.all().length,
+    reconDiag: null,
     gateInput: null, gateAllowed: false, gateReasons: [], realOrderEnabled: false, realOrderReasons: [],
     cfg, token, orders: null, posStore, etDate: market === 'US' ? marketDate(-5) : marketDate(9), delaygb: 'R',
   };
@@ -87,9 +101,10 @@ export async function pilotPreflight(
   const notDuplicateOrder = !orders.hasOrderedCandle(candidate.confirmedDate, 'buy');
   const localNoPending = !orders.hasPending();
 
-  // 시세 + cash + 수량 + reconciliation(실제 조회)
+  // 시세 + cash + 수량 + reconciliation(실제 조회). reconDiag 로 '0건 정상' vs 'API 실패' 구분.
   let price = 0, orderable = 0, qty = 0, cashOnly = false, exchcd = '', delaygb = 'R';
   let reconciliationOk = false, exchangePendingBuys = 0;
+  let reconDiag: ReconDiag | null = null;
   if (market === 'US') {
     const us = loadUSSymbols(); const sym = us.ok.find(s => s.symbol === candidate.symbol.toUpperCase());
     if (!sym) return failClosed(`US 종목 미확인: ${candidate.symbol}`);
@@ -103,7 +118,9 @@ export async function pilotPreflight(
     try {
       const rec = await queryLSUSOrderExec(cfg, token, { exchcd: sym.exchcd, symbol: sym.symbol, ordDate: base.etDate }, { emptyCodes: LS_US_ORDEREXEC_EMPTY_CODES });
       reconciliationOk = pilotReconOkUS(rec.classification);
+      const todayBuy = rec.rows.filter(r => r.symbol === sym.symbol && r.ordPtnCode === '02').length;
       exchangePendingBuys = rec.rows.filter(r => r.symbol === sym.symbol && r.ordPtnCode === '02' && r.unfilledQty > 0).length;
+      reconDiag = { tr: 'COSAQ00102', rspCd: rec.rspCd, rspMsg: rec.rspMsg, httpStatus: rec.httpStatus ?? null, hasEnvelope: rec.hasEnvelope, todayBuy, pendingRows: exchangePendingBuys, classification: rec.classification, reconciliationOk, failureReason: reconciliationOk ? '-' : `classification=${rec.classification}` };
     } catch (e) { return failClosed(`US 대사 조회 실패: ${scrub(String(e))}`); }
   } else {
     exchcd = 'KR';
@@ -112,9 +129,17 @@ export async function pilotPreflight(
     cashOnly = bal.orderableCash > 0;
     orderable = price > 0 ? Math.floor(bal.orderableCash / price) : 0;
     qty = Math.max(0, Math.min(1, orderable));   // 기존 KR 규칙(maxQty=1) + 결제가능 확인
-    const rec = await queryLSKROrderExec(cfg, token, { shcode: candidate.symbol, ordDate: base.etDate, bnsTpCode: '2' });
-    reconciliationOk = rec.ok;   // ok=false 는 내부에서 안전(zeros)처리 → 대사 실패로 취급
+    // P0-35P4: 분류형 대사(soft) — raw rsp_cd 를 잡아 SUCCESS/EMPTY/BUSINESS_ERROR/TRANSPORT_ERROR 구분(추측 금지).
+    const rec = await queryLSKROrderExecClassified(cfg, token, { shcode: candidate.symbol, ordDate: base.etDate, bnsTpCode: '2' });
+    reconciliationOk = rec.queryOk;   // SUCCESS/EMPTY 만 통과. 미확정 업무코드/transport = fail-closed.
     exchangePendingBuys = (rec.buyOrdQty - rec.buyExecQty) > 0 ? 1 : 0;
+    reconDiag = {
+      tr: 'CSPAQ13700', rspCd: rec.rspCd, rspMsg: rec.rspMsg, httpStatus: rec.httpStatus, hasEnvelope: rec.hasEnvelope,
+      todayBuy: rec.buyOrdQty, pendingRows: exchangePendingBuys, classification: rec.classification, reconciliationOk,
+      failureReason: reconciliationOk ? '-' : (rec.classification === 'BUSINESS_ERROR'
+        ? `미확정 업무코드 rsp_cd=${rec.rspCd}(정상0건인지 실측 확인 후 등록 필요 — 추측 금지)`
+        : `${rec.classification} rsp_cd=${rec.rspCd}${rec.kind ? ` kind=${rec.kind}` : ''}`),
+    };
   }
   if (!(price > 0)) return failClosed('실시간가 미확보(quote stale) → 손절/익절 오발동 방지 위해 주문 금지');
 
@@ -134,6 +159,7 @@ export async function pilotPreflight(
   return {
     ...base, ok: true, exchcd, price, orderable, qty, orderAmount: qty * price, delaygb,
     cashOnly, capitalGuardOk, perSymbolBudgetOk, noPending, reconciliationOk, notDuplicateOrder, exchangePendingBuys, currentYeokmaePositions,
+    reconDiag,
     gateInput, gateAllowed: gate.allowed, gateReasons: gate.reasons, realOrderEnabled: rl.enabled, realOrderReasons: rl.reasons,
     orders,
   };

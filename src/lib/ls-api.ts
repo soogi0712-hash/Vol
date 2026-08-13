@@ -1297,6 +1297,49 @@ export async function cancelLSKRBuyOrder(cfg: LSConfig, token: string, p: { orgO
 //   하루 매수 1회 제한 하에서 BuyExecQty>=BuyOrdQty(>0) → 전량체결, 0<BuyExecQty<BuyOrdQty → 부분체결.
 // ⚠️ OutBlock3(주문별 행) 필드는 공식 스냅샷에 없어 사용하지 않는다(추측 금지) — 집계로만 판정.
 export interface LSKROrderExec { ok: boolean; rspCd: string; rspMsg: string; buyOrdQty: number; buyExecQty: number; sellOrdQty: number; sellExecQty: number; diag?: LSHttpDiag; }
+
+// ── KR 주문체결 대사 '분류형' 조회 (P0-35P4) — US(COSAQ00102)와 대칭. soft 조회로 raw rsp_cd 를 잡아 SUCCESS/EMPTY/
+//   BUSINESS_ERROR/TRANSPORT_ERROR 로 분류(추측 금지). '0건 정상'과 'API 실패'를 절대 혼동하지 않는다.
+//   ⚠️ 기존 queryLSKROrderExec(kr-trader 사용)는 변경하지 않는다(별도 함수).
+export interface LSKROrderExecClassified {
+  queryOk: boolean; classification: OrderExecClassification;
+  rspCd: string; rspMsg: string;
+  buyOrdQty: number; buyExecQty: number; sellOrdQty: number; sellExecQty: number;
+  hasEnvelope: boolean; httpStatus: number | null; kind?: LSErrorKind; diag?: LSHttpDiag;
+}
+// 순수 분류 — successCodes/emptyCodes 는 실측·문서 확정분만(추측 금지). 그 외 HTTP200 업무코드=BUSINESS_ERROR.
+export function classifyKROrderExec(p: { rspCd: string; hasEnvelope: boolean; successCodes: string[]; emptyCodes: string[] }): OrderExecClassification {
+  if (p.emptyCodes.includes(p.rspCd)) return 'EMPTY';
+  if (p.successCodes.includes(p.rspCd)) return p.hasEnvelope ? 'SUCCESS' : 'EMPTY';
+  return 'BUSINESS_ERROR';   // 미확정 업무코드 → fail-closed(호출측이 대사 실패로 처리)
+}
+export async function queryLSKROrderExecClassified(cfg: LSConfig, token: string, p: { shcode: string; ordDate: string; bnsTpCode?: string }): Promise<LSKROrderExecClassified> {
+  const inb = { CSPAQ13700InBlock1: { OrdMktCode: '00', BnsTpCode: p.bnsTpCode ?? '0', IsuNo: krIsuNo(p.shcode), ExecYn: '0', OrdDt: p.ordDate, SrtOrdNo2: 0, BkseqTpCode: '0', OrdPtnCode: '00' } };
+  const successCodes = LS_SUCCESS_CODES['CSPAQ13700'] ?? ['00000'];   // 미등록이면 00000 만(추측으로 코드 추가 금지)
+  const emptyCodes = LS_EMPTY_CODES['CSPAQ13700'] ?? [];
+  try {
+    // soft: HTTP200 이면 업무코드여도 throw 없이 반환 → 아래에서 엄격 분류. transport 오류는 여전히 throw.
+    const { data, rspCd, rspMsg, diag } = await lsPost(token, '/stock/accno', 'CSPAQ13700', inb, { soft: true });
+    const o2 = data?.CSPAQ13700OutBlock2;
+    const hasEnvelope = o2 != null;
+    const classification = classifyKROrderExec({ rspCd, hasEnvelope, successCodes, emptyCodes });
+    const queryOk = classification === 'SUCCESS' || classification === 'EMPTY';
+    return {
+      queryOk, classification, rspCd, rspMsg,
+      buyOrdQty: toNum(o2?.BuyOrdQty), buyExecQty: toNum(o2?.BuyExecQty), sellOrdQty: toNum(o2?.SellOrdQty), sellExecQty: toNum(o2?.SellExecQty),
+      hasEnvelope, httpStatus: diag.status, diag,
+    };
+  } catch (e) {
+    // 여기 도달 = transport 실패(네트워크/timeout/빈응답/JSON오류/HTTP>=400/호출제한). 안전차단.
+    const kind: LSErrorKind = e instanceof LSApiError ? e.kind : 'INVALID_RESPONSE';
+    const diag = e instanceof LSApiError ? e.diag : undefined;
+    return {
+      queryOk: false, classification: 'TRANSPORT_ERROR', rspCd: e instanceof LSApiError ? (e.rspCd ?? `ERR(${e.kind})`) : 'EXCEPTION',
+      rspMsg: e instanceof Error ? e.message : String(e),
+      buyOrdQty: 0, buyExecQty: 0, sellOrdQty: 0, sellExecQty: 0, hasEnvelope: false, httpStatus: diag?.status ?? null, kind, diag,
+    };
+  }
+}
 export async function queryLSKROrderExec(cfg: LSConfig, token: string, p: { shcode: string; ordDate: string; bnsTpCode?: string }): Promise<LSKROrderExec> {
   const inb = { CSPAQ13700InBlock1: { OrdMktCode: '00', BnsTpCode: p.bnsTpCode ?? '0', IsuNo: krIsuNo(p.shcode), ExecYn: '0', OrdDt: p.ordDate, SrtOrdNo2: 0, BkseqTpCode: '0', OrdPtnCode: '00' } };
   try {
