@@ -10,7 +10,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   getLSKRPrice, getLSUSPrice, getLSKRBalance, getLSUSDeposit, isCashOnly, usCashOnlyUsdCap, computeUSOrderQty,
-  usOrderableQty, evaluateCrossWon, usEtSession,
+  usOrderableQty, evaluateCrossWon, usEtSession, resolveUSExchcd,
   queryLSUSOrderExec, queryLSKROrderExecClassified, usExchcdFromMarket, LS_US_ORDEREXEC_EMPTY_CODES,
   type OrderExecClassification, type USMarketSession,
 } from '../src/lib/ls-api';
@@ -152,16 +152,15 @@ export async function pilotPreflight(
   if (market === 'US') {
     const symUpper = candidate.symbol.toUpperCase();
     // ── US 심볼 resolve — 검증된 signal metadata(수집시 g3190) 우선 재사용, static universe 는 교차검증만(item 4·5) ──
+    //   P0-35US7: 공통 resolveUSExchcd 로 통일(지속러너 복원과 동일 규칙).
     const storedExchange = String(first.exchange ?? '');   // 'NASDAQ'|'NYSE_AMEX'|'ETC'
-    const storedExchcd = first.exchcd ? String(first.exchcd) : (usExchcdFromMarket(storedExchange) ?? '');
+    const storedExchcd = first.exchcd ? String(first.exchcd) : '';
     const uni = loadUSSymbols(); const universeSym = uni.ok.find(s => s.symbol === symUpper);
-    let resolvedExchcd = ''; let failureReason = '';
-    if (storedExchcd && universeSym && universeSym.exchcd !== storedExchcd) failureReason = `STORED_UNIVERSE_CONFLICT(stored=${storedExchcd} vs universe=${universeSym.exchcd})`;
-    else if (storedExchcd) resolvedExchcd = storedExchcd;
-    else if (universeSym) resolvedExchcd = universeSym.exchcd;
-    else failureReason = 'NO_EXCHCD(signal metadata·static universe 모두 없음 → build-us-history 재실행으로 exchcd 저장 필요)';
+    const res = resolveUSExchcd({ storedExchcd, storedExchange, universeExchcd: universeSym?.exchcd ?? null });
+    const resolvedExchcd = res.exchcd; const failureReason = res.failureReason;
     const symbolDiag: UsSymbolDiag = {
-      candidateSymbol: candidate.symbol, storedExchange: storedExchange || '(없음)', storedExchcd: storedExchcd || '(없음)',
+      candidateSymbol: candidate.symbol, storedExchange: storedExchange || '(없음)',
+      storedExchcd: (storedExchcd || (usExchcdFromMarket(storedExchange) ?? '')) || '(없음)',
       universeFound: !!universeSym, universeExchange: universeSym?.exchange ?? '-', resolved: resolvedExchcd || 'FAIL', failureReason: failureReason || '-',
     };
     base.symbolDiag = symbolDiag;

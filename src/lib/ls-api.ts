@@ -409,6 +409,20 @@ function usMarketFromExchcd(exchcd: string): 'NASDAQ' | 'NYSE_AMEX' | 'ETC' {
 export function usExchcdFromMarket(market: string): string | null {
   return market === 'NASDAQ' ? '82' : market === 'NYSE_AMEX' ? '81' : null;
 }
+// ── US exchcd 공통 해결기 (P0-35US7) — pilot preflight 와 지속러너 복원이 동일 규칙으로 exchcd 를 해결(통일). ──
+//   우선순위: signal exchcd(g3190 수집) > signal exchange 라벨(NASDAQ/NYSE_AMEX) 유도 > static universe.
+//   ⚠️ signal 근거와 universe 가 불일치하면 fail-closed(추측 금지). static universe 에 없다는 이유만으로 포기하지 않는다.
+export interface USExchcdResolution { exchcd: string; source: 'SIGNAL_EXCHCD' | 'SIGNAL_EXCHANGE' | 'UNIVERSE' | 'CONFLICT' | 'NONE'; failureReason: string; }
+export function resolveUSExchcd(p: { storedExchcd?: string | null; storedExchange?: string | null; universeExchcd?: string | null }): USExchcdResolution {
+  const rawExchcd = (p.storedExchcd ?? '').trim();
+  const fromExchange = usExchcdFromMarket((p.storedExchange ?? '').trim()) ?? '';
+  const signal = rawExchcd || fromExchange;                 // signal 근거(exchcd 우선, 없으면 exchange 라벨 유도)
+  const uni = (p.universeExchcd ?? '').trim();
+  if (signal && uni && signal !== uni) return { exchcd: '', source: 'CONFLICT', failureReason: `STORED_UNIVERSE_CONFLICT(signal=${signal} vs universe=${uni})` };
+  if (signal) return { exchcd: signal, source: rawExchcd ? 'SIGNAL_EXCHCD' : 'SIGNAL_EXCHANGE', failureReason: '' };
+  if (uni) return { exchcd: uni, source: 'UNIVERSE', failureReason: '' };
+  return { exchcd: '', source: 'NONE', failureReason: 'NO_EXCHCD(signal metadata·static universe 모두 없음)' };
+}
 export function parseLSUSMasterRow(r: any): LSUSMasterRow {
   const exchcd = String(r.exchcd ?? '');
   const expire = String(r.expire_date ?? '00000000');

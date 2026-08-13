@@ -10,7 +10,7 @@ import { loadUSSymbols } from './universe';
 import { YeokmaePositionStore } from './yeokmae-position-store';
 import { YEOKMAE_DAILY_ROOT } from './yeokmae-daily-cache';
 import { marketDate } from './yeokmae-pilot-core';
-import { recoverYeokmaeUSFromBroker, applyYeokmaeRecoveryToLedger, summarizeYeokmaeLive } from './yeokmae-recover';
+import { recoverYeokmaeUSFromBroker, applyYeokmaeRecoveryToLedger, summarizeYeokmaeLive, planUSHoldingRecovery } from './yeokmae-recover';
 import { getLSUSHoldings, getLSUSPrice, usEtSession } from '../src/lib/ls-api';
 import {
   evaluateYeokmaeExit, updateHighestPrice, formatYeokmaeExitPolicy, DEFAULT_YEOKMAE_EXIT_CONFIG,
@@ -21,18 +21,20 @@ import { join } from 'node:path';
 
 const SIGNAL_KEYS = ['112_ORIGINAL', '224_ORIGINAL', '112_UPGRADE', '224_UPGRADE', 'LONG_TERM'];
 
-// real-signals.json → symbol별 진입근거(confirmedDate/matchedSignals/exchange) 매핑(있으면).
-function loadSignalMeta(market: 'US'): Map<string, { confirmedDate: string | null; matchedSignals: string[]; exchange: string }> {
-  const m = new Map<string, { confirmedDate: string | null; matchedSignals: string[]; exchange: string }>();
+// real-signals.json → symbol별 진입근거(confirmedDate/matchedSignals/exchange/exchcd) 매핑(있으면).
+interface SignalMeta { confirmedDate: string | null; matchedSignals: string[]; exchange: string; exchcd: string | null; }
+function loadSignalMeta(market: 'US'): Map<string, SignalMeta> {
+  const m = new Map<string, SignalMeta>();
   const file = join(YEOKMAE_DAILY_ROOT, `${market}.real-signals.json`);
   if (!existsSync(file)) return m;
   try {
     const signals: any[] = JSON.parse(readFileSync(file, 'utf8')).signals ?? [];
     for (const s of signals) {
       const matched = SIGNAL_KEYS.filter(k => s[k] === true);
-      m.set(String(s.symbol).toUpperCase(), { confirmedDate: s.confirmedDate ?? null, matchedSignals: matched, exchange: String(s.exchange ?? '') });
+      if (matched.length === 0) continue;   // 5신호 ON 인 confirmed 후보만(BUY 근거) — item2·3
+      m.set(String(s.symbol).toUpperCase(), { confirmedDate: s.confirmedDate ?? null, matchedSignals: matched, exchange: String(s.exchange ?? ''), exchcd: s.exchcd != null ? String(s.exchcd) : null });
     }
-  } catch { /* 무시 — 메타 없어도 복원은 broker evidence 로 진행 */ }
+  } catch { /* 무시 — 메타 없어도 원장 기존 포지션은 broker evidence 로 동기화 */ }
   return m;
 }
 
@@ -91,17 +93,25 @@ async function main() {
     log.info(`[YEOKMAE-LIVE-HOLDINGS] ok=${hold.ok} rsp_cd=${hold.rspCd} 보유종목=[${heldSymbols.join(',') || '없음'}] rawRows=${hold.rawRows}`);
   } catch (e) { log.warn(`[YEOKMAE-LIVE-HOLDINGS] 조회 실패 → 원장 기존값 유지(감시만). ${scrub(String(e))}`); }
 
+  const entryDateISO = `${etDate.slice(0, 4)}-${etDate.slice(4, 6)}-${etDate.slice(6, 8)}`;
   if (holdingsOk) {
     for (const sym of heldSymbols) {
-      const u = uni.ok.find(s => s.symbol === sym);
-      const md = meta.get(sym);
-      const exchcd = u?.exchcd ?? '';
-      if (!exchcd) { log.warn(`[YEOKMAE-LIVE-RECOVER] ${sym} exchcd 미해결(universe 없음) → 복원 보류(추측 금지).`); continue; }
+      const md = meta.get(sym);                          // signal metadata(real-signals.json, 5신호 ON)
+      const u = uni.ok.find(s => s.symbol === sym);       // static universe(교차검증)
+      const ledger = posStore.get(sym);                   // 기존 YEOKMAE 원장(재기동 복원 증거)
+      const plan = planUSHoldingRecovery({
+        symbol: sym, hasSignal: !!md, signalExchcd: md?.exchcd ?? null, signalExchange: md?.exchange ?? null,
+        ledgerExists: !!ledger, ledgerExchcd: ledger?.exchcd ?? null, universeExchcd: u?.exchcd ?? null,
+      });
+      if (plan.action !== 'RECOVER') {
+        log.info(`[YEOKMAE-LIVE-RECOVER] ${sym} strategyTag=${plan.strategyTag} action=${plan.action} → ${plan.reason} (건드리지 않음)`);
+        continue;
+      }
       try {
-        const rec = await recoverYeokmaeUSFromBroker(cfg, token, { symbol: sym, exchcd, ordDate: etDate, baseDate: etDate });
-        log.info(`[YEOKMAE-LIVE-RECOVER] ${sym} exchcd=${exchcd} ordNo=${rec.ordNo ?? '-'} ordQty=${rec.ordQty} execQty=${rec.execQty} unfilled=${rec.unfilledQty} entryAvg=${rec.entryAvgPrice.toFixed(2)} 보유수량=${rec.holdingBalQty} sellable=${rec.holdingSellableQty} evidenceOk=${rec.evidenceOk} ${rec.reason}`);
-        const applied = applyYeokmaeRecoveryToLedger(posStore, rec, { entryDate: (md?.confirmedDate ?? etDate), confirmedSignalDate: md?.confirmedDate ?? null, matchedSignals: md?.matchedSignals ?? [] });
-        log.info(`[YEOKMAE-LIVE-LEDGER] ${sym} applied=${applied.applied} qty=${applied.qty} ${applied.reason}`);
+        const rec = await recoverYeokmaeUSFromBroker(cfg, token, { symbol: sym, exchcd: plan.exchcd, ordDate: etDate, baseDate: etDate });
+        log.info(`[YEOKMAE-LIVE-RECOVER] ${sym} exchcd=${plan.exchcd}(src=${plan.source}) ordNo=${rec.ordNo ?? '-'} ordQty=${rec.ordQty} execQty=${rec.execQty} unfilled=${rec.unfilledQty} entryAvg=${rec.entryAvgPrice.toFixed(2)} 보유수량=${rec.holdingBalQty} sellable=${rec.holdingSellableQty} evidenceOk=${rec.evidenceOk} ${rec.reason}`);
+        const applied = applyYeokmaeRecoveryToLedger(posStore, rec, { entryDate: entryDateISO, confirmedSignalDate: md?.confirmedDate ?? ledger?.confirmedSignalDate ?? null, matchedSignals: md?.matchedSignals ?? ledger?.matchedSignals ?? [] });
+        log.info(`[YEOKMAE-LIVE-LEDGER] ${sym} applied=${applied.applied} qty=${applied.qty} strategyTag=YEOKMAE ${applied.reason}`);
       } catch (e) { log.warn(`[YEOKMAE-LIVE-RECOVER] ${sym} 복원 조회 실패 → 보류. ${scrub(String(e))}`); }
     }
   }

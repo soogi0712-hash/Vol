@@ -3,7 +3,7 @@
 //   이미 접수된 PRGO 주문(00040 성공)을 재조회로만 확인해 strategyTag=YEOKMAE 원장에 반영한다.
 import type { LocalLSConfig } from './ls-client';
 import {
-  queryLSUSOrderExec, getLSUSHoldings, LS_US_ORDEREXEC_EMPTY_CODES,
+  queryLSUSOrderExec, getLSUSHoldings, resolveUSExchcd, LS_US_ORDEREXEC_EMPTY_CODES,
   type LSOrderExec, type LSUSHolding, type OrderExecClassification,
 } from '../src/lib/ls-api';
 import type { YeokmaePositionStore, YeokmaePosition } from './yeokmae-position-store';
@@ -61,6 +61,26 @@ export function buildYeokmaeUSRecovery(p: {
     holdingBalQty, holdingSellableQty, ledgerQty, filled,
     reconClassification: p.reconClassification, reconOk: p.reconOk, holdingsOk: p.holdingsOk, evidenceOk, reason,
   };
+}
+
+// ── 보유종목별 복원 계획 (P0-35US7, 순수·테스트용) — exchcd 해결 + YEOKMAE 태깅 자격 판정. ──
+//   자격: signal metadata(real-signals 5신호) 또는 기존 YEOKMAE 원장이 있어야 YEOKMAE 로 복원(item2·3).
+//   둘 다 없으면 UNKNOWN(임의 태깅 금지 — AIOT/AMSF 같은 기존 BB/수동 보유 보호). exchcd 는 signal > 원장 > universe.
+export type HoldingRecoveryAction = 'RECOVER' | 'SKIP_UNKNOWN' | 'SKIP_CONFLICT' | 'SKIP_NO_EXCHCD';
+export interface HoldingRecoveryPlan { action: HoldingRecoveryAction; exchcd: string; source: string; strategyTag: 'YEOKMAE' | 'UNKNOWN'; reason: string; }
+export function planUSHoldingRecovery(p: {
+  symbol: string;
+  hasSignal: boolean; signalExchcd?: string | null; signalExchange?: string | null;
+  ledgerExists: boolean; ledgerExchcd?: string | null;
+  universeExchcd?: string | null;
+}): HoldingRecoveryPlan {
+  if (!p.hasSignal && !p.ledgerExists) {
+    return { action: 'SKIP_UNKNOWN', exchcd: '', source: 'NONE', strategyTag: 'UNKNOWN', reason: 'signal 근거 없음 & YEOKMAE 원장 없음 → 태깅 안 함(기존 BB/수동 보유 보호)' };
+  }
+  const res = resolveUSExchcd({ storedExchcd: p.signalExchcd ?? p.ledgerExchcd ?? null, storedExchange: p.signalExchange ?? null, universeExchcd: p.universeExchcd ?? null });
+  if (res.source === 'CONFLICT') return { action: 'SKIP_CONFLICT', exchcd: '', source: res.source, strategyTag: 'UNKNOWN', reason: res.failureReason };
+  if (!res.exchcd) return { action: 'SKIP_NO_EXCHCD', exchcd: '', source: res.source, strategyTag: 'UNKNOWN', reason: res.failureReason };
+  return { action: 'RECOVER', exchcd: res.exchcd, source: res.source, strategyTag: 'YEOKMAE', reason: `exchcd=${res.exchcd}(src=${res.source})` };
 }
 
 // ── broker 재조회 → 복원 근거 산출(POST 없음: 읽기전용 COSAQ00102 + COSOQ00201). ──
