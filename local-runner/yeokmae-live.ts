@@ -87,13 +87,16 @@ async function main() {
   const meta = loadSignalMeta('US');
   const uni = loadUSSymbols();
   let holdingsOk = false; let heldSymbols: string[] = [];
+  const holdingQtyMap = new Map<string, number>();
   try {
     const hold = await getLSUSHoldings(cfg, token, etDate);
     holdingsOk = hold.ok; heldSymbols = hold.holdings.map(h => h.symbol.toUpperCase());
+    for (const h of hold.holdings) holdingQtyMap.set(h.symbol.toUpperCase(), h.balQty);
     log.info(`[YEOKMAE-LIVE-HOLDINGS] ok=${hold.ok} rsp_cd=${hold.rspCd} 보유종목=[${heldSymbols.join(',') || '없음'}] rawRows=${hold.rawRows}`);
   } catch (e) { log.warn(`[YEOKMAE-LIVE-HOLDINGS] 조회 실패 → 원장 기존값 유지(감시만). ${scrub(String(e))}`); }
 
   const entryDateISO = `${etDate.slice(0, 4)}-${etDate.slice(4, 6)}-${etDate.slice(6, 8)}`;
+  const unresolved: { symbol: string; holdingQty: number; reason: string }[] = [];
   if (holdingsOk) {
     for (const sym of heldSymbols) {
       const md = meta.get(sym);                          // signal metadata(real-signals.json, 5신호 ON)
@@ -108,21 +111,37 @@ async function main() {
         continue;
       }
       try {
-        const rec = await recoverYeokmaeUSFromBroker(cfg, token, { symbol: sym, exchcd: plan.exchcd, ordDate: etDate, baseDate: etDate });
+        const rec = await recoverYeokmaeUSFromBroker(cfg, token, { symbol: sym, exchcd: plan.exchcd, ordDate: etDate, baseDate: etDate, yeokmaeEligible: true });
+        // item1: COSAQ00102 원문 진단 — BUSINESS_ERROR 원인(실 rsp_cd/rows) 노출.
+        const d = rec.reconDiag;
+        log.info(`[YEOKMAE-RECOVER-RECON-DIAG] ${sym} ordDate=${d.ordDate} exchcd=${d.exchcd} rsp_cd=${d.rspCd} rsp_msg=${d.rspMsg} httpStatus=${d.httpStatus ?? '-'} envelope=${d.hasEnvelope} rawRows=${d.rawRows} symbolRows=${d.symbolRows} OrdNo=${d.ordNo} OrdQty=${d.ordQty} ExecQty=${d.execQty} UnfilledQty=${d.unfilledQty} AvgExecPrc=${d.avgExecPrc} classification=${d.classification} failureReason=${d.failureReason}`);
         log.info(`[YEOKMAE-LIVE-RECOVER] ${sym} exchcd=${plan.exchcd}(src=${plan.source}) ordNo=${rec.ordNo ?? '-'} ordQty=${rec.ordQty} execQty=${rec.execQty} unfilled=${rec.unfilledQty} entryAvg=${rec.entryAvgPrice.toFixed(2)} 보유수량=${rec.holdingBalQty} sellable=${rec.holdingSellableQty} evidenceOk=${rec.evidenceOk} ${rec.reason}`);
         const applied = applyYeokmaeRecoveryToLedger(posStore, rec, { entryDate: entryDateISO, confirmedSignalDate: md?.confirmedDate ?? ledger?.confirmedSignalDate ?? null, matchedSignals: md?.matchedSignals ?? ledger?.matchedSignals ?? [] });
         log.info(`[YEOKMAE-LIVE-LEDGER] ${sym} applied=${applied.applied} qty=${applied.qty} strategyTag=YEOKMAE ${applied.reason}`);
-      } catch (e) { log.warn(`[YEOKMAE-LIVE-RECOVER] ${sym} 복원 조회 실패 → 보류. ${scrub(String(e))}`); }
+        // item4: 실보유>0 인데 원장 미반영(evidence 불완전) → 미해결 YEOKMAE 보유로 등록(신규 BUY fail-closed).
+        if (rec.unresolvedYeokmaeHolding || (rec.holdingBalQty > 0 && applied.applied === 'SKIPPED')) {
+          unresolved.push({ symbol: sym, holdingQty: rec.holdingBalQty, reason: rec.unresolvedYeokmaeHolding ? `UNRESOLVED_YEOKMAE_HOLDING(recon=${rec.reconClassification})` : `APPLY_SKIPPED(${applied.reason})` });
+          log.warn(`[YEOKMAE-LIVE-UNRESOLVED] ${sym} 실보유 ${rec.holdingBalQty}주 · recon=${rec.reconClassification} → 평단 미확정. 신규 BUY 차단(fail-closed), 자동 SELL 미활성(평단 확보 전).`);
+        }
+      } catch (e) {
+        log.warn(`[YEOKMAE-LIVE-RECOVER] ${sym} 복원 조회 실패 → 보류. ${scrub(String(e))}`);
+        // 조회 실패이지만 broker holdings 에는 있는 YEOKMAE 자격 종목 → 미해결로 간주(보수적 BUY 차단).
+        const bal = holdingQtyMap.get(sym) ?? 0;
+        if (bal > 0) unresolved.push({ symbol: sym, holdingQty: bal, reason: 'RECOVER_QUERY_FAILED' });
+      }
     }
   }
 
   // ── ② 시작요약(item 3·4 필수 확인값) ──
-  const startup = summarizeYeokmaeLive(posStore.all(), YEOKMAE_PILOT_MAX_POSITIONS);
+  const startup = summarizeYeokmaeLive(posStore.all(), YEOKMAE_PILOT_MAX_POSITIONS, unresolved);
   for (const p of startup.positions) {
     log.info(`[YEOKMAE-LIVE-POSITION] symbol=${p.symbol} qty=${p.qty} strategyTag=${p.strategyTag} entryAvgPrice=${p.entryAvgPrice.toFixed(2)} confirmedSignalDate=${p.confirmedSignalDate ?? '-'} matchedSignals=[${p.matchedSignals.join(',')}] SELL_ARMED=${p.sellArmed} (STOP_LOSS=-${p.stopLossPct}% TAKE_PROFIT=+${p.takeProfitPct}% MAX_HOLD_DAYS=${p.maxHoldDays})`);
   }
-  log.info(`[YEOKMAE-LIVE-STARTUP] currentYeokmaePositions=${startup.currentYeokmaePositions}/${startup.maxPositions} additionalBuyAllowed=${startup.additionalBuyAllowed} SELL_ARMED=${startup.sellArmed} · BB SELL 미적용(별도 저장소 물리분리)`);
-  if (!startup.additionalBuyAllowed) log.info(`[YEOKMAE-LIVE-BUY-GATE] 보유 ${startup.currentYeokmaePositions}/${startup.maxPositions} → 신규 BUY 차단(additionalBuyAllowed=false). 보유청산 후에만 신규 진입.`);
+  for (const u of startup.unresolvedYeokmaeHoldings) {
+    log.warn(`[YEOKMAE-LIVE-UNRESOLVED-HOLDING] symbol=${u.symbol} holdingQty=${u.holdingQty} reason=${u.reason} → additionalBuyAllowed=false(중복매수 차단). 평단 미확정 → 자동 SELL 미활성. COSAQ00102 실체결 확보 후 복원.`);
+  }
+  log.info(`[YEOKMAE-LIVE-STARTUP] currentYeokmaePositions=${startup.currentYeokmaePositions}/${startup.maxPositions} additionalBuyAllowed=${startup.additionalBuyAllowed} SELL_ARMED=${startup.sellArmed} unresolvedYeokmaeHoldings=${startup.unresolvedYeokmaeHoldings.length}[${startup.unresolvedYeokmaeHoldings.map(u => u.symbol).join(',')}] · BB SELL 미적용(별도 저장소 물리분리)`);
+  if (!startup.additionalBuyAllowed) log.info(`[YEOKMAE-LIVE-BUY-GATE] additionalBuyAllowed=false → 신규 BUY 차단(보유 ${startup.currentYeokmaePositions}/${startup.maxPositions}${startup.unresolvedYeokmaeHoldings.length ? ` + 미해결 YEOKMAE 보유 ${startup.unresolvedYeokmaeHoldings.length}` : ''}). 청산/복원 후에만 신규 진입.`);
 
   // ── ③~⑤ 지속 감시 루프 (POST 없음) ──
   await watchCycle(cfg, token, posStore, (m) => log.info(m));

@@ -9,6 +9,14 @@ import {
 import type { YeokmaePositionStore, YeokmaePosition } from './yeokmae-position-store';
 import { DEFAULT_YEOKMAE_EXIT_CONFIG, YEOKMAE_PILOT_MAX_POSITIONS } from '../src/lib/yeokmae';
 
+// COSAQ00102 원문 진단(P0-35US8) — BUSINESS_ERROR 원인 규명용. rsp_cd/rows 를 그대로 노출(신뢰판정 미사용).
+export interface YeokmaeRecoverReconDiag {
+  ordDate: string; exchcd: string; symbol: string;
+  rspCd: string; rspMsg: string; httpStatus: number | null; hasEnvelope: boolean;
+  rawRows: number; symbolRows: number;
+  ordNo: string; ordQty: number; execQty: number; unfilledQty: number; avgExecPrc: string;
+  classification: OrderExecClassification; failureReason: string;
+}
 export interface YeokmaeUSRecovery {
   symbol: string; exchcd: string;
   ordNo: string | null;
@@ -24,6 +32,9 @@ export interface YeokmaeUSRecovery {
   reconOk: boolean;       // COSAQ00102 SUCCESS/EMPTY (신뢰)
   holdingsOk: boolean;    // COSOQ00201 조회 성공(신뢰)
   evidenceOk: boolean;    // 두 조회 모두 신뢰 → 원장 반영 허용
+  // item4: signal/원장상 YEOKMAE + 실보유>0 인데 recon evidence 불완전 → 미해결 보유(신규 BUY fail-closed 대상).
+  unresolvedYeokmaeHolding: boolean;
+  reconDiag: YeokmaeRecoverReconDiag;
   reason: string;
 }
 
@@ -32,6 +43,11 @@ export function buildYeokmaeUSRecovery(p: {
   symbol: string; exchcd: string;
   rows: LSOrderExec[]; reconClassification: OrderExecClassification; reconOk: boolean;
   holdings: LSUSHolding[]; holdingsOk: boolean;
+  // 진단용(선택): 원문 recon 응답. parsedRows 는 BUSINESS_ERROR 여도 원문 rows(신뢰판정 미사용, 표시 전용).
+  ordDate?: string; rspCd?: string; rspMsg?: string; httpStatus?: number | null; hasEnvelope?: boolean;
+  rawRows?: number; parsedRows?: LSOrderExec[];
+  // YEOKMAE 자격(signal metadata 또는 기존 원장). true 여야 미해결 보유(unresolved) 판정 대상.
+  yeokmaeEligible?: boolean;
 }): YeokmaeUSRecovery {
   const sym = p.symbol.toUpperCase();
   const buyRows = p.rows.filter(r => r.symbol.toUpperCase() === sym && r.ordPtnCode === '02');
@@ -51,15 +67,35 @@ export function buildYeokmaeUSRecovery(p: {
   const ledgerQty = holdingBalQty > 0 ? holdingBalQty : execQty;
   const filled = execQty > 0 || holdingBalQty > 0;
   const evidenceOk = p.reconOk && p.holdingsOk;
-  const reason = !evidenceOk
-    ? `EVIDENCE_UNTRUSTED(recon=${p.reconClassification}/${p.reconOk} holdingsOk=${p.holdingsOk}) → 원장 미반영(fail-closed)`
-    : filled
-      ? `FILLED(execQty=${execQty} holdingBalQty=${holdingBalQty} ledgerQty=${ledgerQty} entryAvg=${entryAvgPrice.toFixed(2)})`
-      : `NO_FILL(execQty=0 holdingBalQty=0 — 접수만/미체결 또는 보유 없음)`;
+  // item4: YEOKMAE 자격 + 실보유>0 인데 recon evidence 불완전(원장 반영 불가) → 미해결 보유.
+  const unresolvedYeokmaeHolding = !!p.yeokmaeEligible && holdingBalQty > 0 && !evidenceOk;
+  const reason = unresolvedYeokmaeHolding
+    ? `UNRESOLVED_YEOKMAE_HOLDING(실보유 ${holdingBalQty}주 but recon=${p.reconClassification} → 평단 미확정. 신규 BUY 차단, 자동 SELL 미활성)`
+    : !evidenceOk
+      ? `EVIDENCE_UNTRUSTED(recon=${p.reconClassification}/${p.reconOk} holdingsOk=${p.holdingsOk}) → 원장 미반영(fail-closed)`
+      : filled
+        ? `FILLED(execQty=${execQty} holdingBalQty=${holdingBalQty} ledgerQty=${ledgerQty} entryAvg=${entryAvgPrice.toFixed(2)})`
+        : `NO_FILL(execQty=0 holdingBalQty=0 — 접수만/미체결 또는 보유 없음)`;
+  // 진단: parsedRows(원문, BUSINESS_ERROR 여도 유지) 로 PRGO 행을 그대로 노출.
+  const diagRows = (p.parsedRows ?? p.rows).filter(r => r.symbol.toUpperCase() === sym && r.ordPtnCode === '02');
+  const reconDiag: YeokmaeRecoverReconDiag = {
+    ordDate: p.ordDate ?? '-', exchcd: p.exchcd, symbol: sym,
+    rspCd: p.rspCd ?? '-', rspMsg: p.rspMsg ?? '-', httpStatus: p.httpStatus ?? null, hasEnvelope: p.hasEnvelope ?? false,
+    rawRows: p.rawRows ?? (p.parsedRows ?? p.rows).length, symbolRows: diagRows.length,
+    ordNo: (diagRows[0]?.ordNo ?? '-') || '-',
+    ordQty: diagRows.reduce((s, r) => s + r.ordQty, 0),
+    execQty: diagRows.reduce((s, r) => s + r.execQty, 0),
+    unfilledQty: diagRows.reduce((s, r) => s + r.unfilledQty, 0),
+    // AvgExecPrc 공식 필드 미확정 → OvrsOrdPrc(주문지정가) 기반 값으로 표시(추측 금지, 라벨 명시).
+    avgExecPrc: diagRows.length ? `${diagRows[0].ordPrc}(OvrsOrdPrc·AvgExecPrc필드미확정)` : 'n/a',
+    classification: p.reconClassification,
+    failureReason: p.reconOk ? '-' : `NON_SUCCESS(rsp_cd=${p.rspCd ?? '-'} classification=${p.reconClassification} — COSAQ00102 성공/EMPTY 코드 미등록 가능)`,
+  };
   return {
     symbol: sym, exchcd: p.exchcd, ordNo, ordQty, execQty, unfilledQty, entryAvgPrice,
     holdingBalQty, holdingSellableQty, ledgerQty, filled,
-    reconClassification: p.reconClassification, reconOk: p.reconOk, holdingsOk: p.holdingsOk, evidenceOk, reason,
+    reconClassification: p.reconClassification, reconOk: p.reconOk, holdingsOk: p.holdingsOk, evidenceOk,
+    unresolvedYeokmaeHolding, reconDiag, reason,
   };
 }
 
@@ -86,7 +122,7 @@ export function planUSHoldingRecovery(p: {
 // ── broker 재조회 → 복원 근거 산출(POST 없음: 읽기전용 COSAQ00102 + COSOQ00201). ──
 export async function recoverYeokmaeUSFromBroker(
   cfg: LocalLSConfig, token: string,
-  p: { symbol: string; exchcd: string; ordDate: string; baseDate: string },
+  p: { symbol: string; exchcd: string; ordDate: string; baseDate: string; yeokmaeEligible?: boolean },
 ): Promise<YeokmaeUSRecovery> {
   const rec = await queryLSUSOrderExec(cfg, token, { exchcd: p.exchcd, symbol: p.symbol.toUpperCase(), ordDate: p.ordDate }, { emptyCodes: LS_US_ORDEREXEC_EMPTY_CODES });
   const hold = await getLSUSHoldings(cfg, token, p.baseDate);
@@ -94,6 +130,9 @@ export async function recoverYeokmaeUSFromBroker(
     symbol: p.symbol, exchcd: p.exchcd,
     rows: rec.rows, reconClassification: rec.classification, reconOk: rec.queryOk,
     holdings: hold.holdings, holdingsOk: hold.ok,
+    ordDate: p.ordDate, rspCd: rec.rspCd, rspMsg: rec.rspMsg, httpStatus: rec.httpStatus ?? null,
+    hasEnvelope: rec.hasEnvelope, rawRows: (rec.parsedRows ?? rec.rows).length, parsedRows: rec.parsedRows ?? rec.rows,
+    yeokmaeEligible: p.yeokmaeEligible,
   });
 }
 
@@ -131,12 +170,19 @@ export interface YeokmaeLivePositionView {
   confirmedSignalDate: string | null; matchedSignals: string[];
   stopLossPct: number; takeProfitPct: number; maxHoldDays: number; sellArmed: boolean;
 }
+export interface UnresolvedYeokmaeHolding { symbol: string; holdingQty: number; reason: string; }
 export interface YeokmaeLiveStartup {
   positions: YeokmaeLivePositionView[];
   currentYeokmaePositions: number; maxPositions: number;
   additionalBuyAllowed: boolean; sellArmed: boolean;
+  unresolvedYeokmaeHoldings: UnresolvedYeokmaeHolding[];
 }
-export function summarizeYeokmaeLive(positions: YeokmaePosition[], maxPositions = YEOKMAE_PILOT_MAX_POSITIONS): YeokmaeLiveStartup {
+// item4 안전장치: unresolved(YEOKMAE 자격 + 실보유>0 인데 복원 evidence 불완전)가 하나라도 있으면
+//   중복매수 위험 → additionalBuyAllowed=false 로 fail-closed. 평단 미확정이라 자동 SELL 은 미활성(원장 미반영).
+export function summarizeYeokmaeLive(
+  positions: YeokmaePosition[], maxPositions = YEOKMAE_PILOT_MAX_POSITIONS,
+  unresolvedYeokmaeHoldings: UnresolvedYeokmaeHolding[] = [],
+): YeokmaeLiveStartup {
   const held = positions.filter(p => p.qty > 0);
   const views: YeokmaeLivePositionView[] = held.map(p => ({
     symbol: p.symbol, qty: p.qty, strategyTag: p.strategyTag, entryAvgPrice: p.entryAvgPrice,
@@ -146,9 +192,12 @@ export function summarizeYeokmaeLive(positions: YeokmaePosition[], maxPositions 
     sellArmed: p.qty > 0 && p.strategyTag === 'YEOKMAE',
   }));
   const count = held.length;
+  const hasUnresolved = unresolvedYeokmaeHoldings.length > 0;
   return {
     positions: views, currentYeokmaePositions: count, maxPositions,
-    additionalBuyAllowed: count < maxPositions,
+    // 슬롯이 남아도 미해결 YEOKMAE 보유가 있으면 신규 BUY 금지(중복매수 방지).
+    additionalBuyAllowed: count < maxPositions && !hasUnresolved,
     sellArmed: views.some(v => v.sellArmed),
+    unresolvedYeokmaeHoldings,
   };
 }

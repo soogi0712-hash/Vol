@@ -843,6 +843,9 @@ export interface LSOrderExecResult {
   queryOk: boolean; classification: OrderExecClassification;
   rspCd: string; rspMsg: string; rows: LSOrderExec[]; hasEnvelope: boolean;
   diag: LSHttpDiag; kind?: LSErrorKind; httpStatus?: number;
+  // 진단전용(P0-35US8): classification 과 무관하게 실제 파싱된 rows. rows 는 fail-closed 로 비워지지만
+  //   parsedRows 는 BUSINESS_ERROR 여도 원문 rows 를 그대로 담아 [*-RECON-DIAG] 로 원인 규명에 쓴다(신뢰판정엔 미사용).
+  parsedRows?: LSOrderExec[];
 }
 export async function queryLSUSOrderExec(
   cfg: LSConfig, token: string, p: { exchcd: string; symbol?: string; ordDate: string; execYn?: '0' | '1' | '2' },
@@ -874,13 +877,14 @@ export async function queryLSUSOrderExec(
     const classification = classifyOrderExec({ rspCd, successCodes, emptyCodes, rowCount: rows.length, hasEnvelope });
     const queryOk = classification === 'SUCCESS' || classification === 'EMPTY';
     // BUSINESS_ERROR(unknown 코드/불일치)면 rows 를 신뢰하지 않는다(비워서 반환) — 잘못된 0건 통과 방지.
-    return { queryOk, classification, rspCd, rspMsg, rows: queryOk ? rows : [], hasEnvelope, diag, httpStatus: diag.status };
+    //   parsedRows 는 진단용으로 원문 rows 를 그대로 유지(신뢰판정 미사용).
+    return { queryOk, classification, rspCd, rspMsg, rows: queryOk ? rows : [], hasEnvelope, diag, httpStatus: diag.status, parsedRows: rows };
   } catch (e) {
     // 여기 도달 = transport 실패(네트워크/timeout/빈응답/JSON오류/HTTP>=400/호출제한). 안전차단.
     const kind: LSErrorKind = e instanceof LSApiError ? e.kind : 'INVALID_RESPONSE';
     const rspCd = e instanceof LSApiError ? (e.rspCd ?? `ERR(${e.kind})`) : 'EXCEPTION';
     const diag = (e instanceof LSApiError ? e.diag : undefined) ?? ({} as LSHttpDiag);
-    return { queryOk: false, classification: 'TRANSPORT_ERROR', rspCd, rspMsg: e instanceof Error ? e.message : String(e), rows: [], hasEnvelope: false, diag, kind, httpStatus: diag.status };
+    return { queryOk: false, classification: 'TRANSPORT_ERROR', rspCd, rspMsg: e instanceof Error ? e.message : String(e), rows: [], hasEnvelope: false, diag, kind, httpStatus: diag.status, parsedRows: [] };
   }
 }
 

@@ -161,3 +161,65 @@ describe('P0-35US6 summarizeYeokmaeLive — 시작요약(item 3·4 보고값)', 
     expect(s.sellArmed).toBe(false);
   });
 });
+
+describe('P0-35US8 PRGO BUSINESS_ERROR — recon 진단 + UNRESOLVED 안전장치', () => {
+  // PRGO: holdings 4주 확인되나 COSAQ00102 가 미등록 업무코드(BUSINESS_ERROR) 반환 → 원장 미반영.
+  const prgoBiz = () => buildYeokmaeUSRecovery({
+    symbol: 'PRGO', exchcd: '81',
+    rows: [], reconClassification: 'BUSINESS_ERROR', reconOk: false,   // rows 는 fail-closed 로 비워짐
+    holdings: [hold({ balQty: 4, sellableQty: 4 })], holdingsOk: true,
+    ordDate: '20260813', rspCd: '00001', rspMsg: '조회가 완료되었습니다.', httpStatus: 200, hasEnvelope: true, rawRows: 1,
+    parsedRows: [buyRow({ execQty: 4, unfilledQty: 0, ordPrc: 12.86 })],   // 원문 rows(진단 표시용)
+    yeokmaeEligible: true,
+  });
+
+  it('item1: reconDiag 에 실 rsp_cd/rows/classification 노출(BUSINESS_ERROR 여도 parsedRows 표시)', () => {
+    const r = prgoBiz();
+    expect(r.reconDiag.rspCd).toBe('00001');
+    expect(r.reconDiag.classification).toBe('BUSINESS_ERROR');
+    expect(r.reconDiag.symbolRows).toBe(1);          // parsedRows 로 PRGO 행 노출
+    expect(r.reconDiag.execQty).toBe(4);
+    expect(r.reconDiag.avgExecPrc).toContain('12.86');
+    expect(r.reconDiag.failureReason).toContain('NON_SUCCESS');
+  });
+
+  it('item4: 실보유>0 + recon 불완전 + YEOKMAE 자격 → unresolvedYeokmaeHolding=true, evidenceOk=false', () => {
+    const r = prgoBiz();
+    expect(r.evidenceOk).toBe(false);
+    expect(r.unresolvedYeokmaeHolding).toBe(true);
+    expect(r.reason).toContain('UNRESOLVED_YEOKMAE_HOLDING');
+  });
+
+  it('item3: 원장에 임의 평단/수량 삽입 금지(SKIPPED) — holdings 로 avgPrice 추측 안 함', () => {
+    const ps = new YeokmaePositionStore(dir); ps.load();
+    const out = applyYeokmaeRecoveryToLedger(ps, prgoBiz(), { entryDate: '2026-08-13', confirmedSignalDate: '2026-08-11', matchedSignals: ['112_UPGRADE'] });
+    expect(out.applied).toBe('SKIPPED');
+    expect(ps.get('PRGO')).toBeNull();   // 평단 미확정 → 원장 미반영
+  });
+
+  it('item4: summarize 에 unresolved 전달 시 additionalBuyAllowed=false(중복매수 차단), SELL_ARMED=false', () => {
+    const ps = new YeokmaePositionStore(dir); ps.load();   // 원장 비어 있음(복원 실패)
+    const s = summarizeYeokmaeLive(ps.all(), 1, [{ symbol: 'PRGO', holdingQty: 4, reason: 'UNRESOLVED_YEOKMAE_HOLDING(recon=BUSINESS_ERROR)' }]);
+    expect(s.currentYeokmaePositions).toBe(0);
+    expect(s.additionalBuyAllowed).toBe(false);   // ⚠️ 슬롯 남아도 미해결 보유로 차단
+    expect(s.sellArmed).toBe(false);              // 평단 미확정 → 자동 SELL 미활성
+    expect(s.unresolvedYeokmaeHoldings).toHaveLength(1);
+  });
+
+  it('YEOKMAE 자격 없음(AIOT/AMSF) → business error 라도 unresolved 아님(오태깅·오차단 방지)', () => {
+    const r = buildYeokmaeUSRecovery({
+      symbol: 'AIOT', exchcd: '82', rows: [], reconClassification: 'BUSINESS_ERROR', reconOk: false,
+      holdings: [{ symbol: 'AIOT', balQty: 10, sellableQty: 10 }], holdingsOk: true, yeokmaeEligible: false,
+    });
+    expect(r.unresolvedYeokmaeHolding).toBe(false);
+  });
+
+  it('정상 복원 시 unresolved=false(회귀)', () => {
+    const r = buildYeokmaeUSRecovery({
+      symbol: 'PRGO', exchcd: '81', rows: [buyRow({})], reconClassification: 'SUCCESS', reconOk: true,
+      holdings: [hold({})], holdingsOk: true, yeokmaeEligible: true,
+    });
+    expect(r.unresolvedYeokmaeHolding).toBe(false);
+    expect(r.evidenceOk).toBe(true);
+  });
+});
