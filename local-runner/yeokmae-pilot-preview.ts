@@ -2,6 +2,7 @@
 //   ⚠️ 실제 주문 전송 없음. <market>.real-signals.json 의 confirmed 화살표 종목만 PILOT 후보로 변환하고
 //      PILOT 게이트 + [YEOKMAE-PILOT-CHECKLIST] 출력. 하나라도 불명확(false)이면 fail-closed(allowed=false).
 //   PILOT 은 사용자 승인 소액 실계정 시험 — 검증완료 아님(STRATEGY_VALIDATED=false / SEMANTICS_VERIFIED=false 유지).
+import { loadEnvLocal } from './env';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
@@ -16,6 +17,7 @@ import { YeokmaePositionStore } from './yeokmae-position-store';
 const SIGNAL_KEYS: YeokmaeSignalType[] = ['112_ORIGINAL', '224_ORIGINAL', '112_UPGRADE', '224_UPGRADE', 'LONG_TERM'];
 
 function main() {
+  loadEnvLocal();   // P0-35P3 버그수정: .env.local 자동 로드(기존 러너와 동일)
   const market = ((process.argv[2] || 'US').toUpperCase() === 'KR' ? 'KR' : 'US') as 'KR' | 'US';
   const price = Number(process.argv[3] || 0) || 0;
   const budgetUSD = Number(process.env.LS_US_PER_TRADE_BUDGET_USD || 60) || 60;
