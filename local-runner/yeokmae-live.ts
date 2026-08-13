@@ -1,17 +1,21 @@
-// 역매공파 지속실행 러너 (P0-35US6) — 실행: npm run yeokmae:live -- US [--once]
+// 역매공파 지속실행 러너 (P0-35US6/US10) — 실행: npm run yeokmae:live -- US [--once] [--dry-run]
 //   오늘 미국장 동안 계속: ① broker 실보유 복원(원장 우선순위: broker evidence) → ② 시작요약 →
-//   ③ quote 갱신 → ④ P0-34 SELL 감시(관찰) → ⑤ 신규 confirmed 신호 탐색(단, PILOT 1포지션 제한: 보유 중 신규 BUY 0).
-//   ⚠️ 이번 빌드는 POST 금지(추가 BUY/SELL 실주문 없음). 재주문/candle·order lock 삭제 절대 금지. 관찰/복원/감시 전용.
+//   ③ quote 갱신 → ④ P0-34 자동 SELL(위험청산) → ⑤ 신규 confirmed 신호(PILOT 1포지션 제한: 보유 중 신규 BUY 0).
+//   BUY POST 는 여기서 하지 않는다(pilot-live 담당). SELL 실 POST 는 LS_LIVE_TRADING ∧ YEOKMAE_SELL_LIVE ∧ !dryRun ∧
+//   전 안전게이트 통과 시에만. --dry-run 은 실가격으로 HOLD/SELL 판정+게이트까지만(POST 0). candle/order lock 삭제 금지.
 import { loadEnvLocal } from './env';
 import { createLogger } from './logger';
 import { loadConfig, getTokenCached, resolveUSQuote } from './ls-client';
 import { makeScrubber } from './mask';
 import { loadUSSymbols } from './universe';
+import { OrderStore } from './order-store';
 import { YeokmaePositionStore } from './yeokmae-position-store';
 import { YEOKMAE_DAILY_ROOT } from './yeokmae-daily-cache';
 import { marketDate } from './yeokmae-pilot-core';
 import { recoverYeokmaeUSFromBroker, applyYeokmaeRecoveryToLedger, summarizeYeokmaeLive, planUSHoldingRecovery } from './yeokmae-recover';
-import { getLSUSHoldings, getLSUSPrice, usEtSession } from '../src/lib/ls-api';
+import { runYeokmaeSell, type YeokmaeSellIO } from './yeokmae-sell';
+import { executeSellOrder } from './us-seller';
+import { getLSUSHoldings, getLSUSPrice, usEtSession, placeLSUSSellOrder, queryLSUSOrderExec, LS_US_ORDEREXEC_EMPTY_CODES } from '../src/lib/ls-api';
 import {
   evaluateYeokmaeExit, updateHighestPrice, formatYeokmaeExitPolicy, DEFAULT_YEOKMAE_EXIT_CONFIG,
   YEOKMAE_PILOT_MAX_POSITIONS, YEOKMAE_STRATEGY_VALIDATED, YEOKMAE_SEMANTICS_VERIFIED,
@@ -38,9 +42,31 @@ function loadSignalMeta(market: 'US'): Map<string, SignalMeta> {
   return m;
 }
 
-async function watchCycle(cfg: any, token: string, posStore: YeokmaePositionStore, log: (m: string) => void): Promise<void> {
+// 실행용 SELL IO 배선 — us-seller 안전경로에 LS 함수 연결(place=매도 OrdPtnCode=01, 대사/신선매도가능).
+function buildSellIO(cfg: any, token: string, etDate: string, log: (m: string) => void): YeokmaeSellIO {
+  const freshSellable = async (p: { exchcd: string; symbol: string }) => {
+    const h = await getLSUSHoldings(cfg, token, etDate);
+    const hh = h.holdings.find(x => x.symbol.toUpperCase() === p.symbol.toUpperCase());
+    return { ok: h.ok, qty: hh?.sellableQty ?? 0 };
+  };
+  return {
+    freshSellable,
+    reconcile: async (p) => { const q = await queryLSUSOrderExec(cfg, token, p, { emptyCodes: LS_US_ORDEREXEC_EMPTY_CODES }); return { ok: q.queryOk, classification: q.classification }; },
+    executeSell: executeSellOrder,
+    sellDeps: {
+      place: (pp) => placeLSUSSellOrder(cfg, token, pp),
+      query: (pp) => queryLSUSOrderExec(cfg, token, pp, { emptyCodes: LS_US_ORDEREXEC_EMPTY_CODES }),
+      sellableQty: freshSellable,
+      now: () => Date.now(), log,
+    },
+  };
+}
+
+async function watchCycle(ctx: { cfg: any; token: string; posStore: YeokmaePositionStore; etDate: string; sellLive: boolean; dryRun: boolean; sellIO: YeokmaeSellIO; log: (m: string) => void }): Promise<{ fullExits: number }> {
+  const { cfg, token, posStore, log } = ctx;
   const held = posStore.all().filter(p => p.qty > 0);
   const delaygb = resolveUSQuote().delaygb ?? 'R';
+  let fullExits = 0;
   for (const pos of held) {
     let price = 0; let quoteOk = false;
     try { const q = await getLSUSPrice(cfg, token, pos.symbol, pos.exchcd, delaygb); price = q.price; quoteOk = price > 0; }
@@ -52,10 +78,17 @@ async function watchCycle(cfg: any, token: string, posStore: YeokmaePositionStor
       quote: { reliableRealtime: quoteOk, price },
     });
     log(`[YEOKMAE-LIVE-WATCH] ${pos.symbol} qty=${pos.qty} entryAvg=${pos.entryAvgPrice.toFixed(2)} price=${quoteOk ? price.toFixed(2) : 'n/a'} pnl=${decision.pnlPct == null ? 'n/a' : decision.pnlPct.toFixed(2) + '%'} action=${decision.action}${decision.reason ? ` reason=${decision.reason}` : ''} holdDays=${pos.holdDays}/${DEFAULT_YEOKMAE_EXIT_CONFIG.maxHoldDays}`);
-    if (decision.action === 'SELL') {
-      log(`[YEOKMAE-LIVE-SELL-SIGNAL] ${pos.symbol} reason=${decision.reason} pnl=${decision.pnlPct?.toFixed(2)}% — ⚠️ 이번 빌드 POST 금지(관찰). 실 SELL 은 후속 커밋에서 게이트 활성 후.`);
-    }
+    if (decision.action !== 'SELL') continue;
+    // 위험청산 신호 → P0-34 SELL 게이트 + us-seller 실행(POST 는 sellLive ∧ !dryRun 시에만). strategyTag=YEOKMAE 만.
+    const orders = new OrderStore(`YEOKMAE_US_${pos.symbol}`); orders.load();
+    const res = await runYeokmaeSell(ctx.sellIO, {
+      posStore, orders, position: pos, exchcd: pos.exchcd,
+      exitAction: decision.action, exitReason: decision.reason, pnlPct: decision.pnlPct,
+      currentPrice: price, etDate: ctx.etDate, sellLive: ctx.sellLive, dryRun: ctx.dryRun, log,
+    });
+    if (res.status === 'placed-filled' && res.remainingQty <= 0) fullExits++;
   }
+  return { fullExits };
 }
 
 async function main() {
@@ -64,11 +97,17 @@ async function main() {
   const args = process.argv.slice(2);
   const market = (args.find(a => !a.startsWith('--')) || '').toUpperCase();
   const once = args.includes('--once');
-  if (market !== 'US') { log.error('사용법: npm run yeokmae:live -- US [--once] (현재 US 전용)'); process.exit(1); return; }
+  const dryRun = args.includes('--dry-run');
+  if (market !== 'US') { log.error('사용법: npm run yeokmae:live -- US [--once] [--dry-run] (현재 US 전용)'); process.exit(1); return; }
   const intervalSec = Math.max(10, Number(process.env.YEOKMAE_LIVE_INTERVAL_SEC || 30) || 30);
+  // SELL 실 POST kill-switch — 보유 위험청산은 BUY validation 과 분리(YEOKMAE_STRATEGY_VALIDATED 무관).
+  const liveTrading = process.env.LS_LIVE_TRADING === 'true';
+  const yeokmaeSellLive = process.env.YEOKMAE_SELL_LIVE === 'true';
+  const sellLive = liveTrading && yeokmaeSellLive && !dryRun;
 
-  log.info(`===== [YEOKMAE-LIVE] market=US 지속실행(복원→감시) — ⚠️ 이번 빌드 BUY/SELL POST=0 =====`);
-  log.info(`[YEOKMAE-SAFETY] YEOKMAE_STRATEGY_VALIDATED=${YEOKMAE_STRATEGY_VALIDATED} YEOKMAE_SEMANTICS_VERIFIED=${YEOKMAE_SEMANTICS_VERIFIED} · PILOT 1포지션 제한 유지`);
+  log.info(`===== [YEOKMAE-LIVE] market=US 지속실행(복원→감시→P0-34 SELL)${dryRun ? ' [--dry-run: POST 0]' : ''} =====`);
+  log.info(`[YEOKMAE-SAFETY] YEOKMAE_STRATEGY_VALIDATED=${YEOKMAE_STRATEGY_VALIDATED} YEOKMAE_SEMANTICS_VERIFIED=${YEOKMAE_SEMANTICS_VERIFIED} · PILOT 1포지션 제한 유지 · BUY POST=0(pilot-live 담당)`);
+  log.info(`[YEOKMAE-SELL-LIVE] LS_LIVE_TRADING=${liveTrading} YEOKMAE_SELL_LIVE=${yeokmaeSellLive} dryRun=${dryRun} → SELL_REAL_POST=${sellLive} (보유 위험청산은 STRATEGY_VALIDATED 무관)`);
   log.info(formatYeokmaeExitPolicy(DEFAULT_YEOKMAE_EXIT_CONFIG));
 
   let cfg; try { cfg = loadConfig(); } catch (e) { log.error(`[YEOKMAE-LIVE] FAIL_CLOSED(config: ${String(e)})`); process.exit(2); return; }
@@ -143,13 +182,22 @@ async function main() {
   log.info(`[YEOKMAE-LIVE-STARTUP] currentYeokmaePositions=${startup.currentYeokmaePositions}/${startup.maxPositions} additionalBuyAllowed=${startup.additionalBuyAllowed} SELL_ARMED=${startup.sellArmed} unresolvedYeokmaeHoldings=${startup.unresolvedYeokmaeHoldings.length}[${startup.unresolvedYeokmaeHoldings.map(u => u.symbol).join(',')}] · BB SELL 미적용(별도 저장소 물리분리)`);
   if (!startup.additionalBuyAllowed) log.info(`[YEOKMAE-LIVE-BUY-GATE] additionalBuyAllowed=false → 신규 BUY 차단(보유 ${startup.currentYeokmaePositions}/${startup.maxPositions}${startup.unresolvedYeokmaeHoldings.length ? ` + 미해결 YEOKMAE 보유 ${startup.unresolvedYeokmaeHoldings.length}` : ''}). 청산/복원 후에만 신규 진입.`);
 
-  // ── ③~⑤ 지속 감시 루프 (POST 없음) ──
-  await watchCycle(cfg, token, posStore, (m) => log.info(m));
-  if (once) { log.info('[YEOKMAE-LIVE] --once → 1회 감시 후 종료(POST 0).'); return; }
+  // ── ③~⑤ 지속 감시 루프 — quote 갱신 → P0-34 SELL 게이트/실행(sellLive ∧ !dryRun 시에만 POST). ──
+  const sellIO = buildSellIO(cfg, token, etDate, (m) => log.info(m));
+  const wctx = { cfg, token, posStore, etDate, sellLive, dryRun, sellIO, log: (m: string) => log.info(m) };
+  const summarizeAfter = (r: { fullExits: number }) => {
+    if (r.fullExits > 0) {
+      const s2 = summarizeYeokmaeLive(posStore.all(), YEOKMAE_PILOT_MAX_POSITIONS, unresolved);
+      // 전량 SELL 후에만 슬롯 개방. 단, 동일 tick 신규 BUY 금지(이 러너는 BUY 안 함) — 다음 scan/tick(pilot-live)부터 허용.
+      log.info(`[YEOKMAE-LIVE-STARTUP] (post-SELL) currentYeokmaePositions=${s2.currentYeokmaePositions}/${s2.maxPositions} additionalBuyAllowed=${s2.additionalBuyAllowed} SELL_ARMED=${s2.sellArmed} — 신규 BUY 는 다음 tick 부터(동일 tick 금지).`);
+    }
+  };
+  summarizeAfter(await watchCycle(wctx));
+  if (once) { log.info(`[YEOKMAE-LIVE] --once → 1회 감시 후 종료. SELL_REAL_POST=${sellLive}${dryRun ? '(dry-run)' : ''}.`); return; }
 
   log.info(`[YEOKMAE-LIVE] ${intervalSec}s 간격 지속 감시 시작(Ctrl+C 종료). 신규 BUY 는 pilot-live 로 별도 진행(보유 중 차단).`);
   const tick = async () => {
-    try { await watchCycle(cfg, token, posStore, (m) => log.info(m)); }
+    try { summarizeAfter(await watchCycle(wctx)); }
     catch (e) { log.warn(`[YEOKMAE-LIVE] 감시 tick 오류(계속). ${scrub(String(e))}`); }
     setTimeout(tick, intervalSec * 1000);
   };

@@ -26,7 +26,12 @@ export interface YeokmaePosition {
   confirmedSignalDate?: string | null;   // P0-35P2: 진입 근거 confirmed 신호일
   matchedSignals?: string[];             // P0-35P2: 진입 시 matched 5신호
 }
-interface Body { version: number; positions: Record<string, YeokmaePosition> }
+// P0-35US10: 청산 체결 기록(전량 SELL 후 포지션이 삭제돼도 realizedPnL/사유를 영구 보존).
+export interface YeokmaeExitRecordEntry {
+  symbol: string; exitReason: YeokmaeExitReason; exitDate: string;
+  filledQty: number; avgFill: number; entryAvgPrice: number; realizedPnLGross: number; remainingQty: number;
+}
+interface Body { version: number; positions: Record<string, YeokmaePosition>; exits?: YeokmaeExitRecordEntry[] }
 
 export class YeokmaePositionStore {
   readonly file: string;
@@ -38,18 +43,19 @@ export class YeokmaePositionStore {
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
     this.file = join(dir, 'us-yeokmae-positions.json');
     this.tmp = this.file + '.tmp';
-    this.body = { version: VERSION, positions: {} };
+    this.body = { version: VERSION, positions: {}, exits: [] };
   }
   load(): void {
     if (!existsSync(this.file)) return;
     try {
       const d = JSON.parse(readFileSync(this.file, 'utf8')) as Partial<Body>;
       if (!d || typeof d !== 'object' || !d.positions) { this.corrupt = true; return; }
-      this.body = { version: VERSION, positions: d.positions };
+      this.body = { version: VERSION, positions: d.positions, exits: Array.isArray(d.exits) ? d.exits : [] };
     } catch { this.corrupt = true; try { renameSync(this.file, this.file + '.corrupt'); } catch { /* noop */ } }
   }
   get(symbol: string): YeokmaePosition | null { return this.body.positions[symbol] ?? null; }
   all(): YeokmaePosition[] { return Object.values(this.body.positions); }
+  exits(): YeokmaeExitRecordEntry[] { return this.body.exits ?? []; }
 
   // 역매공파 BUY 체결 → 진입/증분(가중평균). config 스냅샷 저장(재시작 복원). flush 필요.
   applyYeokmaeBuyFill(p: {
@@ -91,6 +97,20 @@ export class YeokmaePositionStore {
     const c = this.body.positions[symbol]; if (!c) return;
     c.lastExitReason = reason;
     if (!(remainingQty > 0)) delete this.body.positions[symbol]; else c.qty = remainingQty;
+  }
+  // P0-35US10: SELL 체결 반영 — realizedPnL gross(=(체결가-진입평균가)*체결수량) 를 exits 로그에 영구저장 후
+  //   잔여수량 반영(0 이면 포지션 삭제). 원본 P0-34 정책/임계값 무변경(수량·기록 배선만). flush 필요.
+  recordSellFill(symbol: string, p: { exitReason: YeokmaeExitReason; filledQty: number; avgFill: number; exitDate: string }): { realizedPnLGross: number; remainingQty: number } {
+    const cur = this.body.positions[symbol];
+    if (!cur) return { realizedPnLGross: 0, remainingQty: 0 };
+    const filled = Math.max(0, Math.floor(p.filledQty));
+    const realizedPnLGross = (p.avgFill - cur.entryAvgPrice) * filled;
+    const remainingQty = Math.max(0, cur.qty - filled);
+    cur.lastExitReason = p.exitReason;
+    if (!this.body.exits) this.body.exits = [];
+    this.body.exits.push({ symbol, exitReason: p.exitReason, exitDate: p.exitDate, filledQty: filled, avgFill: p.avgFill, entryAvgPrice: cur.entryAvgPrice, realizedPnLGross, remainingQty });
+    if (remainingQty <= 0) delete this.body.positions[symbol]; else cur.qty = remainingQty;
+    return { realizedPnLGross, remainingQty };
   }
   flush(): void { if (this.corrupt) return; writeFileSync(this.tmp, JSON.stringify(this.body), 'utf8'); renameSync(this.tmp, this.file); }
 }
