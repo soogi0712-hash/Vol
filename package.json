@@ -24,6 +24,7 @@
     "yeokmae:signals": "tsx local-runner/yeokmae-signals.ts",
     "yeokmae:near-matches": "tsx local-runner/yeokmae-near-matches.ts",
     "yeokmae:live-candidates": "tsx local-runner/yeokmae-live-candidates.ts",
+    "yeokmae:pilot-preview": "tsx local-runner/yeokmae-pilot-preview.ts",
     "yeokmae:signal-report": "tsx local-runner/yeokmae-signal-report.ts",
     "yeokmae:exit-diag": "tsx local-runner/yeokmae-exit-diag.ts",
     "yeokmae:batch-diag": "tsx local-runner/yeokmae-batch-diag.ts",

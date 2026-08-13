@@ -11,6 +11,7 @@ export * from './live';
 export * from './snapshot';
 export * from './exit';
 export * from './validation';
+export * from './pilot';
 
 import { evaluateAllYeokmae } from './signals';
 import { evaluateYeokmaeSearcher, type YeokmaeMarketFlags, type YeokmaeSearcherOpts } from './searcher';
