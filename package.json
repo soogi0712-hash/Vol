@@ -19,6 +19,7 @@
     "yeokmae:diag-cache": "tsx local-runner/yeokmae-diag-cache.ts",
     "yeokmae:find-reverse": "tsx local-runner/yeokmae-find-reverse.ts",
     "yeokmae:build-us-history": "tsx local-runner/yeokmae-build-us-history.ts",
+    "yeokmae:build-kr-history": "tsx local-runner/yeokmae-build-kr-history.ts",
     "yeokmae:scan-candidates": "tsx local-runner/yeokmae-scan-candidates.ts",
     "yeokmae:signals": "tsx local-runner/yeokmae-signals.ts",
     "yeokmae:near-matches": "tsx local-runner/yeokmae-near-matches.ts",
