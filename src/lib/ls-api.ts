@@ -828,9 +828,19 @@ export type OrderExecClassification = 'SUCCESS' | 'EMPTY' | 'BUSINESS_ERROR' | '
 //   02679 "조회내역이 없습니다." = 오늘 주문 0건 상태의 정상 응답(HTTP200·envelope 존재·rawRows=0, 실측 확인).
 //   ⚠️ 이 목록의 코드는 rows=0 + 정상 envelope 일 때만 EMPTY. rows>0/비정상 envelope 이면 fail-closed(BUSINESS_ERROR).
 export const LS_US_ORDEREXEC_EMPTY_CODES: string[] = ['02679'];
-export function classifyOrderExec(input: { transportError?: boolean; rspCd: string; successCodes: string[]; emptyCodes: string[]; rowCount?: number; hasEnvelope?: boolean }): OrderExecClassification {
+// ── P0-35US9: COSAQ00102 "정상 자료있음" DATA 코드 — 실계정 실측 확정분(PRGO OrdNo=285 체결). ──
+//   00136 "조회가 완료되었습니다." = 주문/체결 데이터가 있을 때의 정상 응답(HTTP200·envelope 정상·rawRows>0, 실측 확인).
+//   ⚠️ COSAQ00102 한정(전역 금지). rows>0 + 정상 envelope 일 때만 SUCCESS. rows=0/비정상 envelope 이면 fail-closed(오탐 방지).
+export const LS_US_ORDEREXEC_DATA_CODES: string[] = ['00136'];
+export function classifyOrderExec(input: { transportError?: boolean; rspCd: string; successCodes: string[]; emptyCodes: string[]; dataCodes?: string[]; rowCount?: number; hasEnvelope?: boolean }): OrderExecClassification {
   if (input.transportError) return 'TRANSPORT_ERROR';
   if (input.successCodes.includes(input.rspCd)) return 'SUCCESS';   // 공식 성공코드 — rows 신뢰(주문 있으면 rows>0 정상)
+  if ((input.dataCodes ?? []).includes(input.rspCd)) {
+    // DATA 코드(예: COSAQ00102 00136)는 "자료있음" 이 응답구조로도 일치할 때만 SUCCESS: rows>0 + envelope 정상.
+    //   rows=0(자료없다는데 DATA 코드) 또는 envelope 비정상 → 오탐 방지 위해 fail-closed(BUSINESS_ERROR).
+    if ((input.rowCount ?? 0) > 0 && input.hasEnvelope !== false) return 'SUCCESS';
+    return 'BUSINESS_ERROR';
+  }
   if (input.emptyCodes.includes(input.rspCd)) {
     // EMPTY 코드는 "자료없음" 이 응답구조로도 일치할 때만 통과: rows=0 + envelope 정상. 아니면 fail-closed.
     if ((input.rowCount ?? 0) === 0 && input.hasEnvelope !== false) return 'EMPTY';
@@ -873,8 +883,8 @@ export async function queryLSUSOrderExec(
       ordQty: toNum(r.OrdQty), execQty: toNum(r.ExecQty), unfilledQty: toNum(r.UnercQty),
       ordPrc: toNum(r.OvrsOrdPrc), ordPtnCode: String(r.OrdPtnCode ?? ''), trxNm: String(r.OrdTrxPtnNm ?? ''),
     }));
-    // rows/envelope 를 함께 판정 — 02679 라도 rows>0/비정상 envelope 이면 EMPTY 아님(fail-closed, req3).
-    const classification = classifyOrderExec({ rspCd, successCodes, emptyCodes, rowCount: rows.length, hasEnvelope });
+    // rows/envelope 를 함께 판정 — 02679(EMPTY)는 rows=0, 00136(DATA)는 rows>0 일 때만 통과(fail-closed).
+    const classification = classifyOrderExec({ rspCd, successCodes, emptyCodes, dataCodes: LS_US_ORDEREXEC_DATA_CODES, rowCount: rows.length, hasEnvelope });
     const queryOk = classification === 'SUCCESS' || classification === 'EMPTY';
     // BUSINESS_ERROR(unknown 코드/불일치)면 rows 를 신뢰하지 않는다(비워서 반환) — 잘못된 0건 통과 방지.
     //   parsedRows 는 진단용으로 원문 rows 를 그대로 유지(신뢰판정 미사용).

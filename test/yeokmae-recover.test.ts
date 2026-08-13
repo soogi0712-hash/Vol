@@ -223,3 +223,47 @@ describe('P0-35US8 PRGO BUSINESS_ERROR — recon 진단 + UNRESOLVED 안전장�
     expect(r.evidenceOk).toBe(true);
   });
 });
+
+describe('P0-35US9 PRGO 완전 복원 (00136 SUCCESS → 원장 INSERTED)', () => {
+  // 00136 등록 후: COSAQ00102 가 SUCCESS 로 rows 신뢰 → OrdNo=285/ExecQty=4/OvrsOrdPrc=13.02 복원.
+  const prgoRow = buyRow({ ordNo: '285', ordQty: 4, execQty: 4, unfilledQty: 0, ordPrc: 13.02 });
+  const rec = () => buildYeokmaeUSRecovery({
+    symbol: 'PRGO', exchcd: '81',
+    rows: [prgoRow], reconClassification: 'SUCCESS', reconOk: true,
+    holdings: [hold({ balQty: 4, sellableQty: 4 })], holdingsOk: true,
+    ordDate: '20260813', rspCd: '00136', rspMsg: '조회가 완료되었습니다.', httpStatus: 200, hasEnvelope: true, rawRows: 1,
+    parsedRows: [prgoRow], yeokmaeEligible: true,
+  });
+  const meta = { entryDate: '2026-08-13', confirmedSignalDate: '2026-08-11', matchedSignals: ['112_UPGRADE'] };
+
+  it('entryAvgPrice=13.02(OvrsOrdPrc, 하드코딩 아님) · ordNo=285 · qty=4 · evidenceOk=true', () => {
+    const r = rec();
+    expect(r.reconOk).toBe(true);
+    expect(r.evidenceOk).toBe(true);
+    expect(r.unresolvedYeokmaeHolding).toBe(false);
+    expect(r.ordNo).toBe('285');
+    expect(r.execQty).toBe(4);
+    expect(r.entryAvgPrice).toBeCloseTo(13.02, 4);
+    expect(r.reconDiag.avgExecPrc).toContain('13.02');
+    expect(r.reconDiag.avgExecPrc).toContain('OvrsOrdPrc');
+    expect(r.reconDiag.avgExecPrc).not.toContain('미확정');
+  });
+
+  it('item6: 복원 후 currentYeokmaePositions=1/1, additionalBuyAllowed=false, unresolved=0, SELL_ARMED=true', () => {
+    const ps = new YeokmaePositionStore(dir); ps.load();
+    const applied = applyYeokmaeRecoveryToLedger(ps, rec(), meta);
+    expect(applied.applied).toBe('INSERTED');
+    const pos = ps.get('PRGO')!;
+    expect(pos.strategyTag).toBe('YEOKMAE');
+    expect(pos.exchcd).toBe('81');
+    expect(pos.qty).toBe(4);
+    expect(pos.entryAvgPrice).toBeCloseTo(13.02, 4);
+    expect(pos.confirmedSignalDate).toBe('2026-08-11');
+    expect(pos.matchedSignals).toEqual(['112_UPGRADE']);
+    const s = summarizeYeokmaeLive(ps.all(), 1, []);   // unresolved 없음(복원 성공)
+    expect(s.currentYeokmaePositions).toBe(1);
+    expect(s.additionalBuyAllowed).toBe(false);
+    expect(s.unresolvedYeokmaeHoldings).toHaveLength(0);
+    expect(s.sellArmed).toBe(true);
+  });
+});

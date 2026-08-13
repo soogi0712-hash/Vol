@@ -3,7 +3,7 @@ import {
   getLSAccessToken, getLSKRBalance, getLSUSBalance,
   getLSKRPrice, getLSUSPrice, getLSKR15Min, getLSUS15Min, getLSUS15MinPaged, getLSUS15MinOlderThan, prevYmd,
   getLSUSTicks, getLSUSTicksPaged, lsOverseasChartRaw,
-  placeLSUSBuyOrder, queryLSUSOrderExec, classifyOrderExec, LS_US_ORDEREXEC_EMPTY_CODES, getLSUSDeposit, getLSUSHoldings, cancelLSUSOrder, LS_CANCEL_TR_CONFIRMED, isUSOrderSuccess,
+  placeLSUSBuyOrder, queryLSUSOrderExec, classifyOrderExec, LS_US_ORDEREXEC_EMPTY_CODES, LS_US_ORDEREXEC_DATA_CODES, getLSUSDeposit, getLSUSHoldings, cancelLSUSOrder, LS_CANCEL_TR_CONFIRMED, isUSOrderSuccess,
   decideUSCashPayment, usCashOnlyUsdCap, usOrderableQty, formatCashOrderableLine,
   computeUSOrderQty, formatUSSize, isCashOnly, crossWonAdoptedUsdCap,
   computeUSDailyBuyGate, formatUSDailyGuard,
@@ -579,6 +579,26 @@ describe('해외 주문/체결/예수금 (공식 필드)', () => {
     expect(classifyOrderExec({ rspCd: '02679', successCodes: sc, emptyCodes: ec, rowCount: 0, hasEnvelope: true })).toBe('EMPTY');
     expect(classifyOrderExec({ rspCd: '02679', successCodes: sc, emptyCodes: ec, rowCount: 2, hasEnvelope: true })).toBe('BUSINESS_ERROR');   // rows>0 → 차단
     expect(classifyOrderExec({ rspCd: '02679', successCodes: sc, emptyCodes: ec, rowCount: 0, hasEnvelope: false })).toBe('BUSINESS_ERROR'); // envelope 비정상 → 차단
+  });
+  it('P0-35US9: 00136 DATA 코드 — rows>0+정상envelope 만 SUCCESS, rows=0/비정상 envelope 은 fail-closed', () => {
+    const sc = ['00000']; const ec = ['02679']; const dc = ['00136'];
+    expect(classifyOrderExec({ rspCd: '00136', successCodes: sc, emptyCodes: ec, dataCodes: dc, rowCount: 1, hasEnvelope: true })).toBe('SUCCESS');   // PRGO 실측
+    expect(classifyOrderExec({ rspCd: '00136', successCodes: sc, emptyCodes: ec, dataCodes: dc, rowCount: 0, hasEnvelope: true })).toBe('BUSINESS_ERROR');  // 자료있음코드인데 rows=0 → 오탐 차단
+    expect(classifyOrderExec({ rspCd: '00136', successCodes: sc, emptyCodes: ec, dataCodes: dc, rowCount: 1, hasEnvelope: false })).toBe('BUSINESS_ERROR'); // envelope 비정상 → 차단
+    expect(classifyOrderExec({ rspCd: '00136', successCodes: sc, emptyCodes: ec, rowCount: 1, hasEnvelope: true })).toBe('BUSINESS_ERROR');   // dataCodes 미주입 → 미등록 차단(전역 아님)
+  });
+  it('P0-35US9: LS_US_ORDEREXEC_DATA_CODES 에 00136 등록(COSAQ00102 한정)', () => {
+    expect(LS_US_ORDEREXEC_DATA_CODES).toEqual(['00136']);
+  });
+  it('P0-35US9: 실계정 COSAQ00102 00136+rows>0 → SUCCESS·queryOk=true, PRGO OrdNo/ExecQty/OvrsOrdPrc 파싱', async () => {
+    stubFetch(() => ({ status: 200, json: { rsp_cd: '00136', rsp_msg: '조회가 완료되었습니다.', COSAQ00102OutBlock3: [
+      { OrdNo: 285, ShtnIsuNo: 'PRGO', OrdQty: 4, ExecQty: 4, UnercQty: 0, OvrsOrdPrc: 13.02, OrdPtnCode: '02' },
+    ] } }));
+    const r = await queryLSUSOrderExec(cfg, 'T', { exchcd: '81', symbol: 'PRGO', ordDate: '20260813' });
+    expect(r.classification).toBe('SUCCESS');
+    expect(r.queryOk).toBe(true);
+    expect(r.rows).toHaveLength(1);
+    expect(r.rows[0]).toMatchObject({ ordNo: '285', symbol: 'PRGO', ordQty: 4, execQty: 4, unfilledQty: 0, ordPrc: 13.02, ordPtnCode: '02' });
   });
   it('P0-27b: 실계정 02679(조회내역 없음)+rawRows0+envelope → EMPTY·queryOk=true (env 없이 기본 적용, req1·2·6)', async () => {
     stubFetch(() => ({ status: 200, json: { rsp_cd: '02679', rsp_msg: '조회내역이 없습니다.', COSAQ00102OutBlock3: [] } }));

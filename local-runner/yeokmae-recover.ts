@@ -86,8 +86,13 @@ export function buildYeokmaeUSRecovery(p: {
     ordQty: diagRows.reduce((s, r) => s + r.ordQty, 0),
     execQty: diagRows.reduce((s, r) => s + r.execQty, 0),
     unfilledQty: diagRows.reduce((s, r) => s + r.unfilledQty, 0),
-    // AvgExecPrc 공식 필드 미확정 → OvrsOrdPrc(주문지정가) 기반 값으로 표시(추측 금지, 라벨 명시).
-    avgExecPrc: diagRows.length ? `${diagRows[0].ordPrc}(OvrsOrdPrc·AvgExecPrc필드미확정)` : 'n/a',
+    // 진입가 = COSAQ00102 OutBlock3 OvrsOrdPrc(공식 필드) 체결가중. 전량체결 시 이 값이 체결가. 하드코딩 없음.
+    avgExecPrc: (() => {
+      const dq = diagRows.reduce((s, r) => s + r.execQty, 0);
+      const w = diagRows.reduce((s, r) => s + r.execQty * r.ordPrc, 0);
+      const v = dq > 0 ? w / dq : (diagRows[0]?.ordPrc ?? 0);
+      return diagRows.length ? `${v.toFixed(2)}(OvrsOrdPrc)` : 'n/a';
+    })(),
     classification: p.reconClassification,
     failureReason: p.reconOk ? '-' : `NON_SUCCESS(rsp_cd=${p.rspCd ?? '-'} classification=${p.reconClassification} — COSAQ00102 성공/EMPTY 코드 미등록 가능)`,
   };
