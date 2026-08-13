@@ -5,6 +5,14 @@
 //    대신 MANUAL_CANCEL_MODE(수동취소)로 운영: 미체결 시 사용자 수동취소 요구, AS3 수신 시에만 다음 BUY.
 import { toLSOverseasExchcd, LS_CANCEL_TR_CONFIRMED, LS_US_CROSS_WON_TR_CONFIRMED, CROSS_WON_ADOPTED_FIELD } from '../src/lib/ls-api';
 
+// ── 통합증거금(타통화+원화) 실측확인 단일 판정 (P0-35US5) ──
+// preflight(pilot-core)·executor(pilot-live)·ls-usws(live-config)가 이 함수로 통일해 cash/orderable parity 보장.
+//   = 코드상수(공식 필드 확정) AND 채택필드 지정 AND env kill-switch(LS_US_CROSS_WON_VERIFIED!=='false').
+// process.env 를 읽으므로 node 런타임(local-runner)에만 둔다(src/lib 는 env-free 유지).
+export function usCrossWonVerified(): boolean {
+  return LS_US_CROSS_WON_TR_CONFIRMED && CROSS_WON_ADOPTED_FIELD != null && process.env.LS_US_CROSS_WON_VERIFIED !== 'false';
+}
+
 export interface LiveConfig {
   liveSymbol: string;          // 'AAPL'
   liveExchange: string;        // 'NASDAQ'
@@ -59,7 +67,7 @@ export function loadLiveConfig(): LiveConfig {
     htsOrderableQty: (() => { const v = process.env.LS_US_HTS_ORDERABLE_QTY; if (v == null || v.trim() === '') return null; const n = parseInt(v, 10); return Number.isFinite(n) ? Math.max(0, n) : null; })(),
     // 타통화+원화 경로 실측확인(P0-20 완료) — 코드상수(공식 필드 확정) AND 채택필드 지정 시 true.
     //   안전 kill-switch: env LS_US_CROSS_WON_VERIFIED='false' 로 강제 비활성 가능.
-    crossWonVerified: LS_US_CROSS_WON_TR_CONFIRMED && CROSS_WON_ADOPTED_FIELD != null && process.env.LS_US_CROSS_WON_VERIFIED !== 'false',
+    crossWonVerified: usCrossWonVerified(),
   };
 }
 

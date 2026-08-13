@@ -14,6 +14,7 @@ import {
   placeLSKRBuyOrder, queryLSKROrderExecUnified, cancelLSKRBuyOrder, getLSKRBalance, LS_US_ORDEREXEC_EMPTY_CODES,
   buildKRBuyInBlock, resolveKRMbrNo,
 } from '../src/lib/ls-api';
+import { usCrossWonVerified } from './live-config';
 import {
   runYeokmaePilotBuy, formatYeokmaeExitPolicy, DEFAULT_YEOKMAE_EXIT_CONFIG,
   YEOKMAE_STRATEGY_VALIDATED, YEOKMAE_SEMANTICS_VERIFIED,
@@ -70,8 +71,10 @@ async function main() {
       place: (pp) => placeLSUSBuyOrder(cfg, token, pp),
       query: (pp) => queryLSUSOrderExec(cfg, token, pp, { emptyCodes: LS_US_ORDEREXEC_EMPTY_CODES }),
       cancel: (pp) => cancelLSUSOrder(cfg, token, pp),
-      // P0-35US4: cash 값은 변경하지 않음(usCashOnlyUsdCap(d,{}) = 순수 USD, 게이트 blocker 유지). rspCd/msg 는 진단 노출용.
-      cashOrderable: async () => { const d = await getLSUSDeposit(cfg, token); return { ok: d.ok, cash: usCashOnlyUsdCap(d, {}), rspCd: d.rspCd, rspMsg: scrub(d.rspMsg), httpStatus: d.diag?.status ?? null }; },
+      // P0-35US5: executor cash 게이트를 preflight/ls-usws 와 통일 — usCashOnlyUsdCap(d,{crossWonVerified}).
+      //   crossWonVerified=true → 통합증거금(WonCashMin 원화현금) USD환산 포함(cash-only, 미수/대출 0 전제).
+      //   crossWonVerified=false → 순수 USD현금만(=해당 경로 하드차단). preflight orderable gating 과 동일 기준(parity).
+      cashOrderable: async () => { const d = await getLSUSDeposit(cfg, token); return { ok: d.ok, cash: usCashOnlyUsdCap(d, { crossWonVerified: usCrossWonVerified() }), rspCd: d.rspCd, rspMsg: scrub(d.rspMsg), httpStatus: d.diag?.status ?? null }; },
       now: () => Date.now(), log: (m) => log.info(m),
     };
     return {

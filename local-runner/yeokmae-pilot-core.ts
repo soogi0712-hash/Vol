@@ -10,10 +10,11 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   getLSKRPrice, getLSUSPrice, getLSKRBalance, getLSUSDeposit, isCashOnly, usCashOnlyUsdCap, computeUSOrderQty,
-  usOrderableQty, evaluateCrossWon, usEtSession, CROSS_WON_ADOPTED_FIELD, LS_US_CROSS_WON_TR_CONFIRMED,
+  usOrderableQty, evaluateCrossWon, usEtSession,
   queryLSUSOrderExec, queryLSKROrderExecClassified, usExchcdFromMarket, LS_US_ORDEREXEC_EMPTY_CODES,
   type OrderExecClassification, type USMarketSession,
 } from '../src/lib/ls-api';
+import { usCrossWonVerified } from './live-config';
 import {
   buildYeokmaeLiveCandidate, evaluateYeokmaePilotGate, pilotRealOrderEnabled, formatYeokmaePilotChecklist,
   DEFAULT_YEOKMAE_EXIT_CONFIG,
@@ -171,21 +172,23 @@ export async function pilotPreflight(
     if (!dep.ok) return { ...failClosed('US 예수금 조회 실패(ok=false)'), symbolDiag };
     cashOnly = isCashOnly(dep);
     baseXchRate = dep.baseXchRate > 0 ? dep.baseXchRate : 0;   // 총자본(원) 한도 환산용
-    // ── P0-35US3 근본수정: orderableQty 산정을 ls-usws(검증된 AAPL 매수경로)와 통일 ──
+    // ── P0-35US3/US5 근본수정: orderableQty 를 executor(pilot-live cashOrderable)와 '동일 식'으로 산정 ──
     //   기존 PILOT: usCashOnlyUsdCap(dep,{})/price = 순수 USD현금(FcurrOrdAbleAmt)만 → USD현금 0(원화보유) 계좌에서 항상 0.
-    //   통일 후: Math.max(crossWon.programQty, qtyCountry) — 통합증거금(WonCashMin 원화현금) 경로 포함(ls-usws L715 동일).
-    //   POST 는 여전히 게이트 OFF 로 0(진단 전용). 원본 BUY 공식/서쳐 무변경.
-    const crossWon = evaluateCrossWon(dep, price, null);   // htsQty=null(PILOT 은 HTS 입력값 없음)
-    const { qtyCountry, qtyCrossWon } = usOrderableQty(dep, price);
-    orderable = Math.max(crossWon.programQty, qtyCountry);   // = ls-usws orderableQty
+    //   통일 후: orderable = floor( usCashOnlyUsdCap(dep,{crossWonVerified}) / price ). executor CASH_GATE 상한과
+    //   완전히 같은 근거(usCashOnlyUsdCap) → 구성상 parity 보장: price*finalQty ≤ cap ⇒ CASH_GATE 절대 되막지 않음.
+    //   cashOnly(미수/대출 0)·crossWonVerified 판정이 usCashOnlyUsdCap 안에 포함되어 margin/대출 계좌는 자동 0.
+    //   crossWonVerified=true 면 통합증거금(WonCashMin 원화현금) USD환산 포함, false 면 순수 USD현금만.
+    const crossWonVerified = usCrossWonVerified();
+    const cashOnlyUsdCap = usCashOnlyUsdCap(dep, { crossWonVerified });
+    const crossWon = evaluateCrossWon(dep, price, null);   // 진단표시용(programQty/reason)
+    const { qtyCountry, qtyCrossWon } = usOrderableQty(dep, price);   // 진단표시용(거래국가/선환전 수량)
+    orderable = price > 0 ? Math.floor(cashOnlyUsdCap / price) : 0;
     const qtyDec = computeUSOrderQty({ perTradeBudgetUsd: env.budgetUSD, orderableQty: orderable, bestAsk: price, maxQty: null });
     budgetQty = qtyDec.budgetQty;   // 예산 게이트(perSymbolBudgetOk) 근거 — orderable 과 독립
     qty = qtyDec.finalQty;          // = min(orderable, budgetQty)
     // ── [US-PILOT-ORDERABLE-DIAG] 근본원인 진단 — 예산부족 vs broker주문가능0 구분(추측 없음, 실 응답값) ──
     const krwCashMin = Math.min(dep.krwCash, dep.krwWithdrawable);
     const et = usEtSession(new Date());
-    // crossWonVerified: live-config 와 동일 판정(코드상수 AND 채택필드 AND env). orderable 산정엔 ls-usws 처럼 미적용(programQty 그대로).
-    const crossWonVerified = LS_US_CROSS_WON_TR_CONFIRMED && CROSS_WON_ADOPTED_FIELD != null && process.env.LS_US_CROSS_WON_VERIFIED !== 'false';
     let orderableFailure: string;
     if (orderable >= 1 && budgetQty >= 1) orderableFailure = '-';   // 주문가능·예산 모두 충분 → orderableQty 는 blocker 아님
     else if (orderable >= 1 && budgetQty < 1) orderableFailure = `BUDGET_TOO_SMALL(예산 $${env.budgetUSD} < 1주 $${price.toFixed(2)} — 자본부족 아님, 예산 상향 필요)`;
@@ -203,7 +206,7 @@ export async function pilotPreflight(
       usdCash: dep.usdCash, usdOrderable: dep.usdOrderable, usdPrexchOrderable: dep.usdPrexchOrderable,
       krwCash: dep.krwCash, krwCashMin, baseXchRate: dep.baseXchRate,
       cashOnly, overseasMargin: dep.overseasMargin, loanAmt: dep.loanAmt,
-      cashOnlyUsdCap: usCashOnlyUsdCap(dep, { crossWonVerified }),
+      cashOnlyUsdCap,   // executor CASH_GATE 상한과 동일값(parity 근거)
       qtyCountry, qtyCrossWon, crossWonProgramQty: crossWon.programQty,
       crossWonAdoptedField: crossWon.adoptedField ?? '(미채택)', crossWonVerified,
       budgetQty, orderableQty: orderable, finalQty: qty, failureReason: orderableFailure,
