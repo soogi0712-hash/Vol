@@ -69,6 +69,52 @@ export function evaluateYeokmaePilotGate(g: YeokmaePilotGateInput): YeokmaePilot
   };
 }
 
+// ── 최종 실주문 하드 게이트 (P0-35P2) — env 3종 + PILOT 게이트 통과 + YEOKMAE 포지션 0개 일 때만 실주문. ──
+//   ⚠️ YEOKMAE_STRATEGY_VALIDATED/SEMANTICS_VERIFIED 는 요구하지 않는다(별도 사용자 승인 경로). 하나라도 미충족이면 POST 금지.
+export interface PilotRealOrderInput {
+  liveTrading: boolean; yeokmaeLive: boolean; pilotLive: boolean;
+  gateAllowed: boolean; currentYeokmaePositions: number;
+}
+export interface PilotRealOrderResult { enabled: boolean; reasons: string[] }
+export function pilotRealOrderEnabled(p: PilotRealOrderInput): PilotRealOrderResult {
+  const reasons: string[] = [];
+  if (!p.liveTrading) reasons.push('LS_LIVE_TRADING_off');
+  if (!p.yeokmaeLive) reasons.push('YEOKMAE_LIVE_TRADING_off');
+  if (!p.pilotLive) reasons.push('YEOKMAE_PILOT_LIVE_off');
+  if (!p.gateAllowed) reasons.push('PILOT_GATE_BLOCKED');
+  if (p.currentYeokmaePositions !== 0) reasons.push(`YEOKMAE_POSITION_NOT_ZERO(${p.currentYeokmaePositions})`);
+  return { enabled: reasons.length === 0, reasons };
+}
+
+// ── PILOT BUY 오케스트레이터 (주입식 executor — 단위테스트 가능) ──
+//   realOrderEnabled=false 면 executor 를 절대 호출하지 않는다(POST 0). 체결 시 strategyTag=YEOKMAE + 신호정보 저장.
+export interface YeokmaePilotBuyDeps {
+  executeBuy: (o: { exchcd: string; symbol: string; qty: number; price: number; candleDatetime: string; etDate: string }) => Promise<{ status: string; ordNo: string | null; filledQty: number; fillPrice: number }>;
+  recordPosition: (o: { symbol: string; exchcd: string; entryDate: string; fillQty: number; fillPrice: number; confirmedSignalDate: string; matchedSignals: string[] }) => void;
+  log: (m: string) => void;
+}
+export interface YeokmaePilotBuyInput {
+  realOrderEnabled: boolean;
+  candidate: YeokmaeLiveCandidate | null;
+  exchcd: string; qty: number; price: number; candleDatetime: string; etDate: string;
+}
+export interface YeokmaePilotBuyResult { posted: boolean; ordNo: string | null; reason: string }
+export async function runYeokmaePilotBuy(deps: YeokmaePilotBuyDeps, input: YeokmaePilotBuyInput): Promise<YeokmaePilotBuyResult> {
+  if (!input.realOrderEnabled) { deps.log('[YEOKMAE-PILOT-ORDER] PILOT_REAL_ORDER_ENABLED=false → 실주문 POST 생략(관찰).'); return { posted: false, ordNo: null, reason: 'PILOT_REAL_ORDER_DISABLED' }; }
+  if (!input.candidate) return { posted: false, ordNo: null, reason: 'NO_CANDIDATE' };
+  if (!(input.qty > 0)) { deps.log('[YEOKMAE-PILOT-ORDER] qty<=0 → POST 금지(fail-closed).'); return { posted: false, ordNo: null, reason: 'NO_QTY' }; }
+  if (!(input.price > 0)) { deps.log('[YEOKMAE-PILOT-ORDER] price<=0(quote stale) → POST 금지(fail-closed).'); return { posted: false, ordNo: null, reason: 'NO_PRICE' }; }
+  const out = await deps.executeBuy({ exchcd: input.exchcd, symbol: input.candidate.symbol, qty: input.qty, price: input.price, candleDatetime: input.candleDatetime, etDate: input.etDate });
+  deps.log(`[YEOKMAE-PILOT-ORDER] symbol=${input.candidate.symbol} qty=${input.qty} price=${input.price} status=${out.status} ordNo=${out.ordNo ?? '-'}`);
+  if (out.status === 'placed-filled' || out.status === 'placed-partial') {
+    const fq = out.filledQty > 0 ? out.filledQty : input.qty;
+    deps.recordPosition({ symbol: input.candidate.symbol, exchcd: input.exchcd, entryDate: input.etDate, fillQty: fq, fillPrice: out.fillPrice || input.price, confirmedSignalDate: input.candidate.confirmedDate, matchedSignals: input.candidate.matchedSignals });
+    return { posted: true, ordNo: out.ordNo, reason: out.status };
+  }
+  if (out.status === 'placed-pending') return { posted: true, ordNo: out.ordNo, reason: 'placed-pending' };
+  return { posted: false, ordNo: out.ordNo, reason: out.status };
+}
+
 // [YEOKMAE-PILOT-CHECKLIST] — 첫 실주문 전 전 항목 출력. 하나라도 불명확(false)이면 fail-closed(gate.allowed=false).
 export interface PilotChecklistExtra {
   strategyTag: string;              // 'YEOKMAE'

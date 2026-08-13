@@ -23,6 +23,8 @@ export interface YeokmaePosition {
   trailingDrawdownPct: number;
   holdDays: number;
   lastExitReason: YeokmaeExitReason | null;
+  confirmedSignalDate?: string | null;   // P0-35P2: 진입 근거 confirmed 신호일
+  matchedSignals?: string[];             // P0-35P2: 진입 시 matched 5신호
 }
 interface Body { version: number; positions: Record<string, YeokmaePosition> }
 
@@ -52,6 +54,7 @@ export class YeokmaePositionStore {
   // 역매공파 BUY 체결 → 진입/증분(가중평균). config 스냅샷 저장(재시작 복원). flush 필요.
   applyYeokmaeBuyFill(p: {
     symbol: string; exchcd: string; entryDate: string; fillQty: number; fillPrice: number;
+    confirmedSignalDate?: string | null; matchedSignals?: string[];
     config?: Partial<typeof DEFAULT_YEOKMAE_EXIT_CONFIG>;
   }): void {
     if (!(p.fillQty > 0)) return;
@@ -64,6 +67,7 @@ export class YeokmaePositionStore {
         highestPnlPct: 0, stopLossPct: cfg.stopLossPct, profitMode: cfg.profitMode, takeProfitPct: cfg.takeProfitPct,
         trailingActivatePct: cfg.trailingActivatePct, trailingDrawdownPct: cfg.trailingDrawdownPct,
         holdDays: 0, lastExitReason: null,
+        confirmedSignalDate: p.confirmedSignalDate ?? null, matchedSignals: p.matchedSignals ?? [],
       };
     } else {
       const newQty = cur.qty + p.fillQty;
