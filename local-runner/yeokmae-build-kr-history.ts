@@ -11,6 +11,7 @@ import { fetchKRDaily } from './yeokmae/kr-daily';
 import { DailyCache, YEOKMAE_DAILY_ROOT, type DailyBar } from './yeokmae-daily-cache';
 import { computeHistoryCapacity, classifyUSCacheState, needsFetch, type CacheState } from './yeokmae/us-history-pool';
 import { analyzeSymbol, summarize, rankNearMatches, conditionsLine, SIGNAL_TYPES, type SymbolDiscovery } from './yeokmae/discovery';
+import { collectRankedSignals, formatKRSignalDetail, signalTierCounts } from './yeokmae/signal-detail';
 import { getLSMinIntervalMs } from '../src/lib/ls-api';
 import { marketToday, buildYeokmaeSnapshot, type Candle, type YeokmaeSnapshot } from '../src/lib/yeokmae';
 import { writeFileSync, renameSync } from 'node:fs';
@@ -140,6 +141,17 @@ async function main() {
   log.info(`  topNearMatches(verifiedFailedCount 오름차순, BUY 아님)=[${near.map(d => `${d.symbol}(${nameOf.get(d.symbol) ?? '?'}):${d.verifiedFailedCount}`).join(' ') || '없음'}]`);
   log.info(`  build: processed=${done} fetched=${fetched} skipped(ready)=${skipped} failed=${failed} stillInsufficient=${insufficientAfter}`);
   log.info(`  files: ${CANDIDATES_FILE} · ${SIGNALS_FILE} · ${SNAPSHOTS_FILE}`);
-  log.info(`  다음: npm run yeokmae:signals -- KR (실신호) / npm run yeokmae:signal-report -- KR (HTS 대조표). 재실행 시 READY skip(resume).`);
+
+  // ── 우선순위 상세 출력 (P0-35KR2) — 수집(SEARCHER_PASS||arrow), 112_UPGRADE/224_UPGRADE 먼저. 주문 0. ──
+  const ranked = collectRankedSignals(discoveries);
+  const tc = signalTierCounts(ranked);
+  log.info(`──── [YEOKMAE-KR-SIGNALS-PRIORITIZED] 수집=${tc.total} (UPGRADE=${tc.upgrade} 기타arrow=${tc.arrow} searcher-only=${tc.searcherOnly}) — UPGRADE 먼저 ────`);
+  for (const d of ranked) {
+    const c2 = new DailyCache('KR', d.symbol); c2.load();
+    const snap = c2.corrupt ? null : buildYeokmaeSnapshot(d.symbol, confirmedCandlesOf(c2));
+    for (const line of formatKRSignalDetail(d, snap, nameOf.get(d.symbol) ?? '?')) log.info(line);
+  }
+  if (ranked.length === 0) log.info('  (SEARCHER_PASS/5신호 종목 없음 — 정상. 조건 완화 금지. 근접후보는 위 topNearMatches 참조.)');
+  log.info(`  다음: npm run yeokmae:signals -- KR (캐시서 재출력, 네트워크 0) / npm run yeokmae:signal-report -- KR (HTS 대조표). 재실행 시 READY skip(resume).`);
 }
 main();

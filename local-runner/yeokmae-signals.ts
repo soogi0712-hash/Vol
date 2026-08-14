@@ -1,30 +1,34 @@
-// 역매공파 실제 신호 종목 (P0-32G) — 실행: npm run yeokmae:signals -- US|KR
-//   캐시 전체에서 5신호 중 하나라도 ON 인 종목만 출력([YEOKMAE-REAL-SIGNAL]). 원본 무변경, 주문 0.
-//   ⚠️ 역배열만 true 이고 5신호 모두 false 인 종목은 BUY 후보 아님(여기 출력 안 됨).
+// 역매공파 실제 신호 종목 (P0-32G / P0-35KR2) — 실행: npm run yeokmae:signals -- US|KR
+//   캐시 전체에서 SEARCHER_PASS 또는 5신호(arrow) 하나라도 ON 인 종목을 수집·우선순위 출력([YEOKMAE-KR-SIGNAL]).
+//   우선순위: 112_UPGRADE/224_UPGRADE > 기타 arrow > searcher-only. 원본 수식 무변경, 주문 0, 네트워크 0(캐시 전용).
 import { loadEnvLocal } from './env';
-import { scanCachedDiscovery } from './yeokmae/discovery-scan';
-import { conditionsLine, summarize, SIGNAL_TYPES } from './yeokmae/discovery';
+import { DailyCache } from './yeokmae-daily-cache';
+import { scanCachedDiscovery, confirmedCandles, loadNameMap } from './yeokmae/discovery-scan';
+import { summarize } from './yeokmae/discovery';
+import { collectRankedSignals, formatKRSignalDetail, signalTierCounts } from './yeokmae/signal-detail';
+import { buildYeokmaeSnapshot } from '../src/lib/yeokmae';
 
 function main() {
   loadEnvLocal();   // P0-35US: .env.local 자동로드(일관성)
   const market = ((process.argv[2] || 'US').toUpperCase() === 'KR' ? 'KR' : 'US') as 'KR' | 'US';
-  console.log(`===== [YEOKMAE-SIGNALS] market=${market} — 5신호 중 1개+ ON 종목 (주문 0) =====`);
-  console.log(`[YEOKMAE-SAFETY] YEOKMAE_STRATEGY_VALIDATED=false · REAL_ORDER_FROM_YEOKMAE=false · 관찰 전용`);
+  console.log(`===== [YEOKMAE-SIGNALS] market=${market} — SEARCHER_PASS/5신호 종목 (우선순위: UPGRADE 먼저, 주문 0) =====`);
+  console.log(`[YEOKMAE-SAFETY] YEOKMAE_STRATEGY_VALIDATED=false · REAL_ORDER_FROM_YEOKMAE=false · 관찰 전용 · 네트워크 0(캐시 전용)`);
   const { cached, results, exMap, corrupt } = scanCachedDiscovery(market);
-  if (cached === 0) { console.log('  캐시 종목 없음 — 먼저 pool 구축(yeokmae:build-us-history).'); return; }
+  if (cached === 0) { console.log(`  캐시 종목 없음 — 먼저 pool 구축(${market === 'KR' ? 'yeokmae:build-kr-history' : 'yeokmae:build-us-history'}).`); return; }
+  const nameOf = loadNameMap(market);
 
-  const hits = results.filter(d => d.anyArrow);
-  const f2 = (x: number) => Number.isFinite(x) ? x.toFixed(2) : 'NaN';
-  for (const d of hits) {
-    const on = SIGNAL_TYPES.filter(t => d.arrows[t]);
-    console.log(`\n[YEOKMAE-REAL-SIGNAL] symbol=${d.symbol} exch=${exMap.get(d.symbol) ?? market} confirmedDate=${d.lastConfirmed} arrows=[${on.join(',')}]`);
-    console.log(`  A~U ${conditionsLine(d.conditions)} searcherFormula=${d.searcherFormulaPass}`);
-    console.log(`  112_ORIGINAL=${d.arrows['112_ORIGINAL']} 224_ORIGINAL=${d.arrows['224_ORIGINAL']} 112_UPGRADE=${d.arrows['112_UPGRADE']} 224_UPGRADE=${d.arrows['224_UPGRADE']} LONG_TERM=${d.arrows['LONG_TERM']}`);
-    console.log(`  EMA112=${f2(d.ema112)} EMA224=${f2(d.ema224)} EMA448=${f2(d.ema448)}`);
-    console.log(`  verifiedFailed=[${d.verifiedFailed.join(',')}] unverified=[${d.unverifiedExternal.join(',')}] (A/B/C 매핑·T 환율 미검증 — 완전일치 주장 금지)`);
+  const ranked = collectRankedSignals(results);
+  const counts = signalTierCounts(ranked);
+  for (const d of ranked) {
+    const cache = new DailyCache(market, d.symbol); cache.load();
+    const snap = cache.corrupt ? null : buildYeokmaeSnapshot(d.symbol, confirmedCandles(cache));
+    for (const line of formatKRSignalDetail(d, snap, nameOf.get(d.symbol) ?? (exMap.get(d.symbol) ?? '?'))) console.log(line);
   }
+
   const s = summarize(cached, results);
-  console.log(`\n[YEOKMAE-SIGNALS] cached=${cached} ready=${s.ready} reverse=${s.reverse} withArrow=${s.anyArrow} bothSearcherAndArrow=${s.bothSearcherAndArrow} corrupt=${corrupt}`);
-  if (hits.length === 0) console.log(`  (5신호 ON 종목 없음 — 정상. 조건 완화/튜닝하지 않는다. 근접후보는 yeokmae:near-matches 로 확인.)`);
+  console.log(`\n[YEOKMAE-SIGNALS] cached=${cached} ready=${s.ready} reverse=${s.reverse} corrupt=${corrupt}`);
+  console.log(`  수집(SEARCHER_PASS||arrow)=${counts.total} · UPGRADE=${counts.upgrade} · 기타arrow=${counts.arrow} · searcher-only=${counts.searcherOnly}`);
+  console.log(`  arrow별: 112_ORIGINAL=${s.arrow112Original} 224_ORIGINAL=${s.arrow224Original} 112_UPGRADE=${s.arrow112Upgrade} 224_UPGRADE=${s.arrow224Upgrade} LONG_TERM=${s.longTerm} searcherFormulaPass=${s.searcherFormulaPass} bothSearcherAndArrow=${s.bothSearcherAndArrow}`);
+  if (ranked.length === 0) console.log(`  (SEARCHER_PASS/5신호 종목 없음 — 정상. 조건 완화/튜닝하지 않는다. 근접후보는 build 러너의 topNearMatches 참조.)`);
 }
 main();
