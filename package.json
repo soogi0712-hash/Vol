@@ -29,6 +29,7 @@
     "yeokmae:pilot-preflight": "tsx local-runner/yeokmae-pilot-preflight.ts",
     "yeokmae:live": "tsx local-runner/yeokmae-live.ts",
     "yeokmae:kr-live": "tsx local-runner/yeokmae-kr-live.ts",
+    "yeokmae:us-live": "tsx local-runner/yeokmae-us-live.ts",
     "yeokmae:signal-report": "tsx local-runner/yeokmae-signal-report.ts",
     "yeokmae:exit-diag": "tsx local-runner/yeokmae-exit-diag.ts",
     "yeokmae:batch-diag": "tsx local-runner/yeokmae-batch-diag.ts",
