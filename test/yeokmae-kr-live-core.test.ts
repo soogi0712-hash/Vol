@@ -1,6 +1,6 @@
 // P0-33 — KR 실전 코어: 자본가드 / UPGRADE-only 후보 / A·B·C 마스터연결 / 청산정책 resolver.
 import { describe, it, expect } from 'vitest';
-import { computeKRCapitalGuard, selectKRBuyCandidates, krMasterFlags, resolveKRExitPolicy } from '../local-runner/yeokmae/kr-live-core';
+import { computeKRCapitalGuard, selectKRBuyCandidates, krMasterFlags, resolveKRExitPolicy, krRealOrderEnabled, KR_BUY_PATH_READY, KR_SELL_PATH_READY } from '../local-runner/yeokmae/kr-live-core';
 import type { SymbolDiscovery } from '../local-runner/yeokmae/discovery';
 
 const A0 = { '112_ORIGINAL': false, '224_ORIGINAL': false, '112_UPGRADE': false, '224_UPGRADE': false, 'LONG_TERM': false };
@@ -78,6 +78,42 @@ describe('P0-33 selectKRBuyCandidates — UPGRADE-only, ORIGINAL 자동대체 �
   });
   it('ready=false/reverse=false 는 제외(1차 미통과)', () => {
     expect(selectKRBuyCandidates([disc('X', { reverse: false, arrows: { '112_UPGRADE': true } })])).toHaveLength(0);
+  });
+});
+
+describe('P0-33B krRealOrderEnabled — KR 실주문 최종 게이트(단일 함수)', () => {
+  const on = { liveTrading: true, yeokmaeLive: true, krLive: true, exitConfirmed: true };
+  it('4개 env 전부 true + BUY/SELL path ready → enabled=true, reasons 없음', () => {
+    const r = krRealOrderEnabled(on);
+    expect(r.enabled).toBe(true);
+    expect(r.reasons).toHaveLength(0);
+    expect(r.buyPathReady).toBe(KR_BUY_PATH_READY);
+    expect(r.sellPathReady).toBe(KR_SELL_PATH_READY);
+  });
+  it('각 env off → 해당 사유로 차단(enabled=false)', () => {
+    expect(krRealOrderEnabled({ ...on, liveTrading: false }).reasons).toContain('LS_LIVE_TRADING_off');
+    expect(krRealOrderEnabled({ ...on, yeokmaeLive: false }).reasons).toContain('YEOKMAE_LIVE_TRADING_off');
+    expect(krRealOrderEnabled({ ...on, krLive: false }).reasons).toContain('YEOKMAE_KR_LIVE_TRADING_off');
+    expect(krRealOrderEnabled({ ...on, exitConfirmed: false }).reasons).toContain('YEOKMAE_KR_EXIT_CONFIRMED_off');
+    expect(krRealOrderEnabled({ ...on, liveTrading: false }).enabled).toBe(false);
+  });
+  it('BUY/SELL 경로 준비완료(P0-33B: 둘 다 true) → 게이트가 경로 미비로 막지 않음', () => {
+    expect(KR_BUY_PATH_READY).toBe(true);
+    expect(KR_SELL_PATH_READY).toBe(true);
+  });
+});
+
+describe('P0-33B 수동/기존 보유 보호 — 계좌보유 종목은 BUY 후보 제외(commingling 방지)', () => {
+  it('broker(t0424) 보유 종목은 원장보유가 아니어도 BUY 후보에서 제외', () => {
+    const res = [
+      disc('MANUAL', { arrows: { '112_UPGRADE': true } }),   // 수동보유(계좌엔 있으나 원장엔 없음)
+      disc('FRESH', { arrows: { '112_UPGRADE': true } }),
+    ];
+    // 러너는 heldSymbols(원장) ∪ brokerSymbols(t0424) 를 제외집합으로 전달 → 수동보유 MANUAL 제외.
+    const buyExclude = new Set<string>(['MANUAL']);
+    const cands = selectKRBuyCandidates(res, { heldSymbols: buyExclude });
+    expect(cands.map(c => c.symbol)).toEqual(['FRESH']);
+    expect(cands.find(c => c.symbol === 'MANUAL')).toBeUndefined();
   });
 });
 

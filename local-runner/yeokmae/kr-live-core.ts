@@ -1,8 +1,29 @@
 // 역매공파 KR 실전 코어 (P0-33) — 순수·테스트용. BUY 후보선정 / 자본가드 / A·B·C 마스터연결. 주문 0.
 //   ⚠️ 원본 검색기/5신호 수식 무변경. 신용·미수 금지(cash-only). UPGRADE 만 실 BUY(ORIGINAL/LONG_TERM 관찰).
 import { isPreferredStock } from '../kr-universe';
+import { LS_KR_SELL_TR_CONFIRMED } from '../../src/lib/ls-api';
 import type { YeokmaeMarketFlags } from '../../src/lib/yeokmae';
 import type { SymbolDiscovery } from './discovery';
+
+// ── KR 실주문 최종 게이트 (P0-33B) — KR 전용 명시적 승인경로. ──
+//   ⚠️ YEOKMAE_STRATEGY_VALIDATED(코드상수 false, 하드블록)를 요구하지 않는다 — PILOT 과 동일하게 '별도 사용자 승인'.
+//     US 는 이 경로로 열리지 않는다(KR 전용). REAL_ORDER_FROM_YEOKMAE 는 표시라벨일 뿐 게이트가 아니다.
+//   KR_BUY_PATH_READY: CSPAT00601 매수 실계정 확인(00040) + cash-only 게이트 + candle idempotency 완비.
+//   KR_SELL_PATH_READY: CSPAT00601 매도('1') 공식확인(LS_KR_SELL_TR_CONFIRMED) + t0424 매도가능수량 + fail-closed.
+export const KR_BUY_PATH_READY = true;
+export const KR_SELL_PATH_READY = LS_KR_SELL_TR_CONFIRMED;
+export interface KRRealOrderInput { liveTrading: boolean; yeokmaeLive: boolean; krLive: boolean; exitConfirmed: boolean; }
+export interface KRRealOrderResult { enabled: boolean; reasons: string[]; buyPathReady: boolean; sellPathReady: boolean; }
+export function krRealOrderEnabled(p: KRRealOrderInput): KRRealOrderResult {
+  const reasons: string[] = [];
+  if (!p.liveTrading) reasons.push('LS_LIVE_TRADING_off');
+  if (!p.yeokmaeLive) reasons.push('YEOKMAE_LIVE_TRADING_off');
+  if (!p.krLive) reasons.push('YEOKMAE_KR_LIVE_TRADING_off');
+  if (!p.exitConfirmed) reasons.push('YEOKMAE_KR_EXIT_CONFIRMED_off');
+  if (!KR_BUY_PATH_READY) reasons.push('KR_BUY_PATH_NOT_READY');
+  if (!KR_SELL_PATH_READY) reasons.push('KR_SELL_PATH_NOT_READY');
+  return { enabled: reasons.length === 0, reasons, buyPathReady: KR_BUY_PATH_READY, sellPathReady: KR_SELL_PATH_READY };
+}
 
 // ── item6: A/B/C 를 t8436 마스터 실필드로 연결(permissive 기본값 대신 실제 파생). ──
 //   A(제외종목): t8436 은 관리/거래정지/투자위험 실시간 플래그를 제공하지 않음(추측 금지) → 전일종가<=0(신규/정지 성격)
