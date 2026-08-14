@@ -9,7 +9,8 @@ import {
   computeUSDailyBuyGate, formatUSDailyGuard,
   placeLSUSSellOrder, LS_US_SELL_TR_CONFIRMED, LS_US_SELL_ORDPTN, LS_US_ORDPTN_BUY,
   evaluateCrossWon, formatCrossWonCheck, formatCrossWonLiveCand, formatUSLiveGate, maskLSResponse, CROSS_WON_ADOPTED_FIELD, LS_US_CROSS_WON_TR_CONFIRMED, type LSUSDeposit,
-  placeLSKRBuyOrder, queryLSKROrderExec, cancelLSKRBuyOrder, krIsuNo, isKROrderSuccess, getLSKRStockMaster,
+  placeLSKRBuyOrder, placeLSKRSellOrder, buildKRSellInBlock, getLSKRHoldings, LS_KR_BNS_SELL, LS_KR_ORDPRC_LIMIT, LS_KR_SELL_TR_CONFIRMED, krShcodeFromExpcode,
+  queryLSKROrderExec, cancelLSKRBuyOrder, krIsuNo, isKROrderSuccess, getLSKRStockMaster,
   getLSUSStockMasterPage,
   toLSOverseasExchcd, LSApiError, configureLSRateLimiter, classifyChart,
   LS_G3203_MAX_QRYCNT_UNCOMPRESSED,
@@ -59,6 +60,54 @@ describe('getLSAccessToken', () => {
     expect(init.body).toContain('appsecretkey=APPSECRET');
     expect(init.body).toContain('appkey=APPKEY');
     expect(init.body).toContain('scope=oob');
+  });
+});
+
+describe('P0-33A KR SELL (CSPAT00601 BnsTpCode=1) + 잔고 t0424', () => {
+  it('LS_KR_SELL_TR_CONFIRMED=true (공식 매매구분 1=매도)', () => {
+    expect(LS_KR_SELL_TR_CONFIRMED).toBe(true);
+    expect(LS_KR_BNS_SELL).toBe('1');
+    expect(LS_KR_ORDPRC_LIMIT).toBe('00');
+  });
+  it('buildKRSellInBlock — BnsTpCode=1(매도)/OrdprcPtnCode=00(지정가)/현금(000)', () => {
+    const ib = buildKRSellInBlock({ shcode: '005930', qty: 4, price: 61000 }).CSPAT00601InBlock1 as any;
+    expect(ib.IsuNo).toBe('A005930'); expect(ib.OrdQty).toBe(4); expect(ib.OrdPrc).toBe(61000);
+    expect(ib.BnsTpCode).toBe('1'); expect(ib.OrdprcPtnCode).toBe('00'); expect(ib.MgntrnCode).toBe('000');
+  });
+  it('placeLSKRSellOrder → CSPAT00601 매도 전송, OrdNo 파싱', async () => {
+    stubFetch((url, init) => {
+      expect(url).toBe('https://openapi.ls-sec.co.kr:8080/stock/order');
+      expect(init.headers['tr_cd']).toBe('CSPAT00601');
+      expect(JSON.parse(init.body).CSPAT00601InBlock1.BnsTpCode).toBe('1');
+      return { json: { rsp_cd: '00040', rsp_msg: '매도 주문 완료', CSPAT00601OutBlock2: { OrdNo: 700 } } };
+    });
+    const r = await placeLSKRSellOrder(cfg, 'T', { shcode: '005930', qty: 4, price: 61000 });
+    expect(r.rspCd).toBe('00040'); expect(r.ordNo).toBe('700');
+  });
+  it('getLSKRHoldings (t0424) — OutBlock1 janqty/mdposqt/pamt 파싱', async () => {
+    stubFetch((url, init) => {
+      expect(url).toBe('https://openapi.ls-sec.co.kr:8080/stock/accno');
+      expect(init.headers['tr_cd']).toBe('t0424');
+      expect(JSON.parse(init.body)).toEqual({ t0424InBlock: { prcgb: '', chegb: '', dangb: '', charge: '', cts_expcode: '' } });
+      return { json: { rsp_cd: '00000', rsp_msg: '정상', t0424OutBlock: {}, t0424OutBlock1: [
+        { expcode: 'A005930', hname: '삼성전자', janqty: '10', mdposqt: '7', pamt: '60000', price: '61400', dtsunik: '14000' },
+        { expcode: '000660', hname: 'SK하이닉스', janqty: '0', mdposqt: '0', pamt: '0', price: '0', dtsunik: '0' },
+      ] } };
+    });
+    const h = await getLSKRHoldings(cfg, 'T');
+    expect(h.ok).toBe(true);
+    expect(h.holdings).toHaveLength(1);   // janqty>0 만
+    expect(h.holdings[0]).toMatchObject({ symbol: '005930', balQty: 10, sellableQty: 7, avgPrice: 60000, currentPrice: 61400, evalPnL: 14000 });
+  });
+  it('getLSKRHoldings — 미등록 성공코드(예: 00136) → fail-closed(ok=false, 추측 금지)', async () => {
+    stubFetch(() => ({ json: { rsp_cd: '00136', rsp_msg: '조회 완료', t0424OutBlock1: [{ expcode: 'A005930', janqty: '10', mdposqt: '7', pamt: '60000', price: '61000', dtsunik: '0' }] } }));
+    const h = await getLSKRHoldings(cfg, 'T');
+    expect(h.ok).toBe(false);   // 00136 미등록 → SELL freshSellable fail-closed
+    expect(h.rspCd).toBe('00136');
+  });
+  it('krShcodeFromExpcode — 선행 A 제거', () => {
+    expect(krShcodeFromExpcode('A005930')).toBe('005930');
+    expect(krShcodeFromExpcode('005930')).toBe('005930');
   });
 });
 

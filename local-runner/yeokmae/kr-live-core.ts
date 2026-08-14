@@ -109,3 +109,41 @@ export function resolveKRExitPolicy(env: NodeJS.ProcessEnv): KRExitPolicy {
   if (!confirmed) pendingDecisions.push('YEOKMAE_KR_EXIT_CONFIRMED!=true(사용자 최종확인 필요)');
   return { stopLossPct, takeProfitPct, maxHoldDays, emergencyStopPct, confirmed, pendingDecisions };
 }
+
+// ── item4: 실전 운영 risk/exit 판정(순수) — ⚠️ 역매공파 원본 SELL 아님(NO_SOURCE_BASED_SELL). 실전 운영용 위험청산 정책. ──
+//   우선순위: EMERGENCY_STOP(-emergencyStopPct, 최우선) > STOP_LOSS(-stopLossPct) > TAKE_PROFIT(+takeProfitPct) > MAX_HOLD_DAYS.
+//   손익률은 실 체결평단(원장 entryAvgPrice, 실제 fill) 기준. entryAvg/현재가 불명확이면 HOLD(임의 생성 금지).
+export type KRExitReason = 'EMERGENCY_STOP' | 'STOP_LOSS' | 'TAKE_PROFIT' | 'MAX_HOLD_DAYS';
+export interface KRExitDecision { action: 'HOLD' | 'SELL'; reason: KRExitReason | null; pnlPct: number | null; note: string }
+export function evaluateKRExit(p: {
+  entryAvgPrice: number; currentPrice: number; holdDays: number; policy: KRExitPolicy;
+}): KRExitDecision {
+  if (!(p.entryAvgPrice > 0)) return { action: 'HOLD', reason: null, pnlPct: null, note: 'NO_ENTRY_AVG(실 체결평단 불명확 → 판정 보류, 임의 생성 금지)' };
+  if (!(p.currentPrice > 0)) return { action: 'HOLD', reason: null, pnlPct: null, note: 'NO_PRICE(현재가 미확보 → 판정 보류)' };
+  const pnlPct = (p.currentPrice - p.entryAvgPrice) / p.entryAvgPrice * 100;
+  const pol = p.policy;
+  // EMERGENCY 최우선(일반 exit 경로와 별개, 항상 활성)
+  if (pnlPct <= -pol.emergencyStopPct) return { action: 'SELL', reason: 'EMERGENCY_STOP', pnlPct, note: `pnl=${pnlPct.toFixed(2)}% <= -${pol.emergencyStopPct}%(비상 최우선)` };
+  if (pol.stopLossPct != null && pnlPct <= -pol.stopLossPct) return { action: 'SELL', reason: 'STOP_LOSS', pnlPct, note: `pnl=${pnlPct.toFixed(2)}% <= -${pol.stopLossPct}%` };
+  if (pol.takeProfitPct != null && pnlPct >= pol.takeProfitPct) return { action: 'SELL', reason: 'TAKE_PROFIT', pnlPct, note: `pnl=${pnlPct.toFixed(2)}% >= +${pol.takeProfitPct}%` };
+  if (pol.maxHoldDays != null && p.holdDays >= pol.maxHoldDays) return { action: 'SELL', reason: 'MAX_HOLD_DAYS', pnlPct, note: `holdDays=${p.holdDays} >= ${pol.maxHoldDays}` };
+  return { action: 'HOLD', reason: null, pnlPct, note: `pnl=${pnlPct.toFixed(2)}% HOLD` };
+}
+
+// ── item2: 시작 시 실계좌(t0424) ↔ 프로그램 원장 reconcile(순수). 원장 qty 를 broker 잔고로 검증. ──
+//   broker balQty=0 인데 원장 보유 → 외부청산 의심(원장 stale). broker < 원장 → 원장 과다(수량 하향 필요).
+//   ⚠️ 여기서는 판정만(부수효과 없음). 실제 sync 는 러너가 결정(자동삭제 금지, 로그 후 보수적 처리).
+export interface KRLedgerReconcileEntry { symbol: string; ledgerQty: number; brokerQty: number; brokerSellable: number; status: 'MATCH' | 'BROKER_LESS' | 'BROKER_ZERO' | 'BROKER_MORE'; }
+export function reconcileKRLedgerVsHoldings(
+  ledger: readonly { symbol: string; qty: number }[],
+  holdings: readonly { symbol: string; balQty: number; sellableQty: number }[],
+): KRLedgerReconcileEntry[] {
+  const hBySym = new Map(holdings.map(h => [h.symbol, h]));
+  return ledger.filter(l => l.qty > 0).map(l => {
+    const h = hBySym.get(l.symbol);
+    const brokerQty = h?.balQty ?? 0; const brokerSellable = h?.sellableQty ?? 0;
+    const status: KRLedgerReconcileEntry['status'] = brokerQty === 0 ? 'BROKER_ZERO'
+      : brokerQty < l.qty ? 'BROKER_LESS' : brokerQty > l.qty ? 'BROKER_MORE' : 'MATCH';
+    return { symbol: l.symbol, ledgerQty: l.qty, brokerQty, brokerSellable, status };
+  });
+}

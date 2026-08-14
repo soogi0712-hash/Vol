@@ -1322,9 +1322,15 @@ export async function getLSUSHoldings(cfg: LSConfig, token: string, baseDateYYYY
 // 국내 종목번호(IsuNo) 는 'A' 접두 6자리(예: A005930). 유니버스 shcode(005930) → A005930.
 export function krIsuNo(shcode: string): string { return /^A/i.test(shcode) ? shcode.toUpperCase() : 'A' + shcode; }
 
-// BnsTpCode: 1=매도, 2=매수 (공식 reqExample 매수="2"). OrdprcPtnCode: 00=지정가.
+// BnsTpCode(매매구분): 1=매도, 2=매수 — LS 공식 CSPAT00601 카탈로그 확인(reqExample 매수="2" + 매매구분 enum).
+// OrdprcPtnCode(호가유형): 00=지정가, 03=시장가(OrdPrc=0). 현재 지정가만 사용(시장가 미구현).
 export const LS_KR_BNS_BUY = '2';
 export const LS_KR_BNS_SELL = '1';
+export const LS_KR_ORDPRC_LIMIT = '00';    // 지정가(공식)
+export const LS_KR_ORDPRC_MARKET = '03';   // 시장가(공식) — 미구현(지정가만 사용)
+// P0-33A: 매도 BnsTpCode='1' 공식 카탈로그 확인 완료 → 봉인 해제. 실 SELL POST 는 러너 게이트(LS_LIVE_TRADING ∧
+//   YEOKMAE_KR_LIVE_TRADING ∧ 청산정책 확정 ∧ 전 안전게이트)로만 통제. 호가유형은 지정가('00') 고정.
+export const LS_KR_SELL_TR_CONFIRMED = true;
 
 // CSPAT00601 주문 성공 판정 — 성공코드(00000/00040) 또는 주문번호(OrdNo) 존재. (실계정 00040 오탐 방지)
 export const KR_ORDER_SUCCESS_CODES = new Set(['00000', '00040']);
@@ -1371,6 +1377,48 @@ export async function cancelLSKRBuyOrder(cfg: LSConfig, token: string, p: { orgO
   const { data, rspCd, rspMsg, diag } = await lsPost(token, '/stock/order', 'CSPAT00801', inb);
   const ob2 = data.CSPAT00801OutBlock2 || {};
   return { rspCd, rspMsg, ordNo: ob2.OrdNo != null ? String(ob2.OrdNo) : null, raw: data, diag };
+}
+
+// ── 현물 지정가 매도 (CSPAT00601, /stock/order, BnsTpCode='1') — P0-33A. 매수와 동일 TR/필드, 매매구분만 '1'(매도). ──
+export function buildKRSellInBlock(p: { shcode: string; qty: number; price: number; mbrNo?: string }): { CSPAT00601InBlock1: Record<string, unknown> } {
+  return {
+    CSPAT00601InBlock1: {
+      IsuNo: krIsuNo(p.shcode), OrdQty: p.qty, OrdPrc: p.price, BnsTpCode: LS_KR_BNS_SELL,
+      OrdprcPtnCode: LS_KR_ORDPRC_LIMIT, MgntrnCode: '000', LoanDt: '', OrdCndiTpCode: '0', MbrNo: p.mbrNo ?? 'NXT',
+    },
+  };
+}
+export async function placeLSKRSellOrder(cfg: LSConfig, token: string, p: { shcode: string; qty: number; price: number; mbrNo?: string }): Promise<LSKROrderResult> {
+  const inb = buildKRSellInBlock(p);
+  const { data, rspCd, rspMsg, diag } = await lsPost(token, '/stock/order', 'CSPAT00601', inb);
+  const ob2 = data.CSPAT00601OutBlock2 || {};
+  return { rspCd, rspMsg, ordNo: ob2.OrdNo != null ? String(ob2.OrdNo) : null, raw: data, diag };
+}
+
+// ── 국내 주식 종목별 잔고 (t0424 주식잔고2, /stock/accno) — 매도 전 실제 보유/매도가능수량 확인 (P0-33A). ──
+// 공식 카탈로그(LS Open API): InBlock reqExample={prcgb,chegb,dangb,charge,cts_expcode} 전부 빈문자.
+//   OutBlock1(종목별): expcode(종목코드) janqty(잔고수량) mdposqt(매도가능수량) pamt(평균단가) price(현재가) dtsunik(평가손익) sunikrt(수익률).
+//   ⚠️ fail-closed: 성공코드(t0424 확정=00000) + 정상 envelope 일 때만 ok. 실계정에서 '조회완료' 다른 코드가 나오면
+//     진단 rsp_cd 확인 후 등록(추측으로 코드 추가 금지 — CSPAQ12200 처럼 00136 일 수 있으나 확인 전 미등록).
+export const LS_KR_HOLDINGS_SUCCESS_CODES = ['00000'];
+export interface LSKRHolding { symbol: string; balQty: number; sellableQty: number; avgPrice: number; currentPrice: number; evalPnL: number }
+export interface LSKRHoldingsResult { ok: boolean; rspCd: string; rspMsg: string; hasEnvelope: boolean; holdings: LSKRHolding[]; rawRows: number; diag: LSHttpDiag }
+// t0424 expcode → 유니버스 shcode 정규화(선행 'A' 제거).
+export function krShcodeFromExpcode(expcode: string): string { return String(expcode ?? '').trim().replace(/^A/i, ''); }
+export async function getLSKRHoldings(cfg: LSConfig, token: string): Promise<LSKRHoldingsResult> {
+  const { data, rspCd, rspMsg, diag } = await lsPost(token, '/stock/accno', 't0424',
+    { t0424InBlock: { prcgb: '', chegb: '', dangb: '', charge: '', cts_expcode: '' } }, { soft: true });
+  const ob1 = data?.t0424OutBlock1;
+  const anyBlock = data && (data.t0424OutBlock !== undefined || ob1 !== undefined);
+  const ob1Valid = ob1 === undefined || Array.isArray(ob1);
+  const hasEnvelope = (rspCd !== '' || anyBlock) && ob1Valid;
+  const ok = LS_KR_HOLDINGS_SUCCESS_CODES.includes(rspCd) && hasEnvelope;
+  const rows: any[] = Array.isArray(ob1) ? ob1 : [];
+  const holdings = ok ? rows.map(r => ({
+    symbol: krShcodeFromExpcode(String(r.expcode ?? '')), balQty: toNum(r.janqty), sellableQty: toNum(r.mdposqt),
+    avgPrice: toNum(r.pamt), currentPrice: toNum(r.price), evalPnL: toNum(r.dtsunik),
+  })).filter(h => h.symbol && h.balQty > 0) : [];
+  return { ok, rspCd, rspMsg, hasEnvelope, holdings, rawRows: rows.length, diag };
 }
 
 // ── 현물 주문체결내역 조회 (CSPAQ13700, /stock/accno) — OutBlock2 집계로 체결/부분체결 판정 ──

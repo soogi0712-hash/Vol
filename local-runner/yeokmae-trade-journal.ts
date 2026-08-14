@@ -66,9 +66,9 @@ export function computeDailyReport(inp: DailyReportInput): DailyReport {
     realizedPnL, unrealizedPnL: unrealKnown ? unreal : null, winRate, capitalUsedKRW,
   };
 }
-export function formatDailyReport(r: DailyReport): string {
+export function formatDailyReport(r: DailyReport, tag = 'YEOKMAE-DAILY-REPORT'): string {
   const pct = r.winRate == null ? 'n/a' : `${(r.winRate * 100).toFixed(0)}%`;
   const un = r.unrealizedPnL == null ? 'n/a(현재가 미확보)' : Math.round(r.unrealizedPnL).toString();
-  return `[YEOKMAE-DAILY-REPORT] market=${r.market} date=${r.date} signals=${r.signals} buys=${r.buys} sells=${r.sells}`
+  return `[${tag}] market=${r.market} date=${r.date} signals=${r.signals} buys=${r.buys} sells=${r.sells}`
     + ` holdings=${r.holdings} realizedPnL=${Math.round(r.realizedPnL)} unrealizedPnL=${un} winRate=${pct} capitalUsedKRW=${Math.round(r.capitalUsedKRW)}`;
 }
