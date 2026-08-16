@@ -26,7 +26,7 @@ function mk(over: { quote?: USQuote; broker?: number | null; pendingAfterSell?: 
   };
   return { deps, posts: () => posts };
 }
-const ctx = (positions: YeokmaePosition[], over: any = {}) => ({ positions, policy: policy(), sessionOrderable: true, verbose: false, ...over });
+const ctx = (positions: YeokmaePosition[], over: any = {}) => ({ positions, policy: policy(), sessionOrderable: true, verbose: false, tag: 'US' as const, ...over });
 
 describe('P0-34L resolveUSLoopIntervals — 주기분리(SELL 짧게 / reconcile 중간 / BUY 낮은빈도) + 하한 클램프', () => {
   it('기본값: sell<reconcile<buyRecalc', () => {

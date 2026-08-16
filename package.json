@@ -30,6 +30,8 @@
     "yeokmae:live": "tsx local-runner/yeokmae-live.ts",
     "yeokmae:kr-live": "tsx local-runner/yeokmae-kr-live.ts",
     "yeokmae:us-live": "tsx local-runner/yeokmae-us-live.ts",
+    "yeokmae:auto": "tsx local-runner/yeokmae-auto.ts",
+    "yeokmae:auto-status": "tsx local-runner/yeokmae-auto-status.ts",
     "yeokmae:signal-report": "tsx local-runner/yeokmae-signal-report.ts",
     "yeokmae:exit-diag": "tsx local-runner/yeokmae-exit-diag.ts",
     "yeokmae:batch-diag": "tsx local-runner/yeokmae-batch-diag.ts",

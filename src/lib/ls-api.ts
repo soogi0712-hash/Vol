@@ -1042,6 +1042,28 @@ export function usEtSession(now: Date): { etTime: string; session: USMarketSessi
   else session = 'CLOSED';
   return { etTime, session, minutesEt };
 }
+// ── 국내장 세션 판정 (P0-35) — IANA Asia/Seoul(KR 은 DST 없음, Intl 로 고정 하드코딩 회피). ──
+//   KRX 정규장(연속매매+마감동시호가 포함): 09:00–15:30. 그 외 CLOSED, 주말 CLOSED_WEEKEND.
+//   ⚠️ 공휴일 달력은 공식소스 없어 미반영 — 휴장일이면 신규 신호도 없고 LS 가 주문을 거부하므로 무해(보고).
+export type KRMarketSession = 'REGULAR' | 'CLOSED' | 'CLOSED_WEEKEND';
+export function krSession(now: Date): { ktTime: string; session: KRMarketSession; minutesKt: number } {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'Asia/Seoul', hour: '2-digit', minute: '2-digit', hour12: false,
+    weekday: 'short', year: 'numeric', month: '2-digit', day: '2-digit',
+  }).formatToParts(now);
+  const p: Record<string, string> = {};
+  for (const x of parts) p[x.type] = x.value;
+  const hh = Number(p.hour) % 24;
+  const mm = Number(p.minute);
+  const minutesKt = hh * 60 + mm;
+  const wd = p.weekday;
+  const ktTime = `${p.year}-${p.month}-${p.day} ${String(hh).padStart(2, '0')}:${p.minute} KST(${wd})`;
+  let session: KRMarketSession;
+  if (wd === 'Sat' || wd === 'Sun') session = 'CLOSED_WEEKEND';
+  else if (minutesKt >= 9 * 60 && minutesKt < 15 * 60 + 30) session = 'REGULAR';
+  else session = 'CLOSED';
+  return { ktTime, session, minutesKt };
+}
 export function decideUSCashPayment(dep: LSUSDeposit, priceUsd: number, qty: number, opts: { crossWonVerified?: boolean } = {}): USCashDecision {
   const estimatedUsd = priceUsd * qty;
   const { qtyCountry, qtyCrossWon } = usOrderableQty(dep, priceUsd);

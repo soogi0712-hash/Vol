@@ -216,7 +216,7 @@ async function main() {
         return { posted: r.status === 'placed-filled' || r.status === 'placed-partial' || r.status === 'placed-pending' };
       },
       log: (m) => log.info(m),
-    }, { positions: usPositions, policy: exit, sessionOrderable, verbose });
+    }, { positions: usPositions, policy: exit, sessionOrderable, verbose, tag: 'US' });
     if (verbose || res.sells > 0 || res.skippedStale > 0 || res.skippedUnmatched > 0) {
       log.info(`[YEOKMAE-US-EXIT-CHECK] managedPositions=${usPositions.length} evaluated=${res.evaluated} sells=${res.sells} holds=${res.holds} stale=${res.skippedStale} unmatched=${res.skippedUnmatched} deferredClosed=${res.deferredClosed}`);
     }
