@@ -1,0 +1,60 @@
+# Vol KR/US 역매공파 자동매매 — 서버 상시운영 (P0-36)
+#   배포: /opt/phoenix/vol 에서 `docker compose up -d --build`. PC 없이 24h 동작.
+#   ⚠️ 시크릿은 ./secrets/vol.env (git/image 미포함). 상태는 ./state (bind mount) 영속화.
+#   ⚠️ vol-kr/vol-us 는 별도 서비스(장애 격리). restart: unless-stopped → 재부팅/크래시 자동복구.
+#   세션 판단은 코드가 IANA 존(Asia/Seoul·America/New_York, DST 자동)을 직접 사용하므로 컨테이너 TZ 와 무관하게 정확.
+#   (TZ 는 로그 타임스탬프 가독성용으로만 지정)
+services:
+  vol-kr:
+    build: .
+    image: vol-yeokmae:latest
+    container_name: vol-kr
+    command: ["node", "--import", "tsx", "local-runner/yeokmae-kr-live.ts"]
+    restart: unless-stopped
+    env_file:
+      - ./secrets/vol.env
+    environment:
+      TZ: Asia/Seoul
+    volumes:
+      - ./state/data:/app/local-runner/data
+      - ./state/logs:/app/local-runner/logs
+      - ./state/cache:/app/local-runner/.cache
+    healthcheck:
+      test: ["CMD", "node", "scripts/healthcheck.mjs", "KR", "180"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  vol-us:
+    build: .
+    image: vol-yeokmae:latest
+    container_name: vol-us
+    command: ["node", "--import", "tsx", "local-runner/yeokmae-us-live.ts"]
+    restart: unless-stopped
+    env_file:
+      - ./secrets/vol.env
+    environment:
+      TZ: America/New_York
+    volumes:
+      - ./state/data:/app/local-runner/data
+      - ./state/logs:/app/local-runner/logs
+      - ./state/cache:/app/local-runner/.cache
+    healthcheck:
+      test: ["CMD", "node", "scripts/healthcheck.mjs", "US", "180"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"

@@ -1,0 +1,21 @@
+# 이미지에 넣지 않을 것 (P0-36) — 시크릿/상태/빌드산출물/VCS 제외.
+.git
+.gitignore
+node_modules
+dist
+# 시크릿 — 절대 image 에 포함 금지
+.env
+.env.*
+!.env.local.example
+secrets/
+# 런타임 상태 — 볼륨으로만(이미지에 굽지 않음)
+state/
+local-runner/data
+local-runner/logs
+local-runner/.cache
+# Windows/문서/개발 잡동사니
+scripts/*.ps1
+scripts/*.cmd
+*.md
+.claude
+coverage

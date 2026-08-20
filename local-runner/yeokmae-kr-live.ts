@@ -19,6 +19,7 @@ import { executeKRSellOrder } from './kr-seller';
 import { runYeokmaeKRSell, type KRSellIO } from './yeokmae-kr-sell-run';
 import { resolveLoopIntervals, isDue, runManagedSellCycle, type Quote } from './yeokmae/loop-core';
 import { TradeJournal, computeDailyReport, formatDailyReport } from './yeokmae-trade-journal';
+import { writeHeartbeat } from './heartbeat';
 import { buildYeokmaeSnapshot } from '../src/lib/yeokmae';
 import { join } from 'node:path';
 
@@ -217,6 +218,7 @@ async function main() {
     const sell = await doSellCycle(postEnabled, sessionOrderable, verboseThisCycle);
 
     const managedNow = posStore.all().filter(p => p.exchcd === 'KR' && p.qty > 0).length;
+    writeHeartbeat('KR', { cycle, session: kt.session, postEnabled, managed: managedNow });   // Docker healthcheck
     log.info(`[YEOKMAE-KR-LOOP] cycle=${cycle} session=${kt.session} postEnabled=${postEnabled} managed=${managedNow} candidates=${candidates.length} evaluated=${sell.evaluated} sellsThisCycle=${sell.sells}`);
     if (verboseThisCycle) lastLogAt = now;
 

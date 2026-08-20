@@ -30,6 +30,7 @@ import {
 import { resolveUSLoopIntervals, isDue, runUSSellCycle, type USQuote } from './yeokmae/us-loop-core';
 import { runYeokmaeUSSell, type USSellIO } from './yeokmae-us-sell-run';
 import { TradeJournal, computeDailyReport, formatDailyReport } from './yeokmae-trade-journal';
+import { writeHeartbeat } from './heartbeat';
 import { buildYeokmaeSnapshot } from '../src/lib/yeokmae';
 import { join } from 'node:path';
 
@@ -226,12 +227,13 @@ async function main() {
   // ── graceful shutdown ──
   let stopping = false; let wake: (() => void) | null = null;
   const interruptibleSleep = (ms: number) => new Promise<void>((resolve) => { const t = setTimeout(() => { wake = null; resolve(); }, ms); wake = () => { clearTimeout(t); wake = null; resolve(); }; });
-  process.on('SIGINT', () => {
+  const onStop = () => {
     if (stopping) { process.exit(130); return; }
     stopping = true;
-    log.info('[YEOKMAE-US-SHUTDOWN] Ctrl+C 수신 — 새 주문 중단, store flush 후 정상 종료 진행…');
+    log.info('[YEOKMAE-US-SHUTDOWN] 종료신호 수신(SIGINT/SIGTERM) — 새 주문 중단, store flush 후 정상 종료 진행…');
     if (wake) wake();
-  });
+  };
+  process.on('SIGINT', onStop); process.on('SIGTERM', onStop);   // Docker stop 은 SIGTERM
 
   // ── STARTUP 초기 복원: reconcile(holdings) + 초기 BUY 후보 계산 + 게이트 로그. ──
   await doReconcile();
@@ -261,6 +263,7 @@ async function main() {
 
     // [YEOKMAE-US-LOOP] 은 매 cycle 출력(살아있음 확인) — 상세 CHECK 로그만 throttle.
     const managedNow = posStore.all().filter(p => p.exchcd !== 'KR' && p.qty > 0).length;
+    writeHeartbeat('US', { cycle, session: et.session, postEnabled, managed: managedNow });   // Docker healthcheck
     log.info(`[YEOKMAE-US-LOOP] cycle=${cycle} session=${et.session} postEnabled=${postEnabled} managed=${managedNow} candidates=${candidates.length} evaluated=${sell.evaluated} sellsThisCycle=${sell.sells}`);
     if (verboseThisCycle) lastLogAt = now;
 

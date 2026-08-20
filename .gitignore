@@ -40,5 +40,13 @@ yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
 
+# P0-36 Docker 서버 상태(bind mount) — 런타임 산출물, 커밋 금지
+state/
+
+# P0-36 서버 시크릿 디렉터리 — 예시 템플릿만 커밋, 실제 값 파일(vol.env 등)은 금지
+!secrets/
+secrets/*
+!secrets/vol.env.example
+
 # misc
 .DS_Store
