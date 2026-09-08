@@ -16,7 +16,8 @@ import {
 import { usCrossWonVerified } from './live-config';
 import { YEOKMAE_STRATEGY_VALIDATED } from '../src/lib/yeokmae';
 import { YeokmaePositionStore, type YeokmaePosition } from './yeokmae-position-store';
-import { OrderStore } from './order-store';
+import { OrderStore, type OrderBuyEvidence } from './order-store';
+import { evaluateManagedRecovery, mergeBuyEvidence, readEntryAvgOverride, readExchcdOverride } from './yeokmae/position-recover';
 import { programInvestedUSD } from './us-position';
 import { executeBuyOrder, type TraderDeps } from './trader';
 import { executeSellOrder } from './us-seller';
@@ -41,6 +42,9 @@ function loadUSExchcdMap(): Map<string, { exchcd: string; exchange: string }> {
   try { const j = JSON.parse(readFileSync(f, 'utf8')); for (const c of (j.candidates ?? [])) if (c.symbol && c.exchcd) m.set(c.symbol, { exchcd: String(c.exchcd), exchange: c.exchange ?? 'US' }); } catch { /* noop */ }
   return m;
 }
+// order-store 파일 → 매수증거(읽기전용). 없으면 빈 증거.
+function orderEvidence(key: string): OrderBuyEvidence { const s = new OrderStore(key); s.load(); return s.buyEvidence(); }
+
 function scanUSYeokmaePendingBuy(dir = join(YEOKMAE_DAILY_ROOT, '..')): { totalUSD: number; symbols: Set<string> } {
   const symbols = new Set<string>(); let totalUSD = 0;
   if (!existsSync(dir)) return { totalUSD, symbols };
@@ -134,11 +138,30 @@ async function main() {
       for (const x of h.holdings) brokerQtyMap.set(x.symbol, x.balQty);
       log.info(`[YEOKMAE-US-HOLDINGS-DIAG] rsp_cd=${h.rspCd || '-'} rsp_msg=${h.rspMsg || '-'} rows=${h.rawRows} broker보유=${h.holdings.length}종목 원장=${usPositions.length}종목 (정상 → ${usHoldingsOk ? '정상' : 'fail-closed(BUY·SELL 차단)'})`);
       if (!usHoldingsOk) log.warn(`[YEOKMAE-US-HOLDINGS-DIAG] holdings 조회 성공코드 미확인 → 임의 성공처리 금지 · BUY/SELL fail-closed.`);
-      for (const r of reconcileUSLedgerVsHoldings(usPositions.map(p => ({ symbol: p.symbol, qty: p.qty })), h.holdings)) {
-        if (r.status !== 'MATCH') log.warn(`[YEOKMAE-US-RECONCILE] ${r.symbol} ledgerQty=${r.ledgerQty} brokerQty=${r.brokerQty} sellable=${r.brokerSellable} status=${r.status} — 자동삭제 금지, MATCH 아니면 자동 exit 보류.`);
+      // ── P0-37: 과거 Vol BUY 증거 + broker 보유 일치 시 managed-position 복원(수동보유 오인 해소). ──
+      //   US 는 COSOQ00201 이 공식평단 미제공 → 평단은 env override(YEOKMAE_US_ENTRY_AVG_<sym>) 또는 order-store 주문가.
+      //   exchcd 는 candidates 캐시(exchOf) > env override(YEOKMAE_US_EXCHCD_<sym>). 미해결이면 fail-closed(수동 유지).
+      if (usHoldingsOk) {
+        for (const x of h.holdings) {
+          if (heldSymbols.has(x.symbol)) continue;
+          const ev = mergeBuyEvidence([orderEvidence(x.symbol), orderEvidence(`YEOKMAE_US_${x.symbol}`)], x.symbol);
+          const exchcd = exchOf.get(x.symbol)?.exchcd || readExchcdOverride(env, x.symbol);
+          const dec = evaluateManagedRecovery({ symbol: x.symbol, market: 'US', brokerQty: x.balQty, brokerAvgPrice: null, evidence: ev, exchcd, entryAvgOverride: readEntryAvgOverride(env, 'US', x.symbol) });
+          if (dec.action === 'RECOVER') {
+            posStore.applyYeokmaeBuyFill({ symbol: x.symbol, exchcd: dec.exchcd, entryDate: dec.entryDate ?? new Date().toISOString().slice(0, 10), fillQty: dec.qty, fillPrice: dec.entryAvgPrice, confirmedSignalDate: dec.entryDate, matchedSignals: [] });
+            posStore.flush(); heldSymbols.add(x.symbol);
+            log.info(`[YEOKMAE-US-RECONCILE] symbol=${x.symbol} status=MATCH managed=true qty=${dec.qty} exchcd=${dec.exchcd} entryAvg=${dec.entryAvgPrice}(${dec.avgSource}) → 복원(${dec.reason})`);
+          } else if (dec.action === 'FAILCLOSED') {
+            if (!loggedManual.has(x.symbol)) { loggedManual.add(x.symbol); log.warn(`[YEOKMAE-US-RECOVER-FAILCLOSED] symbol=${x.symbol} balQty=${x.balQty} → 복원 보류(수동보유 유지). ${dec.reason}`); }
+          }
+        }
+      }
+      const heldNow = new Set(posStore.all().filter(p => p.exchcd !== 'KR' && p.qty > 0).map(p => p.symbol));
+      for (const r of reconcileUSLedgerVsHoldings([...heldNow].map(s => ({ symbol: s, qty: brokerQtyMap.get(s) ?? 0 })), h.holdings)) {
+        if (r.status !== 'MATCH') log.warn(`[YEOKMAE-US-RECONCILE] ${r.symbol} ledgerQty=${posStore.get(r.symbol)?.qty ?? 0} brokerQty=${r.brokerQty} sellable=${r.brokerSellable} status=${r.status} — 자동삭제 금지, MATCH 아니면 자동 exit 보류.`);
       }
       for (const x of h.holdings) {
-        if (!heldSymbols.has(x.symbol) && !loggedManual.has(x.symbol)) { loggedManual.add(x.symbol); log.warn(`[YEOKMAE-US-MANUAL-HOLDING] symbol=${x.symbol} balQty=${x.balQty} sellable=${x.sellableQty} → 프로그램 원장 외(수동/기존 보유). 자동 SELL 절대 금지 · BUY 후보 제외(commingling 방지).`); }
+        if (!heldNow.has(x.symbol) && !loggedManual.has(x.symbol)) { loggedManual.add(x.symbol); log.warn(`[YEOKMAE-US-MANUAL-HOLDING] symbol=${x.symbol} balQty=${x.balQty} sellable=${x.sellableQty} → 프로그램 원장 외(수동/기존 보유·증거없음). 자동 SELL 절대 금지 · BUY 후보 제외(commingling 방지).`); }
       }
     } catch (e) { usHoldingsOk = false; log.error(`[YEOKMAE-US-HOLDINGS-DIAG] COSOQ00201 조회 예외 → BUY/SELL fail-closed. ${scrub(String(e))}`); }
   }

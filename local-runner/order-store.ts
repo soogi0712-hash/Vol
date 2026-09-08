@@ -124,9 +124,42 @@ export class OrderStore {
   saveTracked(map: Map<string, TrackedOrder>): void { this.body.tracked = [...map.values()]; }
   get tracked(): TrackedOrder[] { return [...this.body.tracked]; }
 
+  /**
+   * P0-37: 과거 Vol BUY 증거 추출(복원용, 읽기전용) — 확정봉 lock / 매수 pending / 수락응답(TR+코드+OrdNo).
+   *   ⚠️ 메시지 문자열 아님 — 주문 TR(CSPAT00601/COSAT00301) + 성공코드(00000/00040) 또는 OrdNo 존재로만 수락 판정.
+   */
+  buyEvidence(): OrderBuyEvidence {
+    const orderedBuyCandles = this.body.orderedCandles.filter(k => k.endsWith('|buy'));
+    const buyPendings = this.body.pending.filter(p => p.side === 'buy');
+    const OK = new Set(['00000', '00040']);
+    const ORDER_TRS = new Set(['CSPAT00601', 'COSAT00301']);
+    const acceptedBuyResponses = this.body.responses.filter(r => ORDER_TRS.has(r.tr) && (OK.has(r.rspCd) || (r.ordNo != null && r.ordNo !== '' && r.ordNo !== '(unknown)')));
+    const confirmedBuyQty = buyPendings.length ? buyPendings.reduce((s, p) => s + (Number(p.qty) || 0), 0) : null;
+    const orderPrice = buyPendings.length && buyPendings[0].price > 0 ? buyPendings[0].price : null;
+    // 확정봉 키에서 날짜 부분(<sym>|<date>|buy) 추출 — 진입일 기록용(정확 holdDays).
+    const candleDates = orderedBuyCandles.map(k => k.split('|')[1]).filter(Boolean);
+    return {
+      symbol: this.symbol, orderedBuyCandles, buyPendings, acceptedBuyResponses,
+      hasAnyBuyEvidence: orderedBuyCandles.length > 0 || buyPendings.length > 0 || acceptedBuyResponses.length > 0,
+      confirmedBuyQty, orderPrice, candleDates,
+    };
+  }
+
   flush(): void {
     if (this.corrupt) return;
     writeFileSync(this.tmp, JSON.stringify(this.body), 'utf8');
     renameSync(this.tmp, this.file);
   }
+}
+
+// P0-37 복원 증거 요약.
+export interface OrderBuyEvidence {
+  symbol: string;
+  orderedBuyCandles: string[];
+  buyPendings: PendingOrder[];
+  acceptedBuyResponses: RespAudit[];
+  hasAnyBuyEvidence: boolean;
+  confirmedBuyQty: number | null;   // 매수 pending 수량 합(문서화된 제출수량). 없으면 null.
+  orderPrice: number | null;        // 매수 pending 지정가(문서화된 제출가). 없으면 null.
+  candleDates: string[];            // 매수 확정봉 날짜들(진입일 근사).
 }

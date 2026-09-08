@@ -10,7 +10,8 @@ import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { getLSKRPrice, getLSKRBalance, getLSKRHoldings, placeLSKRBuyOrder, placeLSKRSellOrder, cancelLSKRBuyOrder, queryLSKROrderExecUnified, resolveKRMbrNo, krSession } from '../src/lib/ls-api';
 import { YEOKMAE_STRATEGY_VALIDATED } from '../src/lib/yeokmae';
 import { YeokmaePositionStore } from './yeokmae-position-store';
-import { OrderStore } from './order-store';
+import { OrderStore, type OrderBuyEvidence } from './order-store';
+import { evaluateManagedRecovery, mergeBuyEvidence, readEntryAvgOverride } from './yeokmae/position-recover';
 import { executeKRBuyOrder, type KRTraderDeps } from './kr-trader';
 import { DailyCache, YEOKMAE_DAILY_ROOT } from './yeokmae-daily-cache';
 import { scanCachedDiscovery, confirmedCandles, loadNameMap } from './yeokmae/discovery-scan';
@@ -22,6 +23,9 @@ import { TradeJournal, computeDailyReport, formatDailyReport } from './yeokmae-t
 import { writeHeartbeat } from './heartbeat';
 import { buildYeokmaeSnapshot } from '../src/lib/yeokmae';
 import { join } from 'node:path';
+
+// order-store 파일 → 매수증거(읽기전용). 없으면 빈 증거.
+function orderEvidence(key: string): OrderBuyEvidence { const s = new OrderStore(key); s.load(); return s.buyEvidence(); }
 
 function scanKRPendingBuy(dir = join(YEOKMAE_DAILY_ROOT, '..')): { totalKRW: number; symbols: Set<string> } {
   const symbols = new Set<string>(); let totalKRW = 0;
@@ -96,11 +100,27 @@ async function main() {
       for (const x of h.holdings) { brokerQtyMap.set(x.symbol, x.balQty); sellableBySym.set(x.symbol, x.sellableQty); }
       log.info(`[YEOKMAE-KR-HOLDINGS-DIAG] rsp_cd=${h.rspCd || '-'} rsp_msg=${h.rspMsg || '-'} rows=${h.rawRows} broker보유=${h.holdings.length}종목 원장=${krPositions.length}종목 (성공코드 00000 → ${t0424ok ? '정상' : 'fail-closed(BUY·SELL 차단)'})`);
       if (!t0424ok) log.warn(`[YEOKMAE-KR-HOLDINGS-DIAG] rsp_cd≠00000 → 임의 성공처리 금지 · BUY/SELL fail-closed.`);
-      for (const r of reconcileKRLedgerVsHoldings(krPositions, h.holdings)) {
-        if (r.status !== 'MATCH') log.warn(`[YEOKMAE-KR-RECONCILE] ${r.symbol} ledgerQty=${r.ledgerQty} brokerQty=${r.brokerQty} sellable=${r.brokerSellable} status=${r.status} — 자동삭제 금지, MATCH 아니면 자동 exit 보류.`);
+      // ── P0-37: 과거 Vol BUY 증거 + broker 보유 일치 시 managed-position 복원(수동보유 오인 해소). ──
+      if (t0424ok) {
+        for (const x of h.holdings) {
+          if (heldSymbols.has(x.symbol)) continue;   // 이미 원장 관리중
+          const ev = mergeBuyEvidence([orderEvidence(`YEOKMAE_KR_${x.symbol}`), orderEvidence(`KR_${x.symbol}`)], x.symbol);
+          const dec = evaluateManagedRecovery({ symbol: x.symbol, market: 'KR', brokerQty: x.balQty, brokerAvgPrice: x.avgPrice, evidence: ev, exchcd: 'KR', entryAvgOverride: readEntryAvgOverride(env, 'KR', x.symbol) });
+          if (dec.action === 'RECOVER') {
+            posStore.applyYeokmaeBuyFill({ symbol: x.symbol, exchcd: 'KR', entryDate: dec.entryDate ?? new Date().toISOString().slice(0, 10), fillQty: dec.qty, fillPrice: dec.entryAvgPrice, confirmedSignalDate: dec.entryDate, matchedSignals: [] });
+            posStore.flush(); heldSymbols.add(x.symbol);
+            log.info(`[YEOKMAE-KR-RECONCILE] symbol=${x.symbol} status=MATCH managed=true qty=${dec.qty} entryAvg=${dec.entryAvgPrice}(${dec.avgSource}) → 복원(${dec.reason})`);
+          } else if (dec.action === 'FAILCLOSED') {
+            if (!loggedManual.has(x.symbol)) { loggedManual.add(x.symbol); log.warn(`[YEOKMAE-KR-RECOVER-FAILCLOSED] symbol=${x.symbol} balQty=${x.balQty} → 복원 보류(수동보유 유지). ${dec.reason}`); }
+          }
+        }
+      }
+      const heldNow = new Set(posStore.all().filter(p => p.exchcd === 'KR' && p.qty > 0).map(p => p.symbol));
+      for (const r of reconcileKRLedgerVsHoldings([...heldNow].map(s => ({ symbol: s, qty: brokerQtyMap.get(s) ?? 0 })), h.holdings)) {
+        if (r.status !== 'MATCH') log.warn(`[YEOKMAE-KR-RECONCILE] ${r.symbol} ledgerQty=${posStore.get(r.symbol)?.qty ?? 0} brokerQty=${r.brokerQty} sellable=${r.brokerSellable} status=${r.status} — 자동삭제 금지, MATCH 아니면 자동 exit 보류.`);
       }
       for (const x of h.holdings) {
-        if (!heldSymbols.has(x.symbol) && !loggedManual.has(x.symbol)) { loggedManual.add(x.symbol); log.warn(`[YEOKMAE-KR-MANUAL-HOLDING] symbol=${x.symbol} balQty=${x.balQty} sellable=${x.sellableQty} → 프로그램 원장 외(수동/기존 보유). 자동 SELL 절대 금지 · BUY 후보 제외(commingling 방지).`); }
+        if (!heldNow.has(x.symbol) && !loggedManual.has(x.symbol)) { loggedManual.add(x.symbol); log.warn(`[YEOKMAE-KR-MANUAL-HOLDING] symbol=${x.symbol} balQty=${x.balQty} sellable=${x.sellableQty} → 프로그램 원장 외(수동/기존 보유·증거없음). 자동 SELL 절대 금지 · BUY 후보 제외(commingling 방지).`); }
       }
     } catch (e) { t0424ok = false; log.error(`[YEOKMAE-KR-HOLDINGS-DIAG] t0424 조회 예외 → BUY/SELL fail-closed. ${scrub(String(e))}`); }
   }
