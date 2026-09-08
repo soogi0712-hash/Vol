@@ -1,7 +1,7 @@
 // P0-34 — US 실전 코어: 실주문 게이트 / KRW→USD 자본가드(실 baseXchRate) / UPGRADE 후보랭킹 / exit resolver / 수동보유 보호.
 import { describe, it, expect } from 'vitest';
 import {
-  usRealOrderEnabled, resolveUSExitPolicy, selectUSBuyCandidates, computeUSYeokmaeCapitalGuard,
+  usRealOrderEnabled, usSellEnabled, resolveUSExitPolicy, selectUSBuyCandidates, computeUSYeokmaeCapitalGuard,
   US_BUY_PATH_READY, US_SELL_PATH_READY,
 } from '../local-runner/yeokmae/us-live-core';
 import type { SymbolDiscovery } from '../local-runner/yeokmae/discovery';
@@ -41,6 +41,22 @@ describe('P0-34 usRealOrderEnabled — US 실주문 최종 게이트(KR 과 별�
   });
   it('history 미준비면 다른 조건 다 충족해도 게이트 닫힘(g3204 rows>0 전 실주문 금지)', () => {
     expect(usRealOrderEnabled({ ...on, historyReady: false }).enabled).toBe(false);
+  });
+});
+
+describe('P0-38 usSellEnabled — SELL 게이트는 historyReady 무관(청산 항상 감시)', () => {
+  const on = { liveTrading: true, yeokmaeLive: true, usLive: true, exitConfirmed: true };
+  it('history 없어도(=BUY 불가) SELL 게이트는 열림', () => {
+    // BUY 게이트는 historyReady=false 면 닫힘
+    expect(usRealOrderEnabled({ ...on, historyReady: false }).enabled).toBe(false);
+    // SELL 게이트는 historyReady 파라미터 자체가 없음 → 나머지 충족 시 열림
+    expect(usSellEnabled(on).enabled).toBe(true);
+    expect(usSellEnabled(on).reasons).toHaveLength(0);
+  });
+  it('각 스위치 off → SELL 게이트 차단', () => {
+    expect(usSellEnabled({ ...on, liveTrading: false }).reasons).toContain('LS_LIVE_TRADING_off');
+    expect(usSellEnabled({ ...on, usLive: false }).reasons).toContain('YEOKMAE_US_LIVE_TRADING_off');
+    expect(usSellEnabled({ ...on, exitConfirmed: false }).reasons).toContain('YEOKMAE_US_EXIT_CONFIRMED_off');
   });
 });
 

@@ -25,7 +25,7 @@ import { fetchUSDaily } from './yeokmae/us-daily';
 import { DailyCache, YEOKMAE_DAILY_ROOT } from './yeokmae-daily-cache';
 import { scanCachedDiscovery, confirmedCandles, loadNameMap } from './yeokmae/discovery-scan';
 import {
-  usRealOrderEnabled, resolveUSExitPolicy, selectUSBuyCandidates, computeUSYeokmaeCapitalGuard,
+  usRealOrderEnabled, usSellEnabled, resolveUSExitPolicy, selectUSBuyCandidates, computeUSYeokmaeCapitalGuard,
   reconcileUSLedgerVsHoldings, type USBuyCandidate,
 } from './yeokmae/us-live-core';
 import { resolveUSLoopIntervals, isDue, runUSSellCycle, type USQuote } from './yeokmae/us-loop-core';
@@ -76,12 +76,15 @@ async function main() {
   const totalCapitalKRW = Number(env.LS_US_TOTAL_CAPITAL_KRW || 1_000_000) || 1_000_000;
   const perTradeKRW = Number(env.US_PER_TRADE_KRW || 100_000) || 100_000;
   const exit = resolveUSExitPolicy(env);
-  const delaygb = resolveUSQuote().delaygb ?? 'R';
+  const usQuote = resolveUSQuote();
+  const delaygb = usQuote.delaygb ?? 'R';   // ⚠️ DELAYED 인데 LS_US_DELAYGB 미설정이면 'R'(실시간) fallback → 미권한 계정은 0 rows
   const crossWon = usCrossWonVerified();
   const intervals = resolveUSLoopIntervals(env);
 
   log.info(`===== [YEOKMAE-US-LIVE] US 역매공파 실전 자동매매 (지속실행 daemon${dryRunFlag ? ' · --dry-run POST=0' : ''}${onceFlag ? ' · --once' : ''}) =====`);
   log.info(`[YEOKMAE-US-VALIDATION] YEOKMAE_STRATEGY_VALIDATED=${YEOKMAE_STRATEGY_VALIDATED}(레거시 하드블록, US경로 미사용) · LS_LIVE_TRADING=${liveTrading} YEOKMAE_LIVE_TRADING=${yeokmaeLive} YEOKMAE_US_LIVE_TRADING=${usLive} legacyBbBlocked=${legacyBbBlocked} crossWonVerified=${crossWon}`);
+  // P0-38: 해외시세 구분 진단 — g3204/g3101 이 rsp_cd=00000 인데 rows=0 이면 delaygb/시세권한 의심(TR/InBlock 은 공식 확인됨).
+  log.info(`[YEOKMAE-US-QUOTE] mode=${usQuote.mode} delaygb=${delaygb}${usQuote.delaygb == null ? "(fallback 'R' — LS_US_DELAYGB 미설정)" : ''}${usQuote.error ? ` ⚠️ ${usQuote.error}` : ''} · REALTIME='R'(공식), DELAYED 지연코드는 LS_US_DELAYGB 로 지정(추측 금지). g3204 rows=0 + rsp_cd=00000 → 지연코드/시세신청 확인.`);
   log.info(`[YEOKMAE-US-CAPITAL] totalCapitalKRW=${totalCapitalKRW}(KR 과 별개) perTradeKRW=${perTradeKRW} → 실 baseXchRate 로 USD 환산(고정환율 금지). 신용/미수 금지(cash-only).`);
   log.info(`[YEOKMAE-US-BUY-SOURCE] source=YEOKMAE(112_UPGRADE OR 224_UPGRADE only, CONFIRMED 일봉만) · ORIGINAL/LONG_TERM=관찰만 · BB(20,2)+RSI BUY=완전 비활성(legacyBbBlocked=${legacyBbBlocked})`);
   log.info(`[YEOKMAE-US-EXIT-POLICY] stopLoss=${exit.stopLossPct ?? '미결정'} takeProfit=${exit.takeProfitPct ?? '미결정'} maxHoldDays=${exit.maxHoldDays ?? '미결정'} emergencyStop=-${exit.emergencyStopPct}%(항상활성) confirmed=${exit.confirmed} · ⚠️ 운영 risk policy(원본 역매공파 SELL 아님)`);
@@ -152,7 +155,8 @@ async function main() {
           if (heldSymbols.has(x.symbol)) continue;
           const ev = mergeBuyEvidence([orderEvidence(x.symbol), orderEvidence(`YEOKMAE_US_${x.symbol}`)], x.symbol);
           const fill: AccountFill | null = accountFills.get(x.symbol) ?? null;
-          const exchcd = exchOf.get(x.symbol)?.exchcd || readExchcdOverride(env, x.symbol);
+          // exchcd 공식 우선순위: 계좌이벤트 AS0 거래소코드(주문 OrdMktCode) > g3190 마스터맵 > env override.
+          const exchcd = (fill?.mktCode || '') || exchOf.get(x.symbol)?.exchcd || readExchcdOverride(env, x.symbol);
           const dec = evaluateManagedRecovery({ symbol: x.symbol, market: 'US', brokerQty: x.balQty, brokerAvgPrice: null, evidence: ev, accountFill: fill, exchcd, entryAvgOverride: readEntryAvgOverride(env, 'US', x.symbol) });
           if (dec.action === 'RECOVER') {
             posStore.applyYeokmaeBuyFill({ symbol: x.symbol, exchcd: dec.exchcd, entryDate: dec.entryDate ?? new Date().toISOString().slice(0, 10), fillQty: dec.qty, fillPrice: dec.entryAvgPrice, confirmedSignalDate: dec.entryDate, matchedSignals: [] });
@@ -268,10 +272,12 @@ async function main() {
   // ── STARTUP 초기 복원: reconcile(holdings) + 초기 BUY 후보 계산 + 게이트 로그. ──
   await doReconcile();
   const initialGate = usRealOrderEnabled({ liveTrading, yeokmaeLive, usLive, exitConfirmed: exit.confirmed, historyReady });
-  log.info(`[YEOKMAE-US-REAL-ORDER-GATE] US_YEOKMAE_REAL_ORDER_ENABLED=${initialGate.enabled} buyPathReady=${initialGate.buyPathReady} sellPathReady=${initialGate.sellPathReady} historyReady=${initialGate.historyReady} reasons=[${initialGate.reasons.join(',') || '없음(전부충족)'}] dryRun=${dryRunFlag}`);
+  const initialSell = usSellEnabled({ liveTrading, yeokmaeLive, usLive, exitConfirmed: exit.confirmed });
+  log.info(`[YEOKMAE-US-REAL-ORDER-GATE] BUY_ENABLED=${initialGate.enabled}(historyReady=${historyReady} reasons=[${initialGate.reasons.join(',') || '없음'}]) · SELL_ENABLED=${initialSell.enabled}(history 무관 reasons=[${initialSell.reasons.join(',') || '없음'}]) dryRun=${dryRunFlag}`);
   {
-    const startPost = initialGate.enabled && usHoldingsOk && !dryRunFlag;
-    log.info(`[YEOKMAE-US-LIVE-CFG] realOrderEnabled=${startPost} totalCapital=${totalCapitalKRW} perTrade=${perTradeKRW} stopLoss=${exit.stopLossPct == null ? '미설정' : '-' + exit.stopLossPct} takeProfit=${exit.takeProfitPct == null ? '미설정' : '+' + exit.takeProfitPct} maxHold=${exit.maxHoldDays ?? '미설정'} emergency=-${exit.emergencyStopPct} (gate=${initialGate.enabled} holdingsOk=${usHoldingsOk} historyReady=${historyReady} dryRun=${dryRunFlag})`);
+    const buyPost = initialGate.enabled && usHoldingsOk && !dryRunFlag;
+    const sellPost = initialSell.enabled && usHoldingsOk && !dryRunFlag;
+    log.info(`[YEOKMAE-US-LIVE-CFG] buyEnabled=${buyPost} sellEnabled=${sellPost} totalCapital=${totalCapitalKRW} perTrade=${perTradeKRW} stopLoss=${exit.stopLossPct == null ? '미설정' : '-' + exit.stopLossPct} takeProfit=${exit.takeProfitPct == null ? '미설정' : '+' + exit.takeProfitPct} maxHold=${exit.maxHoldDays ?? '미설정'} emergency=-${exit.emergencyStopPct} (holdingsOk=${usHoldingsOk} historyReady=${historyReady} dryRun=${dryRunFlag}) · ⚠️ SELL 은 historyReady 무관(청산 항상 감시)`);
   }
 
   // ── 메인 루프(Ctrl+C 까지) ──
@@ -284,17 +290,20 @@ async function main() {
     const sessionOrderable = et.session === 'REGULAR';
 
     if (isDue(lastReconcileAt, intervals.reconcileMs, now)) { await doReconcile(); lastReconcileAt = now; }
-    const gate = usRealOrderEnabled({ liveTrading, yeokmaeLive, usLive, exitConfirmed: exit.confirmed, historyReady });
-    const postEnabled = gate.enabled && usHoldingsOk && !dryRunFlag;
+    // BUY 게이트(일봉 history 필요) 와 SELL 게이트(history 무관 — 청산은 현재가+원장) 분리(P0-38).
+    const buyGate = usRealOrderEnabled({ liveTrading, yeokmaeLive, usLive, exitConfirmed: exit.confirmed, historyReady });
+    const sellGate = usSellEnabled({ liveTrading, yeokmaeLive, usLive, exitConfirmed: exit.confirmed });
+    const buyPostEnabled = buyGate.enabled && usHoldingsOk && !dryRunFlag;
+    const sellPostEnabled = sellGate.enabled && usHoldingsOk && !dryRunFlag;
 
     const verboseThisCycle = isDue(lastLogAt, intervals.loopLogMs, now) || cycle === 1;   // CHECK 상세는 throttle
-    if (isDue(lastBuyAt, intervals.buyRecalcMs, now) || cycle === 1) { await doBuyCycle(postEnabled, sessionOrderable); lastBuyAt = now; }
-    const sell = await doSellCycle(postEnabled, sessionOrderable, verboseThisCycle);
+    if (isDue(lastBuyAt, intervals.buyRecalcMs, now) || cycle === 1) { await doBuyCycle(buyPostEnabled, sessionOrderable); lastBuyAt = now; }
+    const sell = await doSellCycle(sellPostEnabled, sessionOrderable, verboseThisCycle);
 
     // [YEOKMAE-US-LOOP] 은 매 cycle 출력(살아있음 확인) — 상세 CHECK 로그만 throttle.
     const managedNow = posStore.all().filter(p => p.exchcd !== 'KR' && p.qty > 0).length;
-    writeHeartbeat('US', { cycle, session: et.session, postEnabled, managed: managedNow });   // Docker healthcheck
-    log.info(`[YEOKMAE-US-LOOP] cycle=${cycle} session=${et.session} postEnabled=${postEnabled} managed=${managedNow} candidates=${candidates.length} evaluated=${sell.evaluated} sellsThisCycle=${sell.sells}`);
+    writeHeartbeat('US', { cycle, session: et.session, buyPostEnabled, sellPostEnabled, managed: managedNow });   // Docker healthcheck
+    log.info(`[YEOKMAE-US-LOOP] cycle=${cycle} session=${et.session} buyPostEnabled=${buyPostEnabled} sellPostEnabled=${sellPostEnabled} historyReady=${historyReady} managed=${managedNow} candidates=${candidates.length} evaluated=${sell.evaluated} sellsThisCycle=${sell.sells}`);
     if (verboseThisCycle) lastLogAt = now;
 
     if (stopping || onceFlag) break;

@@ -54,6 +54,7 @@ export interface TrackedOrder {
   status: OrderStatus;
   ordQty: number; ordPrc: number;
   cumExecQty: number; avgExecPrc: number; unfilledQty: number;
+  mktCode?: string;               // P0-38: AS0 sOrdMktCode(=주문 OrdMktCode=exchcd) — 향후 복원 exchcd 공식소스
   rejectReason: string;
   restCancelOk: boolean;          // REST 취소 성공 여부(AS3 와 별개) — LIVE 취소완료 판정용
   seenExecIds: string[];          // sExecNO/sAbrdExecId 중복 무시
@@ -107,6 +108,7 @@ export function applyOrderEvent(map: Map<string, TrackedOrder>, ev: OrderEvent, 
   switch (ev.kind) {
     case 'AS0':
       next.orgOrdNo = ev.orgOrdNo || next.orgOrdNo; next.symbol = ev.symbol || next.symbol;
+      next.mktCode = ev.mktCode || next.mktCode;   // P0-38: 주문 거래소코드(exchcd) 보존
       next.ordQty = ev.ordQty || next.ordQty; next.ordPrc = ev.ordPrc || next.ordPrc; next.unfilledQty = ev.unfilledQty;
       if (ev.rejectReason) next.rejectReason = ev.rejectReason;
       break;

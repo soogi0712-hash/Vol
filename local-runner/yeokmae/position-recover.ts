@@ -11,7 +11,7 @@ export interface RecoverDecision {
   exchcd: string; entryDate: string | null; reason: string;
 }
 // P0-37A: 계좌이벤트(AS0 ACCEPTED + AS1 FILLED) 실체결 증거 — 실제 체결평단/체결수량(최우선 진실).
-export interface AccountFill { symbol: string; execQty: number; avgExecPrc: number; ordQty: number; ordNo: string; }
+export interface AccountFill { symbol: string; execQty: number; avgExecPrc: number; ordQty: number; ordNo: string; mktCode: string; }
 export interface RecoverInput {
   symbol: string; market: 'KR' | 'US';
   brokerQty: number;                 // t0424(KR)/COSOQ00201(US) 실보유수량
@@ -34,25 +34,26 @@ export function normOrdNo(s: string): string {
 //   ⚠️ AS0(symbol 보유, exec 0) + AS1(symbol 빈칸, exec 보유)이 ordNo padding 으로 분리 저장될 수 있음 → normOrdNo 로 병합.
 //   AS1 symbol 이 비면 같은 ordNo 그룹의 AS0 symbol 로 연결. 여러 주문이면 종목별 합산 + 체결가중 평단.
 export function extractAccountFills(tracked: readonly TrackedOrder[]): Map<string, AccountFill> {
-  const byOrd = new Map<string, { symbol: string; execQty: number; avgExecPrc: number; ordQty: number; ordNo: string }>();
+  const byOrd = new Map<string, { symbol: string; execQty: number; avgExecPrc: number; ordQty: number; ordNo: string; mktCode: string }>();
   for (const t of tracked) {
     const key = normOrdNo(t.ordNo || t.orgOrdNo);
     if (!key) continue;
-    const cur = byOrd.get(key) ?? { symbol: '', execQty: 0, avgExecPrc: 0, ordQty: 0, ordNo: key };
+    const cur = byOrd.get(key) ?? { symbol: '', execQty: 0, avgExecPrc: 0, ordQty: 0, ordNo: key, mktCode: '' };
     if (t.symbol) cur.symbol = t.symbol;                                // AS0 symbol
+    if (t.mktCode) cur.mktCode = t.mktCode;                             // AS0 거래소코드(exchcd, 있으면)
     if (t.ordQty > 0) cur.ordQty = Math.max(cur.ordQty, t.ordQty);      // AS0 주문수량
     if (t.cumExecQty > 0) cur.execQty = Math.max(cur.execQty, t.cumExecQty);   // AS1 누적체결
     if (t.avgExecPrc > 0) cur.avgExecPrc = t.avgExecPrc;               // AS1 체결평단
     byOrd.set(key, cur);
   }
-  const bySym = new Map<string, { symbol: string; execQty: number; wsum: number; ordQty: number; ordNo: string }>();
+  const bySym = new Map<string, { symbol: string; execQty: number; wsum: number; ordQty: number; ordNo: string; mktCode: string }>();
   for (const o of byOrd.values()) {
     if (!o.symbol || !(o.execQty > 0) || !(o.avgExecPrc > 0)) continue;   // 실체결(수량>0·평단>0)만
-    const a = bySym.get(o.symbol) ?? { symbol: o.symbol, execQty: 0, wsum: 0, ordQty: 0, ordNo: o.ordNo };
-    a.execQty += o.execQty; a.wsum += o.execQty * o.avgExecPrc; a.ordQty += o.ordQty; bySym.set(o.symbol, a);
+    const a = bySym.get(o.symbol) ?? { symbol: o.symbol, execQty: 0, wsum: 0, ordQty: 0, ordNo: o.ordNo, mktCode: '' };
+    a.execQty += o.execQty; a.wsum += o.execQty * o.avgExecPrc; a.ordQty += o.ordQty; if (o.mktCode) a.mktCode = o.mktCode; bySym.set(o.symbol, a);
   }
   const out = new Map<string, AccountFill>();
-  for (const a of bySym.values()) out.set(a.symbol, { symbol: a.symbol, execQty: a.execQty, avgExecPrc: a.wsum / a.execQty, ordQty: a.ordQty, ordNo: a.ordNo });
+  for (const a of bySym.values()) out.set(a.symbol, { symbol: a.symbol, execQty: a.execQty, avgExecPrc: a.wsum / a.execQty, ordQty: a.ordQty, ordNo: a.ordNo, mktCode: a.mktCode });
   return out;
 }
 

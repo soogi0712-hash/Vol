@@ -33,6 +33,21 @@ export function usRealOrderEnabled(p: USRealOrderInput): USRealOrderResult {
   return { enabled: reasons.length === 0, reasons, buyPathReady: US_BUY_PATH_READY, sellPathReady: US_SELL_PATH_READY, historyReady: p.historyReady };
 }
 
+// ── P0-38: US SELL/exit 게이트 — BUY 와 분리. 위험청산은 g3204 일봉 history(US_DAILY_HISTORY_READY) 와 무관. ──
+//   근거: 청산은 원장 진입평단 + 실시간 현재가(g3101) + broker MATCH 만 필요(일봉 재계산 불필요). BUY 만 CONFIRMED 일봉 필요.
+//   기존 SELL 정책/임계값(‑5/+8/20/‑15)·중복방지·fresh sellable 무변경 — 게이트 전제조건만 분리(BUY 데이터 가용성에 SELL 이 볼모잡히지 않게).
+export interface USSellGateInput { liveTrading: boolean; yeokmaeLive: boolean; usLive: boolean; exitConfirmed: boolean; }
+export interface USSellGateResult { enabled: boolean; reasons: string[]; sellPathReady: boolean; }
+export function usSellEnabled(p: USSellGateInput): USSellGateResult {
+  const reasons: string[] = [];
+  if (!p.liveTrading) reasons.push('LS_LIVE_TRADING_off');
+  if (!p.yeokmaeLive) reasons.push('YEOKMAE_LIVE_TRADING_off');
+  if (!p.usLive) reasons.push('YEOKMAE_US_LIVE_TRADING_off');
+  if (!p.exitConfirmed) reasons.push('YEOKMAE_US_EXIT_CONFIRMED_off');
+  if (!US_SELL_PATH_READY) reasons.push('US_SELL_PATH_NOT_READY');
+  return { enabled: reasons.length === 0, reasons, sellPathReady: US_SELL_PATH_READY };
+}
+
 // ── US 청산정책 resolver — 운영 risk policy(원본 역매공파 SELL 아님). YEOKMAE_US_* env. 값만 US 독립, 로직은 KR 과 동일. ──
 //   emergencyStop 은 항상 활성(하드 플로어, 기본 -15%). confirmed=YEOKMAE_US_EXIT_CONFIRMED.
 const numEnv = (v: string | undefined): number | null => { if (v == null || v.trim() === '') return null; const n = Number(v); return Number.isFinite(n) ? n : null; };

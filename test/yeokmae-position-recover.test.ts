@@ -91,7 +91,7 @@ describe('P0-37 evaluateManagedRecovery — 안전규칙', () => {
 const track = (o: Partial<TrackedOrder> & { ordNo: string }): TrackedOrder => ({
   ordNo: o.ordNo, orgOrdNo: o.orgOrdNo ?? '', symbol: o.symbol ?? '', status: o.status ?? 'ACCEPTED',
   ordQty: o.ordQty ?? 0, ordPrc: o.ordPrc ?? 0, cumExecQty: o.cumExecQty ?? 0, avgExecPrc: o.avgExecPrc ?? 0,
-  unfilledQty: o.unfilledQty ?? 0, rejectReason: '', restCancelOk: false, seenExecIds: [], seenCancelKeys: [], updatedAtMs: 0,
+  unfilledQty: o.unfilledQty ?? 0, mktCode: o.mktCode ?? '', rejectReason: '', restCancelOk: false, seenExecIds: [], seenCancelKeys: [], updatedAtMs: 0,
 });
 
 describe('P0-37A extractAccountFills — AS0(symbol)+AS1(exec) 병합, ordNo padding 정규화', () => {
@@ -117,10 +117,17 @@ describe('P0-37A extractAccountFills — AS0(symbol)+AS1(exec) 병합, ordNo pad
   it('체결없음(AS0만, exec 0) → 제외', () => {
     expect(extractAccountFills([track({ ordNo: '400', symbol: 'X', status: 'ACCEPTED', ordQty: 5 })]).size).toBe(0);
   });
+  it('mktCode(AS0 거래소코드) 보존 — 향후 exchcd 공식소스', () => {
+    const fills = extractAccountFills([
+      track({ ordNo: '0000000378', symbol: 'AIOT', status: 'ACCEPTED', ordQty: 20, mktCode: '82' }),
+      track({ ordNo: '378', symbol: '', status: 'FILLED', cumExecQty: 20, avgExecPrc: 2.915 }),
+    ]);
+    expect(fills.get('AIOT')!.mktCode).toBe('82');
+  });
 });
 
 describe('P0-37A evaluateManagedRecovery — 계좌이벤트 실체결 최우선', () => {
-  const fill = (execQty: number, avgExecPrc: number) => ({ symbol: 'AIOT', execQty, avgExecPrc, ordQty: execQty, ordNo: '378' });
+  const fill = (execQty: number, avgExecPrc: number, mktCode = '') => ({ symbol: 'AIOT', execQty, avgExecPrc, ordQty: execQty, ordNo: '378', mktCode });
   const ev = mergeBuyEvidence([], 'AIOT');
   it('AIOT exec20@2.915 + broker20 → RECOVER(ACTUAL_FILL avg=2.915)', () => {
     const dec = evaluateManagedRecovery({ symbol: 'AIOT', market: 'US', brokerQty: 20, brokerAvgPrice: null, evidence: ev, accountFill: fill(20, 2.915), exchcd: '82', entryAvgOverride: null });
