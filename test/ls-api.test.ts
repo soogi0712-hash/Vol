@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
   getLSAccessToken, getLSKRBalance, getLSUSBalance,
   getLSKRPrice, getLSUSPrice, getLSKR15Min, getLSUS15Min, getLSUS15MinPaged, getLSUS15MinOlderThan, prevYmd,
+  resolveUSKeysymbol, US_NASDAQ_EXCHCD,
   getLSUSTicks, getLSUSTicksPaged, lsOverseasChartRaw,
   placeLSUSBuyOrder, queryLSUSOrderExec, classifyOrderExec, LS_US_ORDEREXEC_EMPTY_CODES, LS_US_ORDEREXEC_DATA_CODES, getLSUSDeposit, getLSUSHoldings, cancelLSUSOrder, LS_CANCEL_TR_CONFIRMED, isUSOrderSuccess,
   decideUSCashPayment, usCashOnlyUsdCap, usOrderableQty, formatCashOrderableLine,
@@ -199,6 +200,25 @@ describe('거래소코드 매핑 (확인분만)', () => {
   });
 });
 
+describe('P0-39 resolveUSKeysymbol — 공식 keysymbol(추측 금지)', () => {
+  it('NASDAQ(82) AAPL → AAPL.O (공식 예제), 82AAPL 아님', () => {
+    expect(resolveUSKeysymbol('AAPL', US_NASDAQ_EXCHCD)).toBe('AAPL.O');
+    expect(resolveUSKeysymbol('AAPL', '82')).not.toBe('82AAPL');
+    expect(resolveUSKeysymbol('AIOT', '82')).toBe('AIOT.O');
+  });
+  it('g3190 마스터 keysymbol 주입 시 그대로(전 거래소 공식, 최우선)', () => {
+    expect(resolveUSKeysymbol('AMSF', '81', 'AMSF.N')).toBe('AMSF.N');
+    expect(resolveUSKeysymbol('AAPL', '82', 'AAPL.O')).toBe('AAPL.O');
+  });
+  it('NASDAQ 외 거래소(81) + 마스터 keysymbol 없음 → null(추측 금지 fail-closed)', () => {
+    expect(resolveUSKeysymbol('AMSF', '81')).toBeNull();
+    expect(resolveUSKeysymbol('BA', '81', '')).toBeNull();
+  });
+  it('getLSUSPrice/g3204 는 동일 resolver 사용 — keysymbol 미해결(비NASDAQ, 마스터없음)이면 g3101 EMPTY throw', async () => {
+    await expect(getLSUSPrice(cfg, 'T', 'AMSF', '81', 'R')).rejects.toMatchObject({ kind: 'EMPTY' });
+  });
+});
+
 describe('getLSKRPrice / getLSUSPrice', () => {
   it('t1102 현재가 파싱', async () => {
     stubFetch((url, init) => {
@@ -210,11 +230,11 @@ describe('getLSKRPrice / getLSUSPrice', () => {
     const p = await getLSKRPrice(cfg, 'T', '005930');
     expect(p.price).toBe(75000); expect(p.open).toBe(74000); expect(p.volume).toBe(1234567);
   });
-  it('g3101 해외 현재가 파싱 + keysymbol=exchcd+symbol', async () => {
+  it('g3101 해외 현재가 파싱 + 공식 keysymbol(P0-39: NASDAQ TSLA.O, 82TSLA 금지)', async () => {
     stubFetch((url, init) => {
       expect(url).toBe('https://openapi.ls-sec.co.kr:8080/overseas-stock/market-data');
       const b = JSON.parse(init.body).g3101InBlock;
-      expect(b.exchcd).toBe('82'); expect(b.symbol).toBe('TSLA'); expect(b.keysymbol).toBe('82TSLA');
+      expect(b.exchcd).toBe('82'); expect(b.symbol).toBe('TSLA'); expect(b.keysymbol).toBe('TSLA.O'); expect(b.keysymbol).not.toBe('82TSLA');
       return { json: { rsp_cd: '00000', g3101OutBlock: { price: '283.8200', open: '285.09', high: '285.31', low: '281.84', volume: 414175 } } };
     });
     const p = await getLSUSPrice(cfg, 'T', 'TSLA', '82', 'R');
@@ -265,7 +285,7 @@ describe('AAPL 빈 응답 진단 (g3203)', () => {
   it('빈 OutBlock1 시 rsp_cd/msg/OutBlock(연속조회)/개수/요청body 를 노출', async () => {
     stubFetch((url, init) => {
       const b = JSON.parse(init.body).g3203InBlock;
-      expect(b.exchcd).toBe('82'); expect(b.keysymbol).toBe('82AAPL'); expect(b.ncnt).toBe(15);
+      expect(b.exchcd).toBe('82'); expect(b.keysymbol).toBe('AAPL.O'); expect(b.ncnt).toBe(15);   // P0-39 공식 keysymbol
       expect(b.comp_yn).toBe('N'); expect(b.edate).toBe('');
       return { json: {
         rsp_cd: '00000', rsp_msg: '조회완료',

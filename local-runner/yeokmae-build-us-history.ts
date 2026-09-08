@@ -60,9 +60,10 @@ async function main() {
   // P0-37A: 전체 eligible universe 의 공식 symbol→exchcd 맵 저장(g3190 마스터 = 공식 소스).
   //   복원(managed-position)에서 exchcd 를 추측 없이 해결하는 데 사용(AIOT/AMSF 등). candidates 캐시보다 넓은 커버리지.
   const exchcdMap: Record<string, string> = {};
-  for (const r of uni.eligible) if (r.symbol && r.exchcd) exchcdMap[r.symbol] = r.exchcd;
-  saveJsonAtomic(join(YEOKMAE_DAILY_ROOT, 'US.symbol-exchcd.json'), { generatedAt: new Date().toISOString(), count: Object.keys(exchcdMap).length, exchcd: exchcdMap });
-  log.info(`[YEOKMAE-US-EXCHCD-MAP] 공식 symbol→exchcd 저장: ${Object.keys(exchcdMap).length}종목 (g3190 마스터)`);
+  const keysymbolMap: Record<string, string> = {};   // P0-39: g3190 공식 keysymbol(예 AAPL.O) — g3101/g3204 조회에 사용.
+  for (const r of uni.eligible) { if (r.symbol && r.exchcd) exchcdMap[r.symbol] = r.exchcd; if (r.symbol && r.keysymbol) keysymbolMap[r.symbol] = r.keysymbol; }
+  saveJsonAtomic(join(YEOKMAE_DAILY_ROOT, 'US.symbol-exchcd.json'), { generatedAt: new Date().toISOString(), count: Object.keys(exchcdMap).length, exchcd: exchcdMap, keysymbol: keysymbolMap });
+  log.info(`[YEOKMAE-US-EXCHCD-MAP] 공식 symbol→exchcd/keysymbol 저장: ${Object.keys(exchcdMap).length}종목 (g3190 마스터, keysymbol 예: ${uni.eligible.find(r => r.symbol === 'AAPL')?.keysymbol ?? uni.eligible[0]?.keysymbol ?? '-'})`);
 
   // 유동성 우선(marketcap desc) — 순환은 전체(임의 상위 N 영구제한 금지). 테스트용 상한만 env.
   const maxSymbols = Number(process.env.YEOKMAE_BUILD_MAX || 0) || 0;

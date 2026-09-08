@@ -19,6 +19,12 @@ describe('P0-32D US field map — 실측 샘플 정규화', () => {
 
 const calls: any[] = [];
 vi.mock('../src/lib/ls-api', () => ({
+  US_NASDAQ_EXCHCD: '82',
+  resolveUSKeysymbol: (symbol: string, exchcd: string, masterKeysymbol?: string | null) => {
+    const mk = (masterKeysymbol ?? '').trim(); if (mk) return mk;
+    if (exchcd === '82' && symbol) return `${symbol}.O`;
+    return null;
+  },
   lsOverseasChartRaw: vi.fn(async (_t: string, trCd: string, inBlock: any) => {
     calls.push({ trCd, inBlock });
     const edate: string = inBlock.g3204InBlock.edate;
@@ -42,7 +48,7 @@ describe('P0-32D fetchUSDaily — DATE_WINDOW 페이징 + 진행봉 분리', () 
     expect(res.bars.map(b => b.date)).toEqual(['2026-08-08', '2026-08-09', '2026-08-10', '2026-08-11', '2026-08-12']);
     expect(res.uniqueBars).toBe(5);
     expect(calls[0].inBlock.g3204InBlock.symbol).toBe('AAPL');       // plain
-    expect(calls[0].inBlock.g3204InBlock.keysymbol).toBe('82AAPL');  // keysymbol prefixed
+    expect(calls[0].inBlock.g3204InBlock.keysymbol).toBe('AAPL.O');  // P0-39 공식 keysymbol(82AAPL 아님)
     // 종료 후이므로 전부 confirmed
     expect(res.confirmed).toBe(5); expect(res.provisional).toBe(0);
   });

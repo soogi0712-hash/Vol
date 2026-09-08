@@ -11,7 +11,7 @@ import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import {
   getLSUSPrice, getLSUSHoldings, getLSUSDeposit, usCashOnlyUsdCap, usEtSession,
   placeLSUSBuyOrder, placeLSUSSellOrder, queryLSUSOrderExec, cancelLSUSOrder,
-  LS_US_ORDEREXEC_EMPTY_CODES,
+  LS_US_ORDEREXEC_EMPTY_CODES, resolveUSKeysymbol, US_NASDAQ_EXCHCD,
 } from '../src/lib/ls-api';
 import { usCrossWonVerified } from './live-config';
 import { YEOKMAE_STRATEGY_VALIDATED } from '../src/lib/yeokmae';
@@ -35,14 +35,19 @@ import { writeHeartbeat } from './heartbeat';
 import { buildYeokmaeSnapshot } from '../src/lib/yeokmae';
 import { join } from 'node:path';
 
-function loadUSExchcdMap(): Map<string, { exchcd: string; exchange: string }> {
-  const m = new Map<string, { exchcd: string; exchange: string }>();
-  // 공식 전체 마스터 맵(build-us-history 생성) 먼저 — 넓은 커버리지(AIOT/AMSF 등 복원용).
+function loadUSExchcdMap(): Map<string, { exchcd: string; exchange: string; keysymbol: string }> {
+  const m = new Map<string, { exchcd: string; exchange: string; keysymbol: string }>();
+  // 공식 전체 마스터 맵(build-us-history 생성) 먼저 — 넓은 커버리지 + 공식 keysymbol(AAPL.O 등).
   const full = join(YEOKMAE_DAILY_ROOT, 'US.symbol-exchcd.json');
-  if (existsSync(full)) { try { const j = JSON.parse(readFileSync(full, 'utf8')); for (const [sym, ex] of Object.entries(j.exchcd ?? {})) if (sym && ex) m.set(sym, { exchcd: String(ex), exchange: 'US' }); } catch { /* noop */ } }
-  // reverse-candidates 로 exchange 라벨 보강(있으면 덮어씀).
+  if (existsSync(full)) {
+    try {
+      const j = JSON.parse(readFileSync(full, 'utf8')); const ksMap = j.keysymbol ?? {};
+      for (const [sym, ex] of Object.entries(j.exchcd ?? {})) if (sym && ex) m.set(sym, { exchcd: String(ex), exchange: 'US', keysymbol: String(ksMap[sym] ?? '') });
+    } catch { /* noop */ }
+  }
+  // reverse-candidates 로 exchange 라벨 보강(있으면 덮어씀). keysymbol 은 마스터맵 유지.
   const f = join(YEOKMAE_DAILY_ROOT, 'US.reverse-candidates.json');
-  if (existsSync(f)) { try { const j = JSON.parse(readFileSync(f, 'utf8')); for (const c of (j.candidates ?? [])) if (c.symbol && c.exchcd) m.set(c.symbol, { exchcd: String(c.exchcd), exchange: c.exchange ?? 'US' }); } catch { /* noop */ } }
+  if (existsSync(f)) { try { const j = JSON.parse(readFileSync(f, 'utf8')); for (const c of (j.candidates ?? [])) if (c.symbol && c.exchcd) m.set(c.symbol, { exchcd: String(c.exchcd), exchange: c.exchange ?? 'US', keysymbol: String(c.keysymbol ?? m.get(c.symbol)?.keysymbol ?? '') }); } catch { /* noop */ } }
   return m;
 }
 // order-store 파일 → 매수증거(읽기전용). 없으면 빈 증거.
@@ -104,21 +109,26 @@ async function main() {
   const today0 = new Date().toISOString().slice(0, 10);
   const etDate0 = today0.replace(/-/g, '');
 
-  // item1: g3204 일봉 실 rows>0 확인(1회, 매 cycle 재다운로드 금지) + 캐시 ready(600+봉) 종목수.
+  // item1/3: g3101(현재가)·g3204(일봉) probe — 공식 keysymbol(AAPL.O) 사용. AAPL 은 마스터맵 없어도 NASDAQ .O 로 실측 가능.
   let historyReady = false, readyCount = 0, cachedSymbols = 0, probeRows = 0; let probeSym = '-';
   {
     const scan = scanCachedDiscovery('US');
     cachedSymbols = scan.cached; readyCount = scan.results.filter(d => d.ready).length;
-    const probePick = exchOf.get('AAPL') ? 'AAPL' : (exchOf.size ? [...exchOf.keys()][0] : '');
+    // 기본 probe = AAPL(NASDAQ 82). 마스터맵에 있으면 그 exchcd/keysymbol, 없으면 exchcd='82' + resolveUSKeysymbol('AAPL','82')='AAPL.O'.
+    const probePick = exchOf.get('AAPL') ? 'AAPL' : (exchOf.size ? [...exchOf.keys()][0] : 'AAPL');
+    const pex = exchOf.get(probePick)?.exchcd || (probePick === 'AAPL' ? US_NASDAQ_EXCHCD : '');
+    const pks = exchOf.get(probePick)?.keysymbol || resolveUSKeysymbol(probePick, pex) || '';
+    probeSym = probePick;
+    // g3101 현재가 probe(item3)
+    let priceOk = false, priceVal = 0;
+    if (pex) { try { const q = await getLSUSPrice(cfg, token, probePick, pex, delaygb, pks); priceOk = q.price > 0; priceVal = q.price; } catch (e) { log.warn(`[YEOKMAE-US-PRICE-PROBE] ${probePick} g3101 예외 → ${scrub(String(e))}`); } }
+    log.info(`[YEOKMAE-US-PRICE-PROBE] symbol=${probePick} exchcd=${pex || '-'} keysymbol=${pks || '-'} delaygb=${delaygb} g3101 price=${priceVal} ok=${priceOk}`);
+    // g3204 일봉 probe(item1) — 1회, 매 cycle 재다운로드 금지
     let probeOk = false;
-    if (probePick) {
-      const ex = exchOf.get(probePick)!;
-      try { const r = await fetchUSDaily(token, { symbol: probePick, exchcd: ex.exchcd, delaygb }, { nowMs: Date.now(), targetBars: 1, windowDays: 40, maxPages: 1 }); probeOk = r.ok && r.bars.length > 0; probeRows = r.bars.length; probeSym = probePick; }
-      catch (e) { log.warn(`[YEOKMAE-US-DAILY-PROBE] ${probePick} g3204 예외 → probe 실패. ${scrub(String(e))}`); }
-    }
+    if (pex) { try { const r = await fetchUSDaily(token, { symbol: probePick, exchcd: pex, delaygb, keysymbol: pks }, { nowMs: Date.now(), targetBars: 1, windowDays: 40, maxPages: 1 }); probeOk = r.ok && r.bars.length > 0; probeRows = r.bars.length; } catch (e) { log.warn(`[YEOKMAE-US-DAILY-PROBE] ${probePick} g3204 예외 → ${scrub(String(e))}`); } }
     historyReady = probeOk && readyCount > 0;
-    log.info(`[YEOKMAE-US-DAILY-PROBE] probeSymbol=${probeSym} exchcd=${probePick ? exchOf.get(probePick)?.exchcd : '-'} g3204 rows=${probeRows} probeOk=${probeOk} (gubun='2' 일봉, 1회 확인)`);
-    log.info(`[YEOKMAE-US-HISTORY-CAPACITY] cachedSymbols=${cachedSymbols} ready(600+봉)=${readyCount} historyReady=${historyReady}${!historyReady ? ' → INSUFFICIENT_HISTORY(실주문 게이트 닫힘). npm run yeokmae:build-us-history 로 pool 구축.' : ''}`);
+    log.info(`[YEOKMAE-US-DAILY-PROBE] symbol=${probeSym} exchcd=${pex || '-'} keysymbol=${pks || '-'} g3204 rows=${probeRows} probeOk=${probeOk} (gubun='2' 일봉, 1회)`);
+    log.info(`[YEOKMAE-US-HISTORY-CAPACITY] cachedSymbols=${cachedSymbols} ready(600+봉)=${readyCount} historyReady=${historyReady}${!historyReady ? ' → INSUFFICIENT_HISTORY(BUY 게이트 닫힘, SELL 은 무관). g3101 ok 면 keysymbol 정상 · rows=0 면 시세권한/delaygb 확인 · npm run yeokmae:build-us-history 로 pool 구축.' : ''}`);
   }
 
   // ── 루프 공유 상태 ──
@@ -215,7 +225,7 @@ async function main() {
     const today = new Date().toISOString().slice(0, 10); const etDate = today.replace(/-/g, '');
     for (const c of candidates.slice(0, maxReport)) {
       let price = 0;
-      try { price = (await getLSUSPrice(cfg, token, c.symbol, c.exchcd, delaygb)).price; } catch (e) { log.warn(`[YEOKMAE-US-CAPITAL-GUARD] ${c.symbol} 시세 실패 → skip. ${scrub(String(e))}`); continue; }
+      try { price = (await getLSUSPrice(cfg, token, c.symbol, c.exchcd, delaygb, exchOf.get(c.symbol)?.keysymbol)).price; } catch (e) { log.warn(`[YEOKMAE-US-CAPITAL-GUARD] ${c.symbol} 시세 실패 → skip. ${scrub(String(e))}`); continue; }
       const guard = computeUSYeokmaeCapitalGuard({ totalCapitalKRW, perTradeKRW, investedUSD: runningInvestedUSD, pendingUSD: runningPendingUSD, bestAsk: price, baseXchRate, cashOnlyUsd });
       log.info(`[YEOKMAE-US-CAPITAL-GUARD] symbol=${c.symbol} tier=${c.tier} price=$${price} finalQty=${guard.finalQty} investUSD=${guard.candidateUSD.toFixed(2)}(≈${Math.round(guard.candidateKRW)}KRW) canNewBuy=${guard.canNewBuy} reason=${guard.reason} (perTradeQty=${guard.perTradeQty} cashQty=${guard.cashQty} capacityQty=${guard.capacityQty})`);
       if (!guard.canNewBuy) continue;
@@ -237,7 +247,7 @@ async function main() {
   async function doSellCycle(postEnabled: boolean, sessionOrderable: boolean, verbose: boolean): Promise<{ sells: number; evaluated: number }> {
     const usPositions = posStore.all().filter(p => p.exchcd !== 'KR' && p.qty > 0);
     const res = await runUSSellCycle({
-      quote: async (pp): Promise<USQuote> => { try { const q = await getLSUSPrice(cfg, token, pp.symbol, pp.exchcd, delaygb); return { ok: q.price > 0, price: q.price, stale: false }; } catch (e) { return { ok: false, price: 0, stale: true, reason: scrub(String(e)) }; } },
+      quote: async (pp): Promise<USQuote> => { try { const q = await getLSUSPrice(cfg, token, pp.symbol, pp.exchcd, delaygb, exchOf.get(pp.symbol)?.keysymbol); return { ok: q.price > 0, price: q.price, stale: false }; } catch (e) { return { ok: false, price: 0, stale: true, reason: scrub(String(e)) }; } },
       brokerQtyOf: (symbol) => brokerQtyMap.has(symbol) ? brokerQtyMap.get(symbol)! : null,
       runSell: async ({ position, price, decision }) => {
         const orders = new OrderStore(`YEOKMAE_US_${position.symbol}`); orders.load();

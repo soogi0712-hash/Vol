@@ -296,11 +296,24 @@ export async function getLSKRPrice(cfg: LSConfig, token: string, shcode: string)
   return parseLSPrice('t1102', res, 't1102OutBlock');
 }
 
-// ── 해외 현재가 (g3101) — keysymbol = exchcd + symbol ────────
+// ── 해외 keysymbol 공식 형식 (P0-39) — RIC 식 SYMBOL.<suffix>. NASDAQ AAPL='AAPL.O'(LS 공식 g3101 예제 확인). ──
+//   ⚠️ 기존 'exchcd+symbol'(="82AAPL")은 공식 형식이 아님 → g3101/g3204 rows=0 원인.
+//   ⚠️ NASDAQ(.O) 외 거래소 suffix(NYSE/AMEX 등)는 공식 확정 불가 → 추측 금지. g3190 마스터의 keysymbol(공식, 전 거래소) 사용.
+export const US_NASDAQ_EXCHCD = '82';
+export function resolveUSKeysymbol(symbol: string, exchcd: string, masterKeysymbol?: string | null): string | null {
+  const mk = (masterKeysymbol ?? '').trim();
+  if (mk) return mk;                                          // g3190 종목마스터 공식 keysymbol(전 거래소) — 최우선
+  if (exchcd === US_NASDAQ_EXCHCD && symbol) return `${symbol}.O`;   // NASDAQ 만 공식 suffix 확인됨(LS 예제)
+  return null;                                                // 그 외 → 미확정(추측 금지) → 호출측 fail-closed
+}
+
+// ── 해외 현재가 (g3101) — keysymbol 은 공식 형식(SYMBOL.suffix). 호출측이 g3190 masterKeysymbol 을 주면 그대로 사용. ──
 // delaygb 는 하드코딩하지 않는다(req1): 호출측이 실시간('R') 또는 공식 지연 코드를 전달.
-export async function getLSUSPrice(cfg: LSConfig, token: string, symbol: string, exchcd: string, delaygb: string): Promise<LSPrice> {
+export async function getLSUSPrice(cfg: LSConfig, token: string, symbol: string, exchcd: string, delaygb: string, keysymbol?: string): Promise<LSPrice> {
+  const ks = resolveUSKeysymbol(symbol, exchcd, keysymbol);
+  if (!ks) throw new LSApiError('EMPTY', `g3101 keysymbol 미확정(exchcd=${exchcd} symbol=${symbol}) — g3190 마스터 keysymbol 필요(추측 금지)`);
   const res = await lsPost(token, '/overseas-stock/market-data', 'g3101', {
-    g3101InBlock: { delaygb, keysymbol: exchcd + symbol, exchcd, symbol },
+    g3101InBlock: { delaygb, keysymbol: ks, exchcd, symbol },
   });
   return parseLSPrice('g3101', res, 'g3101OutBlock');
 }
@@ -468,6 +481,7 @@ export interface LSUS15MinOpts {
   edate?: string;       // 종료일(기본 '')
   trCont?: string;      // 연속조회 요청 헤더('N' 최초 / 'Y' 연속)
   trContKey?: string;   // 이전 응답 tr_cont_key
+  keysymbol?: string;   // P0-39: g3190 공식 keysymbol(있으면 사용, 없으면 NASDAQ .O fallback)
 }
 
 export async function getLSUS15Min(
@@ -476,7 +490,7 @@ export async function getLSUS15Min(
   // delaygb 는 하드코딩하지 않는다(req1·4): 호출측이 실시간('R') 또는 공식 지연 코드를 전달.
   const ncnt = opts.ncnt ?? 15;
   const qrycnt = Math.min(opts.qrycnt ?? LS_G3203_MAX_QRYCNT_UNCOMPRESSED, LS_G3203_MAX_QRYCNT_UNCOMPRESSED);   // 비압축 상한 5
-  const reqBody = { g3203InBlock: { delaygb, keysymbol: exchcd + symbol, exchcd, symbol, ncnt, qrycnt, comp_yn: 'N', sdate: opts.sdate ?? '', edate: opts.edate ?? '' } };
+  const reqBody = { g3203InBlock: { delaygb, keysymbol: resolveUSKeysymbol(symbol, exchcd, opts.keysymbol) ?? (exchcd + symbol), exchcd, symbol, ncnt, qrycnt, comp_yn: 'N', sdate: opts.sdate ?? '', edate: opts.edate ?? '' } };
   const { data, rspCd, rspMsg, diag } = await lsPost(token, '/overseas-stock/chart', 'g3203', reqBody, { trCont: opts.trCont ?? 'N', trContKey: opts.trContKey ?? '' });
   const rowsRaw: any[] = data.g3203OutBlock1 || [];
   const rows = rowsRaw.map(r => ({
@@ -610,14 +624,14 @@ export interface LSTickResult {
   outBlock: any; reqBody: Record<string, unknown>; diag: LSHttpDiag;
 }
 
-export interface LSTicksOpts { ncnt?: number; qrycnt?: number; sdate?: string; edate?: string; trCont?: string; trContKey?: string; }
+export interface LSTicksOpts { ncnt?: number; qrycnt?: number; sdate?: string; edate?: string; trCont?: string; trContKey?: string; keysymbol?: string; }
 
 export async function getLSUSTicks(
   cfg: LSConfig, token: string, symbol: string, exchcd: string, delaygb: string, opts: LSTicksOpts = {},
 ): Promise<LSTickResult> {
   const ncnt = opts.ncnt ?? 5;   // 공식 reqExample 값(추측 금지). 어떤 값이든 각 행이 date/loctime/OHLC/exevol 이라 15분 재집계 가능.
   const qrycnt = Math.min(opts.qrycnt ?? LS_G3203_MAX_QRYCNT_UNCOMPRESSED, LS_G3203_MAX_QRYCNT_UNCOMPRESSED);   // 비압축 상한 5
-  const reqBody = { g3202InBlock: { delaygb, keysymbol: exchcd + symbol, exchcd, symbol, ncnt, qrycnt, comp_yn: 'N', sdate: opts.sdate ?? '', edate: opts.edate ?? '' } };
+  const reqBody = { g3202InBlock: { delaygb, keysymbol: resolveUSKeysymbol(symbol, exchcd, opts.keysymbol) ?? (exchcd + symbol), exchcd, symbol, ncnt, qrycnt, comp_yn: 'N', sdate: opts.sdate ?? '', edate: opts.edate ?? '' } };
   const { data, rspCd, rspMsg, diag } = await lsPost(token, '/overseas-stock/chart', 'g3202', reqBody, { trCont: opts.trCont ?? 'N', trContKey: opts.trContKey ?? '' });
   const rowsRaw: any[] = data.g3202OutBlock1 || [];
   const ticks = rowsRaw.map(r => ({

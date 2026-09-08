@@ -25,13 +25,18 @@ describe('P0-32D daily-tr-config — KR/US 모두 확정', () => {
     expect(US_DAILY_TR.successCodes).toEqual(['00000']);
     expect(isDailyTRReady(US_DAILY_TR)).toEqual({ ready: true, reason: 'OK' });
   });
-  it('US buildInBlock — g3204InBlock plain symbol + 런타임 exchcd/delaygb', () => {
+  it('US buildInBlock — g3204InBlock plain symbol + 공식 keysymbol(P0-39: NASDAQ AAPL.O, 82AAPL 금지)', () => {
     const ib = US_DAILY_TR.buildInBlock!({ symbol: 'AAPL', exchcd: '82', delaygb: 'R', sdate: '20240101', edate: '20260812' }) as any;
-    expect(ib.g3204InBlock.symbol).toBe('AAPL');          // plain (82AAPL 은 rows=0)
-    expect(ib.g3204InBlock.keysymbol).toBe('82AAPL');     // keysymbol 만 prefixed
+    expect(ib.g3204InBlock.symbol).toBe('AAPL');           // plain
+    expect(ib.g3204InBlock.keysymbol).toBe('AAPL.O');      // 공식(NASDAQ .O) — exchcd+symbol("82AAPL") 아님
+    expect(ib.g3204InBlock.keysymbol).not.toBe('82AAPL');
     expect(ib.g3204InBlock.exchcd).toBe('82');
     expect(ib.g3204InBlock.gubun).toBe('2');
     expect(ib.g3204InBlock.delaygb).toBe('R');
+  });
+  it('US buildInBlock — g3190 마스터 keysymbol 주입 시 그대로 사용(전 거래소 공식)', () => {
+    const ib = US_DAILY_TR.buildInBlock!({ symbol: 'AMSF', exchcd: '81', keysymbol: 'AMSF.N', delaygb: 'R', sdate: '20240101', edate: '20260812' }) as any;
+    expect(ib.g3204InBlock.keysymbol).toBe('AMSF.N');      // 마스터 keysymbol 우선(추측 없음)
   });
   it('dailyTRConfig(market) 라우팅', () => {
     expect(dailyTRConfig('KR')).toBe(KR_DAILY_TR);

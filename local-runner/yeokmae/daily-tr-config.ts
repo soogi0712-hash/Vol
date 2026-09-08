@@ -2,6 +2,7 @@
 //   probe(npm run yeokmae:probe-daily) 로 실제 TR/필드/continuation/successCode 를 확인한 뒤 아래 null 만 채운다.
 //   현재는 전부 미확정(null/UNCONFIRMED) → 어댑터가 fail-closed 로 동작(추측 하드코딩 금지).
 import { EMPTY_DAILY_FIELD_MAP, type DailyFieldMap, type PaginationStrategy } from '../../src/lib/yeokmae/history';
+import { resolveUSKeysymbol } from '../../src/lib/ls-api';
 
 export interface DailyTRConfig {
   market: 'KR' | 'US';
@@ -13,7 +14,7 @@ export interface DailyTRConfig {
   adjustedAvailable: boolean | null;                      // 수정주가 옵션 존재/기본값(probe 확인 후)
   maxPerPage: number | null;                              // 1회 최대 취득건수(probe 확인 후)
   // InBlock 빌더는 필드가 확정된 뒤 구현(현재 null → fail-closed). (date window/커서 인자 포함)
-  buildInBlock: ((p: { symbol: string; exchcd?: string; sdate: string; edate: string; cursor?: string; delaygb?: string }) => Record<string, unknown>) | null;
+  buildInBlock: ((p: { symbol: string; exchcd?: string; keysymbol?: string; sdate: string; edate: string; cursor?: string; delaygb?: string }) => Record<string, unknown>) | null;
 }
 
 // KR 일봉 — P0-32C probe 실측 확정. t8413(주식차트 일주월) primary(수정주가 sujung 지원).
@@ -53,7 +54,7 @@ export const US_DAILY_TR: DailyTRConfig = {
   successCodes: ['00000'],
   adjustedAvailable: false,        // 수정주가 플래그 미확인 → adjustment=UNKNOWN.
   maxPerPage: 500,                 // 실측 단일창 500행(하드 상한 주장 아님 — pages probe 로 실측).
-  buildInBlock: (p) => ({ g3204InBlock: { delaygb: p.delaygb ?? 'R', keysymbol: (p.exchcd ?? '') + p.symbol, exchcd: p.exchcd ?? '', symbol: p.symbol, gubun: '2', qrycnt: 500, comp_yn: 'N', sdate: p.sdate, edate: p.edate } }),
+  buildInBlock: (p) => ({ g3204InBlock: { delaygb: p.delaygb ?? 'R', keysymbol: resolveUSKeysymbol(p.symbol, p.exchcd ?? '', p.keysymbol) ?? ((p.exchcd ?? '') + p.symbol), exchcd: p.exchcd ?? '', symbol: p.symbol, gubun: '2', qrycnt: 500, comp_yn: 'N', sdate: p.sdate, edate: p.edate } }),
 };
 
 export function dailyTRConfig(market: 'KR' | 'US'): DailyTRConfig { return market === 'KR' ? KR_DAILY_TR : US_DAILY_TR; }

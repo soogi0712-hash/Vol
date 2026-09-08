@@ -17,13 +17,13 @@ export interface USDailyFetchResult {
 }
 
 export async function fetchUSDaily(
-  token: string, p: { symbol: string; exchcd: string; delaygb: string },
+  token: string, p: { symbol: string; exchcd: string; delaygb: string; keysymbol?: string },
   opts: { nowMs: number; targetBars?: number; windowDays?: number; maxPages?: number },
 ): Promise<USDailyFetchResult> {
   const cfg = US_DAILY_TR;
   const build = cfg.buildInBlock!;
   const res = await windowedDailyFetch({
-    callPage: (sdate, edate) => lsOverseasChartRaw(token, cfg.trCode!, build({ symbol: p.symbol, exchcd: p.exchcd, delaygb: p.delaygb, sdate, edate })),
+    callPage: (sdate, edate) => lsOverseasChartRaw(token, cfg.trCode!, build({ symbol: p.symbol, exchcd: p.exchcd, keysymbol: p.keysymbol, delaygb: p.delaygb, sdate, edate })),
     fieldMap: cfg.fieldMap, successCodes: cfg.successCodes!,
     startEdateYmd: ymdFromDashed(marketToday(opts.nowMs, 'US')),
     targetBars: opts.targetBars ?? 800, windowDays: opts.windowDays ?? 1200, maxPages: opts.maxPages ?? 10,
