@@ -7,7 +7,9 @@ import { OrderStore } from '../local-runner/order-store';
 import { YeokmaePositionStore } from '../local-runner/yeokmae-position-store';
 import {
   evaluateManagedRecovery, mergeBuyEvidence, earliestEntryDate, readEntryAvgOverride, readExchcdOverride,
+  extractAccountFills, normOrdNo,
 } from '../local-runner/yeokmae/position-recover';
+import type { TrackedOrder } from '../local-runner/order-events';
 import { evaluateUSExit, type USExitPolicy } from '../local-runner/yeokmae/us-live-core';
 
 let dir: string;
@@ -83,6 +85,62 @@ describe('P0-37 evaluateManagedRecovery — 안전규칙', () => {
     o.recordPlaced('buy', '2026-08-13', '20260813', { ordNo: '285', symbol: 'PRGO', qty: 4, price: 13.02, placedAtMs: 1 }); o.flush();
     const dec = evaluateManagedRecovery({ symbol: 'PRGO', market: 'US', brokerQty: 4, brokerAvgPrice: null, evidence: o.buyEvidence(), exchcd: '82', entryAvgOverride: null });
     expect(dec.action).toBe('RECOVER'); expect(dec.entryAvgPrice).toBe(13.02); expect(dec.avgSource).toBe('ORDER_PRICE');
+  });
+});
+
+const track = (o: Partial<TrackedOrder> & { ordNo: string }): TrackedOrder => ({
+  ordNo: o.ordNo, orgOrdNo: o.orgOrdNo ?? '', symbol: o.symbol ?? '', status: o.status ?? 'ACCEPTED',
+  ordQty: o.ordQty ?? 0, ordPrc: o.ordPrc ?? 0, cumExecQty: o.cumExecQty ?? 0, avgExecPrc: o.avgExecPrc ?? 0,
+  unfilledQty: o.unfilledQty ?? 0, rejectReason: '', restCancelOk: false, seenExecIds: [], seenCancelKeys: [], updatedAtMs: 0,
+});
+
+describe('P0-37A extractAccountFills — AS0(symbol)+AS1(exec) 병합, ordNo padding 정규화', () => {
+  it('normOrdNo — 선행 0 제거', () => {
+    expect(normOrdNo('0000000378')).toBe('378'); expect(normOrdNo('378')).toBe('378');
+    expect(normOrdNo('0')).toBe('0'); expect(normOrdNo('')).toBe('');
+  });
+  it('AIOT: AS0(0000000378,AIOT,q20)+AS1(378,exec20,avg2.915) → symbol=AIOT exec20 avg2.915', () => {
+    const fills = extractAccountFills([
+      track({ ordNo: '0000000378', symbol: 'AIOT', status: 'ACCEPTED', ordQty: 20, ordPrc: 2.92 }),
+      track({ ordNo: '378', symbol: '', status: 'FILLED', cumExecQty: 20, avgExecPrc: 2.915 }),
+    ]);
+    const f = fills.get('AIOT')!;
+    expect(f.execQty).toBe(20); expect(f.avgExecPrc).toBe(2.915); expect(f.ordQty).toBe(20);
+  });
+  it('AMSF: AS0(0000000399,AMSF,q2)+AS1(399,exec2,avg28.12) → exec2 avg28.12', () => {
+    const fills = extractAccountFills([
+      track({ ordNo: '0000000399', symbol: 'AMSF', status: 'ACCEPTED', ordQty: 2, ordPrc: 28.38 }),
+      track({ ordNo: '399', symbol: '', status: 'FILLED', cumExecQty: 2, avgExecPrc: 28.12 }),
+    ]);
+    expect(fills.get('AMSF')!.execQty).toBe(2); expect(fills.get('AMSF')!.avgExecPrc).toBe(28.12);
+  });
+  it('체결없음(AS0만, exec 0) → 제외', () => {
+    expect(extractAccountFills([track({ ordNo: '400', symbol: 'X', status: 'ACCEPTED', ordQty: 5 })]).size).toBe(0);
+  });
+});
+
+describe('P0-37A evaluateManagedRecovery — 계좌이벤트 실체결 최우선', () => {
+  const fill = (execQty: number, avgExecPrc: number) => ({ symbol: 'AIOT', execQty, avgExecPrc, ordQty: execQty, ordNo: '378' });
+  const ev = mergeBuyEvidence([], 'AIOT');
+  it('AIOT exec20@2.915 + broker20 → RECOVER(ACTUAL_FILL avg=2.915)', () => {
+    const dec = evaluateManagedRecovery({ symbol: 'AIOT', market: 'US', brokerQty: 20, brokerAvgPrice: null, evidence: ev, accountFill: fill(20, 2.915), exchcd: '82', entryAvgOverride: null });
+    expect(dec.action).toBe('RECOVER'); expect(dec.qty).toBe(20); expect(dec.entryAvgPrice).toBe(2.915); expect(dec.avgSource).toBe('ACTUAL_FILL');
+  });
+  it('실체결평단 > env override (avgExecPrc 최우선)', () => {
+    const dec = evaluateManagedRecovery({ symbol: 'AIOT', market: 'US', brokerQty: 20, brokerAvgPrice: null, evidence: ev, accountFill: fill(20, 2.915), exchcd: '82', entryAvgOverride: 99 });
+    expect(dec.avgSource).toBe('ACTUAL_FILL'); expect(dec.entryAvgPrice).toBe(2.915);
+  });
+  it('cumExecQty != broker qty → FAILCLOSED', () => {
+    const dec = evaluateManagedRecovery({ symbol: 'AIOT', market: 'US', brokerQty: 19, brokerAvgPrice: null, evidence: ev, accountFill: fill(20, 2.915), exchcd: '82', entryAvgOverride: null });
+    expect(dec.action).toBe('FAILCLOSED'); expect(dec.reason).toContain('QTY_MISMATCH');
+  });
+  it('accountFill 만 있고 order-store 증거 없어도 복원(실체결이 증거)', () => {
+    const dec = evaluateManagedRecovery({ symbol: 'AIOT', market: 'US', brokerQty: 20, brokerAvgPrice: null, evidence: mergeBuyEvidence([], 'AIOT'), accountFill: fill(20, 2.915), exchcd: '82', entryAvgOverride: null });
+    expect(dec.action).toBe('RECOVER');
+  });
+  it('accountFill 있어도 US exchcd 미해결 → FAILCLOSED', () => {
+    const dec = evaluateManagedRecovery({ symbol: 'AIOT', market: 'US', brokerQty: 20, brokerAvgPrice: null, evidence: ev, accountFill: fill(20, 2.915), exchcd: '', entryAvgOverride: null });
+    expect(dec.action).toBe('FAILCLOSED'); expect(dec.reason).toContain('EXCHCD_UNRESOLVED');
   });
 });
 

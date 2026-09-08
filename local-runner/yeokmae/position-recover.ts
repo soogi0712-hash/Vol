@@ -2,19 +2,58 @@
 //   ⚠️ broker 보유만으로 managed 생성 금지. 반드시 order-store BUY 증거 + (수량 일치) 필요. 애매하면 fail-closed(수동 유지).
 //   ⚠️ 평단 추측 금지 — 우선순위: env override > broker 공식(KR t0424) > order-store 주문가. 셋 다 없으면 fail-closed.
 import type { OrderBuyEvidence } from '../order-store';
+import type { TrackedOrder } from '../order-events';
 
 export type RecoverAction = 'RECOVER' | 'MANUAL' | 'FAILCLOSED';
+export type RecoverAvgSource = 'ACTUAL_FILL' | 'ENV_OVERRIDE' | 'BROKER_OFFICIAL' | 'ORDER_PRICE' | '-';
 export interface RecoverDecision {
-  action: RecoverAction; qty: number; entryAvgPrice: number; avgSource: 'ENV_OVERRIDE' | 'BROKER_OFFICIAL' | 'ORDER_PRICE' | '-';
+  action: RecoverAction; qty: number; entryAvgPrice: number; avgSource: RecoverAvgSource;
   exchcd: string; entryDate: string | null; reason: string;
 }
+// P0-37A: 계좌이벤트(AS0 ACCEPTED + AS1 FILLED) 실체결 증거 — 실제 체결평단/체결수량(최우선 진실).
+export interface AccountFill { symbol: string; execQty: number; avgExecPrc: number; ordQty: number; ordNo: string; }
 export interface RecoverInput {
   symbol: string; market: 'KR' | 'US';
   brokerQty: number;                 // t0424(KR)/COSOQ00201(US) 실보유수량
   brokerAvgPrice: number | null;     // KR t0424 pamt(공식). US 는 미제공(null).
   evidence: OrderBuyEvidence;        // order-store 증거(여러 키 병합 결과)
+  accountFill?: AccountFill | null;  // __account_events__ AS0/AS1 실체결(있으면 최우선)
   exchcd: string;                    // KR='KR', US='81'/'82'. '' 이면 미해결.
   entryAvgOverride: number | null;   // env YEOKMAE_<MKT>_ENTRY_AVG_<SYM>
+}
+
+// ordNo 정규화 — AS0 zero-padded('0000000378') 과 AS1('378') 매칭용. 선행 0 제거.
+export function normOrdNo(s: string): string {
+  const t = String(s ?? '').trim();
+  if (t === '') return '';
+  const stripped = t.replace(/^0+/, '');
+  return stripped === '' ? '0' : stripped;
+}
+
+// __account_events__ tracked(AS0/AS1 상태머신 결과) → 종목별 실체결(체결수량/체결평단).
+//   ⚠️ AS0(symbol 보유, exec 0) + AS1(symbol 빈칸, exec 보유)이 ordNo padding 으로 분리 저장될 수 있음 → normOrdNo 로 병합.
+//   AS1 symbol 이 비면 같은 ordNo 그룹의 AS0 symbol 로 연결. 여러 주문이면 종목별 합산 + 체결가중 평단.
+export function extractAccountFills(tracked: readonly TrackedOrder[]): Map<string, AccountFill> {
+  const byOrd = new Map<string, { symbol: string; execQty: number; avgExecPrc: number; ordQty: number; ordNo: string }>();
+  for (const t of tracked) {
+    const key = normOrdNo(t.ordNo || t.orgOrdNo);
+    if (!key) continue;
+    const cur = byOrd.get(key) ?? { symbol: '', execQty: 0, avgExecPrc: 0, ordQty: 0, ordNo: key };
+    if (t.symbol) cur.symbol = t.symbol;                                // AS0 symbol
+    if (t.ordQty > 0) cur.ordQty = Math.max(cur.ordQty, t.ordQty);      // AS0 주문수량
+    if (t.cumExecQty > 0) cur.execQty = Math.max(cur.execQty, t.cumExecQty);   // AS1 누적체결
+    if (t.avgExecPrc > 0) cur.avgExecPrc = t.avgExecPrc;               // AS1 체결평단
+    byOrd.set(key, cur);
+  }
+  const bySym = new Map<string, { symbol: string; execQty: number; wsum: number; ordQty: number; ordNo: string }>();
+  for (const o of byOrd.values()) {
+    if (!o.symbol || !(o.execQty > 0) || !(o.avgExecPrc > 0)) continue;   // 실체결(수량>0·평단>0)만
+    const a = bySym.get(o.symbol) ?? { symbol: o.symbol, execQty: 0, wsum: 0, ordQty: 0, ordNo: o.ordNo };
+    a.execQty += o.execQty; a.wsum += o.execQty * o.avgExecPrc; a.ordQty += o.ordQty; bySym.set(o.symbol, a);
+  }
+  const out = new Map<string, AccountFill>();
+  for (const a of bySym.values()) out.set(a.symbol, { symbol: a.symbol, execQty: a.execQty, avgExecPrc: a.wsum / a.execQty, ordQty: a.ordQty, ordNo: a.ordNo });
+  return out;
 }
 
 // 여러 order-store(예: US 레거시 '<sym>' + 신규 'YEOKMAE_US_<sym>')의 증거 병합.
@@ -42,20 +81,24 @@ export function earliestEntryDate(candleDates: readonly string[]): string | null
 
 export function evaluateManagedRecovery(p: RecoverInput): RecoverDecision {
   const sym = p.symbol;
-  const base = { qty: 0, entryAvgPrice: 0, avgSource: '-' as const, exchcd: p.exchcd, entryDate: null as string | null };
+  const base = { qty: 0, entryAvgPrice: 0, avgSource: '-' as RecoverAvgSource, exchcd: p.exchcd, entryDate: null as string | null };
+  const fill = p.accountFill && p.accountFill.execQty > 0 && p.accountFill.avgExecPrc > 0 ? p.accountFill : null;
   if (!(p.brokerQty > 0)) return { ...base, action: 'MANUAL', reason: 'NO_BROKER_QTY' };
-  if (!p.evidence.hasAnyBuyEvidence) return { ...base, action: 'MANUAL', reason: 'NO_VOL_BUY_EVIDENCE(broker-only) → 수동보유 유지' };
-  // 수량 검증 — 주문수량(pending)이 기록돼 있으면 broker 와 반드시 일치.
-  if (p.evidence.confirmedBuyQty != null && p.evidence.confirmedBuyQty !== p.brokerQty) {
-    return { ...base, action: 'FAILCLOSED', reason: `QTY_MISMATCH(order=${p.evidence.confirmedBuyQty} broker=${p.brokerQty}) → 복원 보류(fail-closed)` };
+  // 증거: order-store 증거 또는 계좌이벤트 실체결(AS0/AS1) 중 하나 이상. 둘 다 없으면 수동보유 유지.
+  if (!p.evidence.hasAnyBuyEvidence && !fill) return { ...base, action: 'MANUAL', reason: 'NO_VOL_BUY_EVIDENCE(broker-only) → 수동보유 유지' };
+  // 수량 검증 — 실체결수량(cumExecQty) 우선, 없으면 주문수량(pending). broker 와 반드시 일치.
+  const confirmedQty = fill ? fill.execQty : p.evidence.confirmedBuyQty;
+  if (confirmedQty != null && confirmedQty !== p.brokerQty) {
+    return { ...base, action: 'FAILCLOSED', reason: `QTY_MISMATCH(${fill ? 'exec' : 'order'}=${confirmedQty} broker=${p.brokerQty}) → 복원 보류(fail-closed)` };
   }
   // US 는 주문 라우팅/시세용 exchcd 필수.
   if (p.market === 'US' && !p.exchcd) {
-    return { ...base, action: 'FAILCLOSED', reason: `EXCHCD_UNRESOLVED → env YEOKMAE_US_EXCHCD_${sym} 설정 필요(추측 금지)` };
+    return { ...base, action: 'FAILCLOSED', reason: `EXCHCD_UNRESOLVED → env YEOKMAE_US_EXCHCD_${sym} 설정 또는 build-us-history 로 마스터 exchcd 확보 필요(추측 금지)` };
   }
-  // 평단 우선순위(추측 금지): env override > broker 공식 > order-store 주문가.
-  let v = 0; let src: RecoverDecision['avgSource'] = '-';
-  if (p.entryAvgOverride != null && p.entryAvgOverride > 0) { v = p.entryAvgOverride; src = 'ENV_OVERRIDE'; }
+  // 평단 우선순위(추측 금지): 실체결평단(AS1 avgExecPrc) > env override > broker 공식(KR t0424) > order-store 주문가.
+  let v = 0; let src: RecoverAvgSource = '-';
+  if (fill) { v = fill.avgExecPrc; src = 'ACTUAL_FILL'; }
+  else if (p.entryAvgOverride != null && p.entryAvgOverride > 0) { v = p.entryAvgOverride; src = 'ENV_OVERRIDE'; }
   else if (p.brokerAvgPrice != null && p.brokerAvgPrice > 0) { v = p.brokerAvgPrice; src = 'BROKER_OFFICIAL'; }
   else if (p.evidence.orderPrice != null && p.evidence.orderPrice > 0) { v = p.evidence.orderPrice; src = 'ORDER_PRICE'; }
   if (!(v > 0)) {
@@ -64,7 +107,7 @@ export function evaluateManagedRecovery(p: RecoverInput): RecoverDecision {
   return {
     action: 'RECOVER', qty: p.brokerQty, entryAvgPrice: v, avgSource: src, exchcd: p.exchcd,
     entryDate: earliestEntryDate(p.evidence.candleDates),
-    reason: `MATCH(qty=${p.brokerQty} entryAvg=${v} src=${src}${p.evidence.confirmedBuyQty == null ? ' · 주문수량 미기록→broker수량 사용' : ''})`,
+    reason: `MATCH(qty=${p.brokerQty} entryAvg=${v} src=${src}${confirmedQty == null ? ' · 수량근거 미기록→broker수량 사용' : ''})`,
   };
 }
 

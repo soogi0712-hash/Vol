@@ -17,7 +17,7 @@ import { usCrossWonVerified } from './live-config';
 import { YEOKMAE_STRATEGY_VALIDATED } from '../src/lib/yeokmae';
 import { YeokmaePositionStore, type YeokmaePosition } from './yeokmae-position-store';
 import { OrderStore, type OrderBuyEvidence } from './order-store';
-import { evaluateManagedRecovery, mergeBuyEvidence, readEntryAvgOverride, readExchcdOverride } from './yeokmae/position-recover';
+import { evaluateManagedRecovery, mergeBuyEvidence, readEntryAvgOverride, readExchcdOverride, extractAccountFills, type AccountFill } from './yeokmae/position-recover';
 import { programInvestedUSD } from './us-position';
 import { executeBuyOrder, type TraderDeps } from './trader';
 import { executeSellOrder } from './us-seller';
@@ -37,9 +37,12 @@ import { join } from 'node:path';
 
 function loadUSExchcdMap(): Map<string, { exchcd: string; exchange: string }> {
   const m = new Map<string, { exchcd: string; exchange: string }>();
+  // 공식 전체 마스터 맵(build-us-history 생성) 먼저 — 넓은 커버리지(AIOT/AMSF 등 복원용).
+  const full = join(YEOKMAE_DAILY_ROOT, 'US.symbol-exchcd.json');
+  if (existsSync(full)) { try { const j = JSON.parse(readFileSync(full, 'utf8')); for (const [sym, ex] of Object.entries(j.exchcd ?? {})) if (sym && ex) m.set(sym, { exchcd: String(ex), exchange: 'US' }); } catch { /* noop */ } }
+  // reverse-candidates 로 exchange 라벨 보강(있으면 덮어씀).
   const f = join(YEOKMAE_DAILY_ROOT, 'US.reverse-candidates.json');
-  if (!existsSync(f)) return m;
-  try { const j = JSON.parse(readFileSync(f, 'utf8')); for (const c of (j.candidates ?? [])) if (c.symbol && c.exchcd) m.set(c.symbol, { exchcd: String(c.exchcd), exchange: c.exchange ?? 'US' }); } catch { /* noop */ }
+  if (existsSync(f)) { try { const j = JSON.parse(readFileSync(f, 'utf8')); for (const c of (j.candidates ?? [])) if (c.symbol && c.exchcd) m.set(c.symbol, { exchcd: String(c.exchcd), exchange: c.exchange ?? 'US' }); } catch { /* noop */ } }
   return m;
 }
 // order-store 파일 → 매수증거(읽기전용). 없으면 빈 증거.
@@ -142,11 +145,15 @@ async function main() {
       //   US 는 COSOQ00201 이 공식평단 미제공 → 평단은 env override(YEOKMAE_US_ENTRY_AVG_<sym>) 또는 order-store 주문가.
       //   exchcd 는 candidates 캐시(exchOf) > env override(YEOKMAE_US_EXCHCD_<sym>). 미해결이면 fail-closed(수동 유지).
       if (usHoldingsOk) {
+        // 계좌이벤트(AS0/AS1) 실체결 증거 로드(읽기전용) — AIOT/AMSF 실 체결평단/수량.
+        const evStore = new OrderStore('__account_events__'); evStore.load();
+        const accountFills = extractAccountFills(evStore.tracked);
         for (const x of h.holdings) {
           if (heldSymbols.has(x.symbol)) continue;
           const ev = mergeBuyEvidence([orderEvidence(x.symbol), orderEvidence(`YEOKMAE_US_${x.symbol}`)], x.symbol);
+          const fill: AccountFill | null = accountFills.get(x.symbol) ?? null;
           const exchcd = exchOf.get(x.symbol)?.exchcd || readExchcdOverride(env, x.symbol);
-          const dec = evaluateManagedRecovery({ symbol: x.symbol, market: 'US', brokerQty: x.balQty, brokerAvgPrice: null, evidence: ev, exchcd, entryAvgOverride: readEntryAvgOverride(env, 'US', x.symbol) });
+          const dec = evaluateManagedRecovery({ symbol: x.symbol, market: 'US', brokerQty: x.balQty, brokerAvgPrice: null, evidence: ev, accountFill: fill, exchcd, entryAvgOverride: readEntryAvgOverride(env, 'US', x.symbol) });
           if (dec.action === 'RECOVER') {
             posStore.applyYeokmaeBuyFill({ symbol: x.symbol, exchcd: dec.exchcd, entryDate: dec.entryDate ?? new Date().toISOString().slice(0, 10), fillQty: dec.qty, fillPrice: dec.entryAvgPrice, confirmedSignalDate: dec.entryDate, matchedSignals: [] });
             posStore.flush(); heldSymbols.add(x.symbol);
